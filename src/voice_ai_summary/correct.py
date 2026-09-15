@@ -31,18 +31,27 @@ _CORRECT_SYSTEM = """あなたはユーザー本人の一日の音声ログの�
 
 やること:
 - 前後の文脈と(付与されていれば)用語集を参考に、明らかなASRの誤り
-  (同音異義語の誤変換、固有名詞の誤字、意味の通らない不自然な断片)だけを修正してください。
+  (同音異義語の誤変換、固有名詞の誤字)だけを修正してください。
+- ASRの誤りは「音は合っているが字が違う」ものです。修正前と修正後で読み(音)が
+  ほぼ一致する修正だけを行ってください。音が変わる修正は推測なので行わないでください。
+- 漢字・ひらがな・カタカナを置き換えるだけの、意味の変わらない表記の書き換えは
+  しないでください(例:「糸」を「いと」にする)。
 - 口調・方言・フィラー(「あの」「えー」など)は誤りではないので変更しないでください。
+- 短い相槌や断片的な発話は、文脈から確信が持てない限り触らないでください。
+- 同じ人名・固有名詞が一日の中で異なる表記で現れている場合は、文脈上もっともらしい
+  一つの表記に揃えてください。
 - 発言されていない内容を追加したり、逆に内容を削除したりしないでください。
 - 行を統合・分割しないでください。1行は1発話のままにしてください。
-- 修正が必要な行だけを、そのIDと修正後の本文のペアとして返してください。
-  修正不要な行は出力に含めないでください。
+- 修正が必要な行だけを、そのIDと修正後の本文、そして修正の根拠(用語集のどの語か、
+  文脈のどこからそう読めるか)を短く添えて返してください。
+  確信が持てない行は出力に含めないでください。
 """
 
 
 class Fix(BaseModel):
     id: int
     text: str
+    reason: str = ""
 
 
 class CorrectionResult(BaseModel):
@@ -127,16 +136,23 @@ def correct_day(
     `correction_model` are stamped. Unchanged utterances only get `corrected_at`/
     `correction_model` stamped, so they are not re-sent on the next call.
 
+    `force` re-runs against `raw_text` where there is one, so that a re-correction is
+    derived from the original ASR output rather than stacked on the previous one, and
+    rows the model no longer corrects fall back to that original.
+
     The API is never touched when there is nothing to correct - `client` (default
     `anthropic.Anthropic()`) is only constructed once there is at least one row to send.
     """
     tz = cfg.summarize.timezone
     start_utc, end_utc = local_day_bounds(day, tz)
     corrected_clause = "" if force else " AND u.corrected_at IS NULL"
+    # Re-correcting starts from the original ASR text: otherwise a bad fix becomes the
+    # input to the next run and the two compound.
+    text_expr = "COALESCE(u.raw_text, u.text)" if force else "u.text"
     rows = conn.execute(
         f"""
         SELECT u.id AS id, u.abs_start_utc AS abs_start_utc, u.speaker AS speaker,
-               u.text AS text, r.source AS source
+               {text_expr} AS text, r.source AS source
         FROM utterances u
         JOIN recordings r ON r.id = u.recording_id
         WHERE u.abs_start_utc >= ? AND u.abs_start_utc < ?{corrected_clause}
@@ -190,14 +206,17 @@ def _correct_batch(
             new_text = fixes.get(row["id"])
             if new_text is not None and new_text.strip() and new_text != row["text"]:
                 conn.execute(
-                    "UPDATE utterances SET raw_text = COALESCE(raw_text, text), "
+                    "UPDATE utterances SET raw_text = COALESCE(raw_text, ?), "
                     "text = ?, corrected_at = ?, correction_model = ? WHERE id = ?",
-                    (new_text, now, cfg.correct.model, row["id"]),
+                    (row["text"], new_text, now, cfg.correct.model, row["id"]),
                 )
                 changed += 1
             else:
+                # No fix proposed: keep the text as sent. Under `--force` that is the
+                # original ASR text, so a fix the model no longer stands behind is undone.
                 conn.execute(
-                    "UPDATE utterances SET corrected_at = ?, correction_model = ? WHERE id = ?",
-                    (now, cfg.correct.model, row["id"]),
+                    "UPDATE utterances SET text = ?, raw_text = NULL, corrected_at = ?, "
+                    "correction_model = ? WHERE id = ?",
+                    (row["text"], now, cfg.correct.model, row["id"]),
                 )
     return changed

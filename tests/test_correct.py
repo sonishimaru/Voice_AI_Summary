@@ -225,3 +225,44 @@ def test_correct_day_splits_batch_when_output_truncated(vas, monkeypatch) -> Non
         "SELECT COUNT(*) AS n FROM utterances WHERE corrected_at IS NULL"
     ).fetchone()["n"]
     assert pending == 0
+
+
+def test_force_recorrects_from_the_original_asr_text(vas, monkeypatch) -> None:
+    """A second pass must see the original ASR text, not the first pass's output, so
+    corrections cannot stack on top of each other."""
+    cfg, conn = vas
+    ids = _seed_utterances(conn, ["もうギョウ太郎死んでるよ"])
+    seen: list[str] = []
+
+    def fake_call_correct(client, model, block, glossary_block):
+        seen.append(block)
+        return CorrectionResult(fixes=[Fix(id=ids[0], text="もう行太郎死んでるよ")])
+
+    monkeypatch.setattr(correct_mod, "_call_correct", fake_call_correct)
+    correct_day(conn, cfg, DAY, client=object())
+    correct_day(conn, cfg, DAY, client=object(), force=True)
+
+    assert "ギョウ太郎" in seen[0] and "ギョウ太郎" in seen[1]
+    row = conn.execute("SELECT text, raw_text FROM utterances WHERE id = ?", (ids[0],)).fetchone()
+    assert row["text"] == "もう行太郎死んでるよ"
+    assert row["raw_text"] == "もうギョウ太郎死んでるよ"
+
+
+def test_force_undoes_a_fix_the_model_no_longer_makes(vas, monkeypatch) -> None:
+    cfg, conn = vas
+    ids = _seed_utterances(conn, ["歯で糸をやる"])
+
+    monkeypatch.setattr(
+        correct_mod,
+        "_call_correct",
+        lambda *a: CorrectionResult(fixes=[Fix(id=ids[0], text="歯でいとをやる")]),
+    )
+    correct_day(conn, cfg, DAY, client=object())
+
+    monkeypatch.setattr(correct_mod, "_call_correct", lambda *a: CorrectionResult())
+    changed = correct_day(conn, cfg, DAY, client=object(), force=True)
+
+    assert changed == 0
+    row = conn.execute("SELECT text, raw_text FROM utterances WHERE id = ?", (ids[0],)).fetchone()
+    assert row["text"] == "歯で糸をやる"
+    assert row["raw_text"] is None
