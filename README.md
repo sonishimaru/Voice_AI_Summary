@@ -63,6 +63,11 @@ export VAS_SMTP_PASSWORD=...              # メール配信を使う場合（Gma
 .venv/bin/vas install-launchd     # worker 常駐 + 毎日 22:00（config で変更可）に digest --deliver
 ```
 
+launchd のサービスは素の環境で起動するため、`vas` は zsh のログインシェル経由で実行されます。
+`ANTHROPIC_API_KEY` などの秘密情報は、シェルの種類によらず読み込まれる `~/.zshenv` に
+`export` してください（`~/.zshrc` に書いた場合、常駐した digest からは見えません）。設定後は
+`env -i HOME=$HOME /bin/zsh -lc 'vas status'` で、サービスと同じ環境から動くか確認できます。
+
 ## 日常の使い方
 
 ```bash

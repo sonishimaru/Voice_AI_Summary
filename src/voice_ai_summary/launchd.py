@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,17 @@ from .config import Config
 
 WORKER_LABEL = "com.voiceaisummary.worker"
 DIGEST_LABEL = "com.voiceaisummary.digest"
+
+
+def _program_args(vas_bin: str, *args: str) -> list[str]:
+    """Run `vas` through a zsh login shell.
+
+    A launchd agent starts with a bare environment: none of the secrets the README tells
+    the user to export (`ANTHROPIC_API_KEY` and friends) are visible to it, so a digest
+    run would fail on its first Claude call. zsh reads ~/.zshenv on every invocation,
+    which is where those exports live.
+    """
+    return ["/bin/zsh", "-lc", shlex.join([vas_bin, *args])]
 
 
 def render_worker_plist(vas_bin: str, log_dir: Path) -> str:
@@ -27,7 +39,7 @@ def render_worker_plist(vas_bin: str, log_dir: Path) -> str:
     """
     plist_dict = {
         "Label": WORKER_LABEL,
-        "ProgramArguments": [vas_bin, "worker"],
+        "ProgramArguments": _program_args(vas_bin, "worker"),
         "RunAtLoad": True,
         "KeepAlive": True,
         "StandardOutPath": str(log_dir / f"{WORKER_LABEL}.log"),
@@ -52,7 +64,7 @@ def render_digest_plist(vas_bin: str, log_dir: Path, hour: int, minute: int) -> 
     """
     plist_dict = {
         "Label": DIGEST_LABEL,
-        "ProgramArguments": [vas_bin, "digest", "--deliver"],
+        "ProgramArguments": _program_args(vas_bin, "digest", "--deliver"),
         "StartCalendarInterval": {
             "Hour": hour,
             "Minute": minute,

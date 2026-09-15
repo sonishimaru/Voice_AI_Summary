@@ -47,7 +47,7 @@ class TestPlistRendering:
 
         # Verify required keys
         assert plist["Label"] == WORKER_LABEL
-        assert plist["ProgramArguments"] == ["/usr/local/bin/vas", "worker"]
+        assert plist["ProgramArguments"] == ["/bin/zsh", "-lc", "/usr/local/bin/vas worker"]
         assert plist["RunAtLoad"] is True
         assert plist["KeepAlive"] is True
         assert plist["ProcessType"] == "Background"
@@ -71,7 +71,11 @@ class TestPlistRendering:
         plist = plistlib.loads(plist_xml.encode("utf-8"))
 
         assert plist["Label"] == DIGEST_LABEL
-        assert plist["ProgramArguments"] == ["/usr/local/bin/vas", "digest", "--deliver"]
+        assert plist["ProgramArguments"] == [
+            "/bin/zsh",
+            "-lc",
+            "/usr/local/bin/vas digest --deliver",
+        ]
         assert plist["RunAtLoad"] is False
         assert "StartCalendarInterval" in plist
         assert plist["StartCalendarInterval"]["Hour"] == 22
