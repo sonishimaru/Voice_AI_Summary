@@ -181,26 +181,43 @@ def test_run_day_empty_day_skips_api_and_writes_no_data_markdown(vas, fake_calls
     assert day_row["markdown"] == markdown
 
 
-def test_run_day_recomputes_when_new_utterances_arrive(vas, fake_calls) -> None:
-    """Late-processed audio changes an episode's transcript → both stages run again."""
+def test_run_day_recomputes_when_new_utterances_arrive(vas, fake_calls, monkeypatch) -> None:
+    """Late-processed audio changes an episode's transcript → the map step runs again; the
+    day rollup is re-run only when the episode summaries it consumes actually changed."""
     cfg, conn = vas
     _seed_one_episode(conn)
     run_day(conn, cfg, "2026-09-15", client=object())
     assert fake_calls == {"map": 1, "reduce": 1}
 
-    rec = conn.execute("SELECT id, started_at_utc FROM recordings").fetchone()
-    _insert_utterance(
-        conn,
-        recording_id=rec["id"],
-        rec_started_at_utc=rec["started_at_utc"],
-        t_start_ms=4_000,
-        t_end_ms=4_500,
-        speaker="me",
-        text="追加の発話",
-    )
-    conn.commit()
+    def add_utterance(t_start_ms: int, text: str) -> None:
+        rec = conn.execute("SELECT id, started_at_utc FROM recordings").fetchone()
+        _insert_utterance(
+            conn,
+            recording_id=rec["id"],
+            rec_started_at_utc=rec["started_at_utc"],
+            t_start_ms=t_start_ms,
+            t_end_ms=t_start_ms + 500,
+            speaker="me",
+            text=text,
+        )
+        conn.commit()
 
+    # Transcript changed but the (canned) episode summary is identical → no reduce call.
+    add_utterance(4_000, "追加の発話")
     run_day(conn, cfg, "2026-09-15", client=object())
-    assert fake_calls == {"map": 2, "reduce": 2}
+    assert fake_calls == {"map": 2, "reduce": 1}
     # Episode ids were reused by the rebuild, but the title is still populated.
     assert conn.execute("SELECT title FROM episodes").fetchone()["title"] == "テストエピソード"
+
+    # Transcript changed and the episode summary differs → reduce runs again.
+    changed = _CANNED_EPISODE_SUMMARY.model_copy(update={"title": "新しいタイトル"})
+
+    def fake_map_changed(client, model, transcript, meta):
+        fake_calls["map"] += 1
+        return changed
+
+    monkeypatch.setattr(summarize_mod, "_call_map", fake_map_changed)
+    add_utterance(5_000, "さらに追加")
+    run_day(conn, cfg, "2026-09-15", client=object())
+    assert fake_calls == {"map": 3, "reduce": 2}
+    assert conn.execute("SELECT title FROM episodes").fetchone()["title"] == "新しいタイトル"
