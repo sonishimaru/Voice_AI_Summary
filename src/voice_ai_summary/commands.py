@@ -41,3 +41,28 @@ def config_path() -> None:
     from .config import DEFAULT_CONFIG_PATH
 
     typer.echo(str(Path(os.environ.get("VAS_CONFIG", str(DEFAULT_CONFIG_PATH))).expanduser()))
+
+
+@app.command()
+def usage(
+    days: int = typer.Option(30, "--days", help="Look back this many days."),
+) -> None:
+    """Show Claude API token usage and estimated cost recorded by this tool."""
+    from .llm import USAGE_FILENAME, summarize_usage
+
+    cfg = load_config()
+    rows = summarize_usage(cfg.paths.root / USAGE_FILENAME, days=days)
+    if not rows:
+        typer.echo("no API usage recorded")
+        return
+    typer.echo(f"{'purpose':<10} {'model':<20} {'calls':>5} {'in':>9} {'out':>8} {'USD':>8}")
+    total = 0.0
+    for r in rows:
+        total += r["usd"]
+        tokens_in = r["input"] + r["cache_read"] + r["cache_write"]
+        typer.echo(
+            f"{r['purpose']:<10} {r['model']:<20} {r['calls']:>5} "
+            f"{tokens_in:>9} {r['output']:>8} {r['usd']:>8.3f}"
+        )
+    typer.echo(f"{'total':<10} {'':<20} {'':>5} {'':>9} {'':>8} {total:>8.3f}")
+    typer.echo("(estimate from list prices; only calls made by vas are counted)")

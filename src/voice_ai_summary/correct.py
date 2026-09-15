@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from .config import Config
 from .db import transaction, utcnow_iso
 from .glossary import OutputTruncated, load_glossary
+from .llm import make_client, track_usage
 from .timeutil import fmt_hm, local_day_bounds
 
 log = logging.getLogger(__name__)
@@ -79,6 +80,7 @@ def _call_correct(
     except anthropic.APIStatusError as e:
         log.error("correction model %s returned status %s", model, e.status_code)
         raise
+    track_usage("correct", model, response)
     return response.parsed_output
 
 
@@ -152,7 +154,7 @@ def correct_day(
     batches = _batch_rows(rows, cfg.correct.batch_chars, tz)
 
     if client is None:
-        client = anthropic.Anthropic()
+        client = make_client(cfg)
 
     changed = 0
     for batch_rows, block_text in batches:

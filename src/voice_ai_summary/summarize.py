@@ -20,6 +20,7 @@ from .config import Config
 from .db import utcnow_iso
 from .episodes import build_episodes, episode_transcript
 from .glossary import load_glossary
+from .llm import make_client, track_usage
 from .timeutil import fmt_hm, local_day_bounds
 
 log = logging.getLogger(__name__)
@@ -173,6 +174,7 @@ def _call_map(
     except anthropic.APIStatusError as e:
         log.error("map model %s returned status %s", model, e.status_code)
         raise
+    track_usage("map", model, response)
     return response.parsed_output
 
 
@@ -267,6 +269,7 @@ def _call_reduce(
             messages=[{"role": "user", "content": user_content}],
         ) as stream:
             message = stream.get_final_message()
+            track_usage("reduce", model, message)
     except anthropic.RateLimitError:
         log.error("rate limited calling reduce model %s", model)
         raise
@@ -358,7 +361,7 @@ def run_day(
         )
         if has_utterances:
             if client is None:
-                client = anthropic.Anthropic()
+                client = make_client(cfg)
             correct.correct_day(conn, cfg, day, client=client)
 
     episode_ids = build_episodes(conn, cfg, day)
@@ -375,7 +378,7 @@ def run_day(
         return markdown
 
     if client is None:
-        client = anthropic.Anthropic()
+        client = make_client(cfg)
 
     glossary_block = load_glossary(cfg).prompt_block()
 
