@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from voice_ai_summary.asr import FasterWhisperBackend, get_backend
+from voice_ai_summary.asr import (
+    MAX_HOTWORD_CHARS,
+    FasterWhisperBackend,
+    _merged_hotwords,
+    get_backend,
+)
 from voice_ai_summary.config import DEFAULT_MLX_MODEL, Config
 
 
@@ -33,7 +38,9 @@ def test_faster_whisper_passes_vocabulary_and_prompt() -> None:
     out = backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
 
     assert model.kwargs["hotwords"] == "安田さん 西丸"
-    assert model.kwargs["initial_prompt"] == "社内会議の録音です。 安田さん、西丸。"
+    # Vocabulary goes through the hotwords slot only: faster-whisper applies it to every
+    # window, and repeating it in initial_prompt would eat the decoder's context.
+    assert model.kwargs["initial_prompt"] == "社内会議の録音です。"
     assert model.kwargs["condition_on_previous_text"] is False
     assert out[0].text == "安田さんに送ります"
     assert (out[0].t_start_ms, out[0].t_end_ms) == (0, 1200)
@@ -55,7 +62,7 @@ def test_mlx_backend_swaps_default_model(monkeypatch) -> None:
 
 def test_get_backend_merges_glossary_hotwords(monkeypatch, tmp_path) -> None:
     """`get_backend` loads the glossary once and passes its terms/aliases through as
-    `extra_hotwords`, which end up merged into the model's `hotwords`/`initial_prompt`."""
+    `extra_hotwords`, which end up merged into the model's `hotwords`."""
     monkeypatch.setenv("VAS_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("VAS_ASR_BACKEND", "faster-whisper")
 
@@ -72,5 +79,18 @@ def test_get_backend_merges_glossary_hotwords(monkeypatch, tmp_path) -> None:
     backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
 
     assert model.kwargs["hotwords"] == "安田さん 西丸 にしまる"
-    assert "西丸" in model.kwargs["initial_prompt"]
-    assert "にしまる" in model.kwargs["initial_prompt"]
+    assert model.kwargs["initial_prompt"] is None
+
+
+def test_hotwords_are_capped_to_what_the_decoder_will_read() -> None:
+    """Whisper only conditions on ~223 tokens of prompt; a 300-term glossary would be
+    silently cut, so cap it here and keep the configured terms at the front."""
+    cfg = Config()
+    cfg.asr.hotwords = ["安田さん"]
+    glossary_terms = [f"用語{i:03d}" for i in range(300)]
+
+    merged = _merged_hotwords(cfg, glossary_terms)
+
+    assert merged[0] == "安田さん"
+    assert len(" ".join(merged)) <= MAX_HOTWORD_CHARS
+    assert len(merged) < len(glossary_terms)

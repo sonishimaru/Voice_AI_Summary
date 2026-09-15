@@ -27,14 +27,30 @@ class ASRBackend(Protocol):
     def transcribe(self, samples16k: np.ndarray, *, language: str | None) -> list[Utterance]: ...
 
 
+# Whisper conditions on at most `max_length // 2 - 1` = 223 tokens of prompt and
+# faster-whisper silently truncates the rest, so a glossary of any size only reaches the
+# decoder as its first few dozen terms. Japanese encodes at a bit under one token per
+# character; cap the list by characters and keep it clear of that ceiling.
+MAX_HOTWORD_CHARS = 200
+
+
 def _merged_hotwords(cfg: Config, extra_hotwords: list[str]) -> list[str]:
-    """`cfg.asr.hotwords` extended with the user's glossary hotwords, deduplicated."""
+    """`cfg.asr.hotwords` extended with the user's glossary hotwords, deduplicated.
+
+    Truncated to `MAX_HOTWORD_CHARS` worth of terms: config hotwords come first, so
+    curating `[asr] hotwords` is how to pick what survives a large glossary.
+    """
     seen: set[str] = set()
     merged: list[str] = []
+    size = 0
     for word in (*cfg.asr.hotwords, *extra_hotwords):
-        if word not in seen:
-            seen.add(word)
-            merged.append(word)
+        if not word or word in seen:
+            continue
+        size += len(word) + 1
+        if size > MAX_HOTWORD_CHARS:
+            break
+        seen.add(word)
+        merged.append(word)
     return merged
 
 
@@ -76,7 +92,7 @@ class FasterWhisperBackend:
             beam_size=asr.beam_size,
             vad_filter=False,
             condition_on_previous_text=False,
-            initial_prompt=_prompt_for(self._cfg, hotwords),
+            initial_prompt=asr.initial_prompt.strip() or None,
             hotwords=" ".join(hotwords) or None,
         )
         return [
