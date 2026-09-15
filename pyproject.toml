@@ -1,0 +1,40 @@
+[project]
+name = "voice-ai-summary"
+version = "0.1.0"
+description = "Always-on voice capture → local Japanese transcription → Claude summaries → Slack/email digest"
+requires-python = ">=3.11"
+dependencies = [
+    "faster-whisper>=1.2",
+    "av>=14",
+    "numpy>=1.26",
+    "typer>=0.12",
+    "anthropic>=0.60",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+vas = "voice_ai_summary.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/voice_ai_summary"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

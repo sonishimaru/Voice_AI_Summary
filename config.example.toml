@@ -1,0 +1,45 @@
+# Copy to ~/.config/voice-ai-summary/config.toml (or set VAS_CONFIG=/path/to/config.toml).
+# Secrets (API keys, webhook URLs, SMTP passwords) are read from environment variables only.
+
+[paths]
+# Root data directory. The macOS recorder writes into <data_dir>/inbox/.
+data_dir = "~/Library/Application Support/VoiceAISummary"
+
+[asr]
+# faster-whisper model name or local path. Japanese default: kotoba-whisper-v2.0 (CTranslate2 build).
+model = "kotoba-tech/kotoba-whisper-v2.0-faster"
+device = "auto"          # auto | cpu | cuda
+compute_type = "default" # default | int8 | float16 | ...
+language = "ja"
+beam_size = 5
+
+[vad]
+threshold = 0.5           # Silero speech probability threshold (lower = more recall)
+min_speech_ms = 250
+min_silence_ms = 500      # gap that closes a speech region
+max_speech_s = 30         # split long regions for the ASR window
+pad_ms = 200              # padding added around each region
+
+[episodes]
+gap_minutes = 5           # silence longer than this starts a new episode
+
+[summarize]
+# Per-episode extraction (map) and daily rollup (reduce).
+map_model = "claude-haiku-4-5"
+reduce_model = "claude-opus-5"
+timezone = "Asia/Tokyo"
+
+[deliver]
+# Enable what you use. Secrets come from env: VAS_SLACK_WEBHOOK_URL, VAS_SMTP_PASSWORD.
+slack = false
+email = false
+email_from = ""
+email_to = ""
+smtp_host = "smtp.gmail.com"
+smtp_port = 587
+smtp_user = ""
+
+[schedule]
+digest_hour = 22          # local time for the daily digest (launchd)
+digest_minute = 0
+worker_poll_seconds = 30

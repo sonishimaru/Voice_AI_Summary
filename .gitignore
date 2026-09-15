@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+config.toml
+.env
+clients/macos/*.xcodeproj/
+clients/macos/build/
+clients/macos/DerivedData/
