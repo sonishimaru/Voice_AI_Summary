@@ -1,0 +1,113 @@
+"""Tests for the VAD→ASR→SQLite pipeline and search."""
+
+from __future__ import annotations
+
+import wave
+from pathlib import Path
+
+import pytest
+
+from voice_ai_summary import vad as vad_module
+from voice_ai_summary.asr import FakeBackend
+from voice_ai_summary.config import Config
+from voice_ai_summary.ingest import ingest_file
+from voice_ai_summary.pipeline import process_recording, speaker_for_source
+from voice_ai_summary.search import search
+from voice_ai_summary.vad import SpeechRegion
+
+
+def _write_wav(path: Path, seconds: float = 4.0, sample_rate: int = 16000) -> None:
+    n_samples = int(seconds * sample_rate)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(b"\x00\x00" * n_samples)
+
+
+def test_speaker_for_source() -> None:
+    assert speaker_for_source("mac_mic") == "me"
+    assert speaker_for_source("mac_system") == "other"
+    assert speaker_for_source("file") == "unknown"
+    assert speaker_for_source("anything_else") == "unknown"
+
+
+def test_process_recording_and_search(
+    vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, conn = vas
+    src = cfg.paths.inbox / "mac_system_dev1_20260915T000000Z.wav"
+    _write_wav(src)
+    rec_id = ingest_file(conn, cfg, src)
+
+    fixed_regions = [SpeechRegion(0, 1000, 0.9), SpeechRegion(1500, 2500, 0.8)]
+    monkeypatch.setattr(vad_module, "detect_speech", lambda samples, cfg: fixed_regions)
+
+    backend = FakeBackend(["こんにちは、テストです", "今日は会議があります"])
+    count = process_recording(conn, cfg, rec_id, backend)
+    assert count == 2
+
+    row = conn.execute("SELECT * FROM recordings WHERE id = ?", (rec_id,)).fetchone()
+    assert row["processed_at"] is not None
+    assert row["duration_ms"] is not None
+
+    segments = conn.execute(
+        "SELECT * FROM segments WHERE recording_id = ? ORDER BY start_ms", (rec_id,)
+    ).fetchall()
+    assert len(segments) == 2
+
+    utterances = conn.execute(
+        "SELECT * FROM utterances WHERE recording_id = ? ORDER BY t_start_ms", (rec_id,)
+    ).fetchall()
+    assert [u["text"] for u in utterances] == ["こんにちは、テストです", "今日は会議があります"]
+    assert all(u["speaker"] == "other" for u in utterances)
+    assert all(u["asr_model"] == "fake" for u in utterances)
+
+    # Second region starts at 1500ms -> abs_start_utc offset from started_at_utc.
+    assert utterances[1]["t_start_ms"] == 1500
+    assert utterances[1]["abs_start_utc"] == "2026-09-15T00:00:01Z"
+
+    results = search(conn, "会議が")  # 3 chars: exercises the trigram FTS index
+    assert len(results) == 1
+    assert results[0]["text"] == "今日は会議があります"
+    assert results[0]["speaker"] == "other"
+    assert results[0]["source"] == "mac_system"
+
+    # Query shorter than 3 chars can't match a trigram index; falls back to LIKE.
+    short_results = search(conn, "会議")
+    assert len(short_results) == 1
+    assert short_results[0]["text"] == "今日は会議があります"
+
+
+def test_process_recording_skips_empty_utterances(
+    vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, conn = vas
+    src = cfg.paths.inbox / "mac_mic_dev1_20260915T000000Z.wav"
+    _write_wav(src)
+    rec_id = ingest_file(conn, cfg, src)
+
+    monkeypatch.setattr(
+        vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, 0.9)]
+    )
+    backend = FakeBackend(["   "])
+    count = process_recording(conn, cfg, rec_id, backend)
+    assert count == 0
+
+
+def test_process_recording_sets_error_on_failure(vas: tuple[Config, object]) -> None:
+    cfg, conn = vas
+    src = cfg.paths.inbox / "mac_mic_dev1_20260915T000000Z.wav"
+    _write_wav(src)
+    rec_id = ingest_file(conn, cfg, src)
+    conn.execute(
+        "UPDATE recordings SET storage_path = 'does/not/exist.wav' WHERE id = ?", (rec_id,)
+    )
+    conn.commit()
+
+    backend = FakeBackend(["x"])
+    with pytest.raises(FileNotFoundError):
+        process_recording(conn, cfg, rec_id, backend)
+
+    row = conn.execute("SELECT error FROM recordings WHERE id = ?", (rec_id,)).fetchone()
+    assert row["error"]
