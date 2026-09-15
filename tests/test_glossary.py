@@ -80,6 +80,75 @@ def test_merge_unions_terms_aliases_and_style_notes() -> None:
     assert merged.style_notes == ["社名は「チョコレート」と表記", "英字は半角"]
 
 
+def test_merge_folds_alias_spellings_of_the_same_entity() -> None:
+    """Chunked extraction names the same thing twice, abbreviation-first in one chunk
+    and spelled-out in the next; both spellings land on one entry."""
+    a = Glossary(terms=[Term(term="KT", aliases=["KILLTUBE"], note="キルチューブ企画")])
+    b = Glossary(
+        terms=[
+            Term(term="KILLTUBE", aliases=["KT"], note="ユーザーの企画"),
+            Term(term="松浦藍さん", aliases=["松浦さん"], note="動画の監督"),
+        ]
+    )
+
+    merged = a.merge(b)
+
+    assert [t.term for t in merged.terms] == ["KT", "松浦藍さん"]
+    assert merged.terms[0].aliases == ["KILLTUBE"]
+    assert merged.terms[0].note == "キルチューブ企画"
+
+
+def test_merge_keeps_an_entity_that_is_only_claimed_as_an_alias() -> None:
+    """A character listed as an alias of its project is still its own entry - but a bare
+    repeat of a known alias, with nothing to add, is folded in."""
+    project = Glossary(
+        terms=[Term(term="ホイップラピッド", aliases=["ホイラピ", "ホイッピ"], note="キャラ企画")]
+    )
+    later = Glossary(
+        terms=[
+            Term(term="ホイッピ", note="ホイップラピッドのキャラクター"),
+            Term(term="ホイラピ"),
+        ]
+    )
+
+    merged = project.merge(later)
+
+    assert [t.term for t in merged.terms] == ["ホイップラピッド", "ホイッピ"]
+    assert merged.terms[0].aliases == ["ホイラピ", "ホイッピ"]
+
+
+def test_merge_matches_surface_forms_ignoring_case_width_and_spacing() -> None:
+    a = Glossary(terms=[Term(term="King of Time", note="勤怠管理")])
+    b = Glossary(terms=[Term(term="KingOfTime", aliases=["ｷﾝｸﾞｵﾌﾞﾀｲﾑ"], note="勤怠")])
+
+    merged = a.merge(b)
+
+    assert [t.term for t in merged.terms] == ["King of Time"]
+    assert merged.terms[0].aliases == ["ｷﾝｸﾞｵﾌﾞﾀｲﾑ"]
+
+
+def test_merge_collapses_restatements_of_a_style_note() -> None:
+    a = Glossary(
+        style_notes=["プロジェクト名は英語/カタカナ混在で使用", "キャラクター名は敬称なし"]
+    )
+    b = Glossary(
+        style_notes=[
+            "プロジェクト名は英語とカタカナ混在で使用",
+            "キャラクター名は敬称なし（ドット、ニコ等）",
+            "予算レベルは松竹梅で階級化",
+        ]
+    )
+
+    merged = a.merge(b)
+
+    assert merged.style_notes == [
+        "プロジェクト名は英語/カタカナ混在で使用",
+        # The later phrasing spells the same rule out further, so it wins the slot.
+        "キャラクター名は敬称なし（ドット、ニコ等）",
+        "予算レベルは松竹梅で階級化",
+    ]
+
+
 def test_prompt_block_formatting_and_emptiness() -> None:
     assert Glossary().prompt_block() == ""
 

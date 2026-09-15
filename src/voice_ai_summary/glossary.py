@@ -11,8 +11,12 @@ network; everything else here is pure and safe to unit test without an API key.
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
+import re
+import unicodedata
+from collections.abc import Iterable
 from pathlib import Path
 
 import anthropic
@@ -28,6 +32,13 @@ GLOSSARY_FILENAME = "glossary.json"
 # Keep a single extraction call's input well under the model's context window;
 # chunk longer message batches and merge the per-chunk extractions.
 MAX_EXTRACT_CHARS = 20_000
+
+# Two style notes this similar (after `_note_key`) are taken to be a restatement of the
+# same rule. Japanese one-liners share a lot of function characters, so this sits low;
+# an over-merge only costs one advisory line in the prompt.
+STYLE_NOTE_SIMILARITY = 0.6
+
+_PUNCT = re.compile(r"[\s!-/:-@\[-`{-~\u3000-\u303f]")
 
 
 class OutputTruncated(RuntimeError):
@@ -56,34 +67,18 @@ class Glossary(BaseModel):
         return out
 
     def merge(self, other: Glossary) -> Glossary:
-        """Union by `term`: aliases are unioned, `note` keeps the first non-empty one,
-        and `style_notes` are deduplicated. Order is first-seen, `self` before `other`.
+        """Union of the two glossaries, `self` first, one entry per entity.
+
+        Entries are folded together when they name the same thing (see `_merge_terms`)
+        rather than only on an exact `term` match: chunked extraction happily emits
+        `KT (KILLTUBE)` from one batch and `KILLTUBE (KT)` from the next. Aliases are
+        unioned onto the first-seen spelling, `note` keeps the first non-empty one, and
+        restatements of the same `style_notes` rule are collapsed.
         """
-        order: list[str] = []
-        aliases_by_term: dict[str, list[str]] = {}
-        note_by_term: dict[str, str] = {}
-        for term in (*self.terms, *other.terms):
-            if term.term not in aliases_by_term:
-                order.append(term.term)
-                aliases_by_term[term.term] = []
-                note_by_term[term.term] = ""
-            aliases = aliases_by_term[term.term]
-            for alias in term.aliases:
-                if alias not in aliases:
-                    aliases.append(alias)
-            if not note_by_term[term.term] and term.note:
-                note_by_term[term.term] = term.note
-
-        merged_terms = [
-            Term(term=t, aliases=aliases_by_term[t], note=note_by_term[t]) for t in order
-        ]
-
-        style_notes: list[str] = []
-        for note in (*self.style_notes, *other.style_notes):
-            if note not in style_notes:
-                style_notes.append(note)
-
-        return Glossary(terms=merged_terms, style_notes=style_notes)
+        return Glossary(
+            terms=_merge_terms((*self.terms, *other.terms)),
+            style_notes=_merge_style_notes((*self.style_notes, *other.style_notes)),
+        )
 
     def prompt_block(self) -> str:
         """Compact Japanese block for prompts. Empty sections are omitted; `""` when
@@ -100,6 +95,95 @@ class Glossary(BaseModel):
             lines = ["## 表記ルール", *[f"- {note}" for note in self.style_notes]]
             parts.append("\n".join(lines))
         return "\n".join(parts)
+
+
+def _key(text: str) -> str:
+    """Match key for a surface form: case, width and spacing are not meaningful here."""
+    return "".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def _note_key(note: str) -> str:
+    """Match key for a style note: `_key` with punctuation dropped, so that
+    「英語/カタカナ混在」 and 「英語とカタカナ混在」 compare as the same rule."""
+    return _PUNCT.sub("", unicodedata.normalize("NFKC", note).casefold())
+
+
+def _merge_terms(terms: Iterable[Term]) -> list[Term]:
+    """Fold `terms` into one entry per entity, in first-seen order.
+
+    Two entries are the same entity when their terms match, or when the later one lists
+    an already-known term among its aliases - the extraction pass states the alias
+    relationship explicitly, so that direction is trustworthy. An entry that is merely
+    *claimed* as someone else's alias keeps its own entry unless it adds nothing
+    (no note of its own): the pass often lists a character as an alias of its project.
+    """
+    clusters: list[dict] = []
+    for term in terms:
+        keys = {_key(alias) for alias in term.aliases if alias}
+        key = _key(term.term)
+        if not key:
+            continue
+        hits = [c for c in clusters if _is_same_entity(c, key, keys, bool(term.note))]
+        if not hits:
+            hits = [{"surfaces": [], "seen": set(), "terms": set(), "aliases": set(), "note": ""}]
+            clusters.append(hits[0])
+        target, *rest = hits
+        for other in rest:
+            _absorb(target, other["surfaces"], other["terms"], other["aliases"], other["note"])
+            clusters.remove(other)
+        _absorb(target, [term.term, *term.aliases], {key}, keys, term.note)
+
+    return [
+        Term(term=c["surfaces"][0], aliases=c["surfaces"][1:], note=c["note"]) for c in clusters
+    ]
+
+
+def _is_same_entity(cluster: dict, key: str, alias_keys: set[str], has_note: bool) -> bool:
+    if key in cluster["terms"] or cluster["terms"] & alias_keys:
+        return True
+    if key in cluster["aliases"]:
+        return not has_note or bool(cluster["aliases"] & alias_keys)
+    return False
+
+
+def _absorb(
+    cluster: dict, surfaces: Iterable[str], terms: set[str], aliases: set[str], note: str
+) -> None:
+    for surface in surfaces:
+        key = _key(surface)
+        if key and key not in cluster["seen"]:
+            cluster["seen"].add(key)
+            cluster["surfaces"].append(surface)
+    cluster["terms"] |= terms
+    cluster["aliases"] |= aliases
+    if not cluster["note"] and note:
+        cluster["note"] = note
+
+
+def _merge_style_notes(notes: Iterable[str]) -> list[str]:
+    """Keep one phrasing per rule: every extraction chunk restates the same handful of
+    conventions in slightly different words, and all of them land in the prompt."""
+    kept: list[str] = []
+    keys: list[str] = []
+    for note in notes:
+        key = _note_key(note)
+        if not key:
+            continue
+        for i, known in enumerate(keys):
+            if known in key and known != key:
+                # A later note spells the same rule out further; prefer the longer one.
+                kept[i], keys[i] = note, key
+                break
+            if (
+                key == known
+                or key in known
+                or difflib.SequenceMatcher(None, known, key).ratio() >= STYLE_NOTE_SIMILARITY
+            ):
+                break
+        else:
+            kept.append(note)
+            keys.append(key)
+    return kept
 
 
 def _glossary_path(cfg: Config) -> Path:
@@ -136,7 +220,9 @@ _EXTRACT_SYSTEM = """あなたはユーザー本人のSlackメッセージから
 推測で内容を作らず、メッセージ本文に根拠がある項目だけを挙げてください。
 note は 30 文字以内、style_notes は各 40 文字以内で簡潔に。1 回の出力は重要度の高い
 順に最大 60 項目までとし、一般的な語や一度しか出てこない些末な語は含めないでください。
-すでに分かっている用語集(重複させないための参考。ここにある用語は出力しなくてよい):
+すでに分かっている用語集(重複させないための参考。ここにある用語は、別表記・敬称違い・
+略語と正式名の関係であっても出力しないでください。style_notes も既出のルールと同じ
+内容なら出力しないでください):
 {existing}
 """
 
