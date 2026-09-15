@@ -14,11 +14,12 @@ import logging
 import sqlite3
 
 import anthropic
+import pydantic
 from pydantic import BaseModel, Field
 
 from .config import Config
 from .db import transaction, utcnow_iso
-from .glossary import load_glossary
+from .glossary import OutputTruncated, load_glossary
 from .timeutil import fmt_hm, local_day_bounds
 
 log = logging.getLogger(__name__)
@@ -61,11 +62,14 @@ def _call_correct(
     try:
         response = client.messages.parse(
             model=model,
-            max_tokens=4096,
+            max_tokens=16000,
             system=_CORRECT_SYSTEM,
             messages=[{"role": "user", "content": user_content}],
             output_format=CorrectionResult,
         )
+    except pydantic.ValidationError as e:
+        # Structured output only fails validation when cut off at max_tokens.
+        raise OutputTruncated(str(e)) from e
     except anthropic.RateLimitError:
         log.error("rate limited calling correction model %s", model)
         raise
@@ -152,22 +156,48 @@ def correct_day(
 
     changed = 0
     for batch_rows, block_text in batches:
+        changed += _correct_batch(conn, cfg, client, batch_rows, block_text, glossary_block, tz)
+    return changed
+
+
+def _correct_batch(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    client: anthropic.Anthropic,
+    batch_rows: list[sqlite3.Row],
+    block_text: str,
+    glossary_block: str,
+    tz: str,
+) -> int:
+    """Correct one batch; on a truncated response, split the batch in half and retry."""
+    try:
         result = _call_correct(client, cfg.correct.model, block_text, glossary_block)
-        fixes = {fix.id: fix.text for fix in result.fixes}
-        now = utcnow_iso()
-        with transaction(conn):
-            for row in batch_rows:
-                new_text = fixes.get(row["id"])
-                if new_text is not None and new_text.strip() and new_text != row["text"]:
-                    conn.execute(
-                        "UPDATE utterances SET raw_text = COALESCE(raw_text, text), "
-                        "text = ?, corrected_at = ?, correction_model = ? WHERE id = ?",
-                        (new_text, now, cfg.correct.model, row["id"]),
-                    )
-                    changed += 1
-                else:
-                    conn.execute(
-                        "UPDATE utterances SET corrected_at = ?, correction_model = ? WHERE id = ?",
-                        (now, cfg.correct.model, row["id"]),
-                    )
+    except OutputTruncated:
+        if len(batch_rows) < 2:
+            raise
+        log.warning("correction output truncated; splitting batch of %d rows", len(batch_rows))
+        mid = len(batch_rows) // 2
+        total = 0
+        for part in (batch_rows[:mid], batch_rows[mid:]):
+            [(rows, block)] = _batch_rows(part, 10**9, tz)
+            total += _correct_batch(conn, cfg, client, rows, block, glossary_block, tz)
+        return total
+    fixes = {fix.id: fix.text for fix in result.fixes}
+    now = utcnow_iso()
+    changed = 0
+    with transaction(conn):
+        for row in batch_rows:
+            new_text = fixes.get(row["id"])
+            if new_text is not None and new_text.strip() and new_text != row["text"]:
+                conn.execute(
+                    "UPDATE utterances SET raw_text = COALESCE(raw_text, text), "
+                    "text = ?, corrected_at = ?, correction_model = ? WHERE id = ?",
+                    (new_text, now, cfg.correct.model, row["id"]),
+                )
+                changed += 1
+            else:
+                conn.execute(
+                    "UPDATE utterances SET corrected_at = ?, correction_model = ? WHERE id = ?",
+                    (now, cfg.correct.model, row["id"]),
+                )
     return changed

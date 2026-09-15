@@ -205,3 +205,22 @@ def test_extract_glossary_chunks_and_merges(monkeypatch) -> None:
     assert "既存用語" in term_names
     for i in range(1, len(calls) + 1):
         assert f"用語{i}" in term_names
+
+
+def test_extract_glossary_splits_chunk_when_output_truncated(monkeypatch) -> None:
+    from voice_ai_summary.glossary import OutputTruncated
+
+    calls: list[int] = []
+
+    def fake_call_extract(client, model, text, existing_block) -> Glossary:
+        lines = text.split("\n")
+        calls.append(len(lines))
+        if len(lines) > 2:
+            raise OutputTruncated("cut off")
+        return Glossary(terms=[Term(term=lines[0])])
+
+    monkeypatch.setattr(glossary_mod, "_call_extract", fake_call_extract)
+    result = extract_glossary(object(), "m", ["a", "b", "c", "d", "e"], Glossary())
+
+    assert calls[0] == 5 and max(calls[1:]) <= 3
+    assert [t.term for t in result.terms] == ["a", "c", "d"]

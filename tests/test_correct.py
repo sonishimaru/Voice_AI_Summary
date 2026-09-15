@@ -198,3 +198,30 @@ def test_correct_day_search_finds_corrected_word(vas, monkeypatch) -> None:
     results = search(conn, "西丸")
     assert any(r["text"] == "西丸です" for r in results)
     assert not search(conn, "かたま")
+
+
+def test_correct_day_splits_batch_when_output_truncated(vas, monkeypatch) -> None:
+    from voice_ai_summary.glossary import OutputTruncated
+
+    cfg, conn = vas
+    _seed_utterances(conn, ["いち", "に", "さん", "よん", "ご"])
+    cfg.correct.batch_chars = 100_000
+    seen: list[int] = []
+
+    def fake_call_correct(client, model, block, glossary_block):
+        n = len(block.split("\n"))
+        seen.append(n)
+        if n > 2:
+            raise OutputTruncated("cut off")
+        first_id = int(block.split("\t", 1)[0])
+        return CorrectionResult(fixes=[Fix(id=first_id, text="修正済み")])
+
+    monkeypatch.setattr(correct_mod, "_call_correct", fake_call_correct)
+    changed = correct_day(conn, cfg, DAY, client=object())
+
+    assert seen == [5, 2, 3, 1, 2]
+    assert changed >= 1
+    pending = conn.execute(
+        "SELECT COUNT(*) AS n FROM utterances WHERE corrected_at IS NULL"
+    ).fetchone()["n"]
+    assert pending == 0

@@ -16,6 +16,7 @@ import logging
 from pathlib import Path
 
 import anthropic
+import pydantic
 from pydantic import BaseModel, Field
 
 from .config import Config
@@ -26,7 +27,11 @@ GLOSSARY_FILENAME = "glossary.json"
 
 # Keep a single extraction call's input well under the model's context window;
 # chunk longer message batches and merge the per-chunk extractions.
-MAX_EXTRACT_CHARS = 30_000
+MAX_EXTRACT_CHARS = 20_000
+
+
+class OutputTruncated(RuntimeError):
+    """A structured-output response hit `max_tokens` and could not be parsed."""
 
 
 class Term(BaseModel):
@@ -129,6 +134,8 @@ _EXTRACT_SYSTEM = """あなたはユーザー本人のSlackメッセージから
   style_notes に短い文で入れてください
 
 推測で内容を作らず、メッセージ本文に根拠がある項目だけを挙げてください。
+note は 30 文字以内、style_notes は各 40 文字以内で簡潔に。1 回の出力は重要度の高い
+順に最大 60 項目までとし、一般的な語や一度しか出てこない些末な語は含めないでください。
 すでに分かっている用語集(重複させないための参考。ここにある用語は出力しなくてよい):
 {existing}
 """
@@ -145,11 +152,15 @@ def _call_extract(
     try:
         response = client.messages.parse(
             model=model,
-            max_tokens=4096,
+            max_tokens=16000,
             system=system,
             messages=[{"role": "user", "content": text}],
             output_format=Glossary,
         )
+    except pydantic.ValidationError as e:
+        # The only way structured output fails validation is a response cut off at
+        # max_tokens; the caller retries with a smaller input.
+        raise OutputTruncated(str(e)) from e
     except anthropic.RateLimitError:
         log.error("rate limited calling glossary extraction model %s", model)
         raise
@@ -189,6 +200,23 @@ def extract_glossary(
     model's context window, merging each chunk's extraction into `existing` progressively."""
     result = existing
     for chunk in _chunk_messages(messages, MAX_EXTRACT_CHARS):
-        extracted = _call_extract(client, model, chunk, result.prompt_block())
-        result = result.merge(extracted)
+        result = _extract_chunk(client, model, chunk, result)
     return result
+
+
+def _extract_chunk(
+    client: anthropic.Anthropic, model: str, chunk: str, existing: Glossary
+) -> Glossary:
+    """Extract from one chunk, halving it (by lines) whenever the output was truncated."""
+    try:
+        return existing.merge(_call_extract(client, model, chunk, existing.prompt_block()))
+    except OutputTruncated:
+        lines = chunk.split("\n")
+        if len(lines) < 2:
+            raise
+        log.warning(
+            "glossary extraction output truncated; retrying with %d lines split", len(lines)
+        )
+        mid = len(lines) // 2
+        result = _extract_chunk(client, model, "\n".join(lines[:mid]), existing)
+        return _extract_chunk(client, model, "\n".join(lines[mid:]), result)
