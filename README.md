@@ -92,6 +92,30 @@ vas ingest ~/Downloads/zoom_recording.m4a   # 手持ちの録音を取り込む�
 
 音声側では、録音アプリのビットレート（32kbps）を上げるより、Zoom 側の「オリジナルサウンド」を有効にする方が効きます。
 
+## Claude による校正と用語集
+
+ローカルの Whisper 文字起こしは、固有名詞や同音異義語（「かたまです」→本来は人名、「ギョウ太郎」「行太郎」のような表記ゆれ）を取りこぼします。音声は Mac の外に出しませんが、テキストだけを Claude に送って校正する仕組みがあります。
+
+```
+文字起こし（Whisper） → vas correct（Claude で校正） → vas digest / summarize（要約）
+```
+
+- `vas correct --day YYYY-MM-DD` — その日の未校正の発話を Claude（既定 `claude-haiku-4-5`、`[correct]` で変更可）に送り、明らかな認識ミスだけを修正します。口調・方言・フィラーは変更されません。修正前のテキストは `raw_text` 列に残るので、いつでも元の ASR 出力に戻れます。`--show` で修正前後の差分を表示、`--force` で再校正します。
+- `vas digest` / `vas summarize` は要約前に自動でこの校正パスを実行します（`[correct] enabled = false` で無効化可能）。要約は文字起こし内容のハッシュでキャッシュされるため、校正でテキストが変わると要約も自動的に再生成されます。
+- 校正・要約・ASR の語彙ヒント（`[asr] hotwords`）は、いずれも個人用の **用語集**（人名・社名・製品名や、ユーザー自身の表記の流儀）を参照します。用語集は `<data_dir>/glossary.json` に保存されます。
+
+用語集は手で追加するか、自分の Slack 発言から自動抽出できます：
+
+```bash
+vas vocab show                                   # 現在の用語集を表示
+vas vocab add "西丸" --alias にしまる --note "ユーザー本人の姓"
+
+export VAS_SLACK_USER_TOKEN=xoxp-...             # Slack ユーザートークン（scope: search:read）
+vas vocab import-slack                           # 直近90日分の自分の発言から用語集を生成
+```
+
+`VAS_SLACK_USER_TOKEN` は **ユーザートークン**（`xoxp-`）である必要があります（`search.messages` はボットトークンでは使えません）。抽出には `[correct] model` と同じモデルが既定で使われます。
+
 ## 開発
 
 ```bash

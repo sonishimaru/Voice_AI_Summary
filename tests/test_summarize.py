@@ -90,16 +90,19 @@ _CANNED_DAY_MARKDOWN = "# 2026-09-15 の記録\n\n## ハイライト\n\nテス�
 def fake_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     counts = {"map": 0, "reduce": 0}
 
-    def fake_map(client, model, transcript, meta):
+    def fake_map(client, model, transcript, meta, glossary_block=""):
         counts["map"] += 1
         return _CANNED_EPISODE_SUMMARY
 
-    def fake_reduce(client, model, day, episodes_json):
+    def fake_reduce(client, model, day, episodes_json, glossary_block=""):
         counts["reduce"] += 1
         return _CANNED_DAY_MARKDOWN
 
     monkeypatch.setattr(summarize_mod, "_call_map", fake_map)
     monkeypatch.setattr(summarize_mod, "_call_reduce", fake_reduce)
+    # These tests are not about the correction pass; stub it out so `run_day` never
+    # touches the network through that hook either.
+    monkeypatch.setattr(summarize_mod.correct, "correct_day", lambda *a, **k: 0)
     return counts
 
 
@@ -212,7 +215,7 @@ def test_run_day_recomputes_when_new_utterances_arrive(vas, fake_calls, monkeypa
     # Transcript changed and the episode summary differs → reduce runs again.
     changed = _CANNED_EPISODE_SUMMARY.model_copy(update={"title": "新しいタイトル"})
 
-    def fake_map_changed(client, model, transcript, meta):
+    def fake_map_changed(client, model, transcript, meta, glossary_block=""):
         fake_calls["map"] += 1
         return changed
 
@@ -221,3 +224,57 @@ def test_run_day_recomputes_when_new_utterances_arrive(vas, fake_calls, monkeypa
     run_day(conn, cfg, "2026-09-15", client=object())
     assert fake_calls == {"map": 3, "reduce": 2}
     assert conn.execute("SELECT title FROM episodes").fetchone()["title"] == "新しいタイトル"
+
+
+def test_run_day_calls_correction_before_episodes(vas, monkeypatch) -> None:
+    """`correct.correct_day` runs before `build_episodes` when correction is enabled."""
+    cfg, conn = vas
+    _seed_one_episode(conn)
+    order: list[str] = []
+
+    def fake_correct(conn_, cfg_, day_, *, client=None, force=False):
+        order.append("correct")
+        return 0
+
+    real_build_episodes = summarize_mod.build_episodes
+
+    def fake_build_episodes(conn_, cfg_, day_):
+        order.append("episodes")
+        return real_build_episodes(conn_, cfg_, day_)
+
+    monkeypatch.setattr(summarize_mod.correct, "correct_day", fake_correct)
+    monkeypatch.setattr(summarize_mod, "build_episodes", fake_build_episodes)
+    monkeypatch.setattr(summarize_mod, "_call_map", lambda *a, **k: _CANNED_EPISODE_SUMMARY)
+    monkeypatch.setattr(summarize_mod, "_call_reduce", lambda *a, **k: _CANNED_DAY_MARKDOWN)
+
+    run_day(conn, cfg, "2026-09-15", client=object())
+
+    assert order == ["correct", "episodes"]
+
+
+def test_run_day_includes_glossary_block_in_map_and_reduce(vas, monkeypatch) -> None:
+    cfg, conn = vas
+    _seed_one_episode(conn)
+
+    from voice_ai_summary.glossary import Glossary, Term, save_glossary
+
+    save_glossary(cfg, Glossary(terms=[Term(term="西丸", note="ユーザー本人の姓")]))
+
+    captured: dict[str, str] = {}
+
+    def fake_map(client, model, transcript, meta, glossary_block=""):
+        captured["map"] = glossary_block
+        return _CANNED_EPISODE_SUMMARY
+
+    def fake_reduce(client, model, day, episodes_json, glossary_block=""):
+        captured["reduce"] = glossary_block
+        return _CANNED_DAY_MARKDOWN
+
+    monkeypatch.setattr(summarize_mod, "_call_map", fake_map)
+    monkeypatch.setattr(summarize_mod, "_call_reduce", fake_reduce)
+    monkeypatch.setattr(summarize_mod.correct, "correct_day", lambda *a, **k: 0)
+
+    run_day(conn, cfg, "2026-09-15", client=object())
+
+    assert "西丸" in captured["map"]
+    assert "西丸" in captured["reduce"]

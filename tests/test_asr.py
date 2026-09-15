@@ -51,3 +51,26 @@ def test_mlx_backend_swaps_default_model(monkeypatch) -> None:
     assert backend.name == f"mlx-whisper:{DEFAULT_MLX_MODEL}"
     cfg.asr.model = "mlx-community/whisper-large-v3"
     assert get_backend(cfg).name == "mlx-whisper:mlx-community/whisper-large-v3"
+
+
+def test_get_backend_merges_glossary_hotwords(monkeypatch, tmp_path) -> None:
+    """`get_backend` loads the glossary once and passes its terms/aliases through as
+    `extra_hotwords`, which end up merged into the model's `hotwords`/`initial_prompt`."""
+    monkeypatch.setenv("VAS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("VAS_ASR_BACKEND", "faster-whisper")
+
+    from voice_ai_summary.config import load_config
+    from voice_ai_summary.glossary import Glossary, Term, save_glossary
+
+    cfg = load_config()
+    cfg.asr.hotwords = ["安田さん"]
+    save_glossary(cfg, Glossary(terms=[Term(term="西丸", aliases=["にしまる"])]))
+
+    backend = get_backend(cfg)
+    model = _FakeModel()
+    backend._model = model
+    backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
+
+    assert model.kwargs["hotwords"] == "安田さん 西丸 にしまる"
+    assert "西丸" in model.kwargs["initial_prompt"]
+    assert "にしまる" in model.kwargs["initial_prompt"]

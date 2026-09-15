@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utcnow_iso() -> str:
@@ -32,10 +32,24 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
 def apply_schema(conn: sqlite3.Connection) -> None:
     sql = resources.files("voice_ai_summary").joinpath("schema.sql").read_text(encoding="utf-8")
     conn.executescript(sql)
+    _migrate_utterances_columns(conn)
     row = conn.execute("SELECT version FROM schema_version").fetchone()
     if row is None:
         conn.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
+    elif row["version"] < SCHEMA_VERSION:
+        conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
     conn.commit()
+
+
+def _migrate_utterances_columns(conn: sqlite3.Connection) -> None:
+    """v1 -> v2: add the correction-pass columns to `utterances` for DBs created before them.
+
+    Fresh databases already get these columns from `schema.sql`, so this is a no-op there.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(utterances)")}
+    for name in ("raw_text", "corrected_at", "correction_model"):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE utterances ADD COLUMN {name} TEXT")
 
 
 @contextmanager

@@ -86,6 +86,15 @@ class SummarizeConfig(BaseModel):
     timezone: str = "Asia/Tokyo"
 
 
+class CorrectConfig(BaseModel):
+    """Claude-based correction pass over ASR text, before summarization."""
+
+    enabled: bool = True
+    model: str = "claude-haiku-4-5"
+    # Characters per correction call; longer days are split into consecutive batches.
+    batch_chars: int = 6000
+
+
 class DeliverConfig(BaseModel):
     slack: bool = False
     email: bool = False
@@ -108,6 +117,7 @@ class Config(BaseModel):
     vad: VadConfig = Field(default_factory=VadConfig)
     episodes: EpisodesConfig = Field(default_factory=EpisodesConfig)
     summarize: SummarizeConfig = Field(default_factory=SummarizeConfig)
+    correct: CorrectConfig = Field(default_factory=CorrectConfig)
     deliver: DeliverConfig = Field(default_factory=DeliverConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
 
@@ -119,6 +129,11 @@ class Config(BaseModel):
     @property
     def smtp_password(self) -> str | None:
         return os.environ.get("VAS_SMTP_PASSWORD")
+
+    @property
+    def slack_user_token(self) -> str | None:
+        """User token (`xoxp-…`, scope `search:read`) for building the glossary from Slack."""
+        return os.environ.get("VAS_SLACK_USER_TOKEN")
 
     def ensure_dirs(self) -> None:
         for p in (self.paths.inbox, self.paths.store, self.paths.digests):

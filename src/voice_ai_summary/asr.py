@@ -27,11 +27,31 @@ class ASRBackend(Protocol):
     def transcribe(self, samples16k: np.ndarray, *, language: str | None) -> list[Utterance]: ...
 
 
+def _merged_hotwords(cfg: Config, extra_hotwords: list[str]) -> list[str]:
+    """`cfg.asr.hotwords` extended with the user's glossary hotwords, deduplicated."""
+    seen: set[str] = set()
+    merged: list[str] = []
+    for word in (*cfg.asr.hotwords, *extra_hotwords):
+        if word not in seen:
+            seen.add(word)
+            merged.append(word)
+    return merged
+
+
+def _prompt_for(cfg: Config, hotwords: list[str]) -> str | None:
+    """Same formula as `AsrConfig.prompt`, but over a (possibly glossary-extended) list."""
+    parts = [cfg.asr.initial_prompt.strip()] if cfg.asr.initial_prompt.strip() else []
+    if hotwords:
+        parts.append("、".join(hotwords) + "。")
+    return " ".join(parts) or None
+
+
 class FasterWhisperBackend:
     """Lazily loaded faster-whisper model."""
 
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, *, extra_hotwords: list[str] | None = None) -> None:
         self._cfg = cfg
+        self._extra_hotwords = extra_hotwords or []
         self._model = None
         self.name = f"faster-whisper:{cfg.asr.resolved_model}"
 
@@ -49,14 +69,15 @@ class FasterWhisperBackend:
     def transcribe(self, samples16k: np.ndarray, *, language: str | None) -> list[Utterance]:
         model = self._get_model()
         asr = self._cfg.asr
+        hotwords = _merged_hotwords(self._cfg, self._extra_hotwords)
         segments, _info = model.transcribe(
             samples16k,
             language=language,
             beam_size=asr.beam_size,
             vad_filter=False,
             condition_on_previous_text=False,
-            initial_prompt=asr.prompt,
-            hotwords=" ".join(asr.hotwords) or None,
+            initial_prompt=_prompt_for(self._cfg, hotwords),
+            hotwords=" ".join(hotwords) or None,
         )
         return [
             Utterance(
@@ -73,19 +94,21 @@ class FasterWhisperBackend:
 class MlxWhisperBackend:
     """mlx-whisper: runs Whisper on the Apple Silicon GPU (macOS only)."""
 
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, *, extra_hotwords: list[str] | None = None) -> None:
         self._cfg = cfg
+        self._extra_hotwords = extra_hotwords or []
         self.name = f"mlx-whisper:{cfg.asr.resolved_model}"
 
     def transcribe(self, samples16k: np.ndarray, *, language: str | None) -> list[Utterance]:
         import mlx_whisper
 
         asr = self._cfg.asr
+        hotwords = _merged_hotwords(self._cfg, self._extra_hotwords)
         result = mlx_whisper.transcribe(
             samples16k,
             path_or_hf_repo=asr.resolved_model,
             language=language,
-            initial_prompt=asr.prompt,
+            initial_prompt=_prompt_for(self._cfg, hotwords),
             condition_on_previous_text=False,
             verbose=None,
         )
@@ -130,8 +153,12 @@ def get_backend(cfg: Config) -> ASRBackend:
     backend = os.environ.get("VAS_ASR_BACKEND") or cfg.asr.backend
     if backend == "fake":
         return FakeBackend()
+
+    from .glossary import load_glossary
+
+    extra_hotwords = load_glossary(cfg).hotwords()
     if backend == "mlx":
-        return MlxWhisperBackend(cfg)
+        return MlxWhisperBackend(cfg, extra_hotwords=extra_hotwords)
     if backend == "faster-whisper":
-        return FasterWhisperBackend(cfg)
+        return FasterWhisperBackend(cfg, extra_hotwords=extra_hotwords)
     raise ValueError(f"unknown ASR backend: {backend!r} (faster-whisper | mlx)")

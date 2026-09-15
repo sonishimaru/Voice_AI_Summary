@@ -32,4 +32,5 @@ from . import (  # noqa: E402
     commands_deliver,  # noqa: F401
     commands_pipeline,  # noqa: F401
     commands_summary,  # noqa: F401
+    commands_vocab,  # noqa: F401
 )

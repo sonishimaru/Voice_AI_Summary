@@ -38,6 +38,19 @@ map_model = "claude-haiku-4-5"
 reduce_model = "claude-opus-5"
 timezone = "Asia/Tokyo"
 
+[correct]
+# Claude-based correction pass over ASR text (homophones, proper-noun spellings) that
+# runs before summarization. Uses the personal glossary below as context; corrected
+# text is kept in `text` and the original in `raw_text`. See README for `vas correct`.
+enabled = true
+model = "claude-haiku-4-5"
+batch_chars = 6000   # characters per correction call; long days are split into batches
+
+# The personal glossary (`vas vocab ...`) can be built from your own Slack messages:
+#   export VAS_SLACK_USER_TOKEN=xoxp-...    # Slack *user* token, scope: search:read
+#   vas vocab import-slack
+# (search.messages needs a user token; a bot token won't work.)
+
 [deliver]
 # Enable what you use. Secrets come from env: VAS_SLACK_WEBHOOK_URL, VAS_SMTP_PASSWORD.
 slack = false

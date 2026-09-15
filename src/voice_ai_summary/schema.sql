@@ -58,7 +58,10 @@ CREATE TABLE IF NOT EXISTS utterances (
     lang           TEXT,
     asr_model      TEXT,
     avg_logprob    REAL,
-    speaker        TEXT NOT NULL DEFAULT 'unknown'   -- me | other | unknown (derived from track)
+    speaker        TEXT NOT NULL DEFAULT 'unknown',  -- me | other | unknown (derived from track)
+    raw_text       TEXT,                      -- pre-correction ASR text (set once corrected)
+    corrected_at   TEXT,                       -- ISO 8601 UTC, when the correction pass last ran
+    correction_model TEXT                      -- model id used for the correction pass
 );
 CREATE INDEX IF NOT EXISTS idx_utterances_recording ON utterances(recording_id);
 CREATE INDEX IF NOT EXISTS idx_utterances_abs_start ON utterances(abs_start_utc);

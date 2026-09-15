@@ -15,10 +15,12 @@ import sqlite3
 import anthropic
 from pydantic import BaseModel, Field
 
+from . import correct
 from .config import Config
 from .db import utcnow_iso
 from .episodes import build_episodes, episode_transcript
-from .timeutil import fmt_hm
+from .glossary import load_glossary
+from .timeutil import fmt_hm, local_day_bounds
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +87,7 @@ _MAP_SYSTEM = """あなたはユーザー本人の一日の音声ログを整理
   (ニュース、YouTube、アニメなど)の音声である可能性が高いです。その場合は
   「何を視聴していたか」を短くまとめ、登場人物の発言をユーザーの決定事項や
   TODO として扱わないでください。
+- 用語集(固有名詞の表記や表記ルール)が付与されている場合は、その表記に従ってください。
 """
 
 _REDUCE_SYSTEM = """あなたはユーザー本人の一日分の音声ログ要約(デイリーダイジェスト)を
@@ -95,6 +98,7 @@ _REDUCE_SYSTEM = """あなたはユーザー本人の一日分の音声ログ要
 存在しない情報を創作しないでください。
 kind が "media" のエピソードは視聴していたコンテンツなので、エピソード一覧では
 タイトルの先頭に【視聴】を付けて 1 行にまとめ、ハイライト・決定事項・TODO には含めないでください。
+用語集の表記ルールが付与されている場合は、それに従うこと。
 
 出力フォーマット(必ずこの見出し構成に従うこと):
 # {day} の記録
@@ -126,19 +130,32 @@ def _chunk_transcript(transcript: str, max_chars: int) -> list[str]:
     return chunks
 
 
+def _map_user_content(transcript: str, meta: dict, glossary_block: str = "") -> str:
+    """Pure builder for the map step's user message - kept separate from `_call_map`
+    so tests can assert the glossary block lands here without touching the network."""
+    content = (
+        f"エピソード情報: {meta.get('start')}〜{meta.get('end')} "
+        f"種別(推定)={meta.get('kind')} ソース={meta.get('source_mix')}\n\n"
+        f"文字起こし:\n{transcript}"
+    )
+    if glossary_block:
+        content += f"\n\n{glossary_block}"
+    return content
+
+
 def _call_map(
-    client: anthropic.Anthropic, model: str, transcript: str, meta: dict
+    client: anthropic.Anthropic,
+    model: str,
+    transcript: str,
+    meta: dict,
+    glossary_block: str = "",
 ) -> EpisodeSummary:
     """Map step: extract a structured `EpisodeSummary` from one episode's transcript.
 
     Structured outputs guarantee schema-valid JSON, so no assistant prefill is used
     (and would 400 on these models anyway). `claude-haiku-4-5` needs no `thinking` param.
     """
-    user_content = (
-        f"エピソード情報: {meta.get('start')}〜{meta.get('end')} "
-        f"種別(推定)={meta.get('kind')} ソース={meta.get('source_mix')}\n\n"
-        f"文字起こし:\n{transcript}"
-    )
+    user_content = _map_user_content(transcript, meta, glossary_block)
     try:
         response = client.messages.parse(
             model=model,
@@ -199,18 +216,37 @@ def _merge_episode_summaries(parts: list[EpisodeSummary]) -> EpisodeSummary:
 
 
 def summarize_episode(
-    client: anthropic.Anthropic, cfg: Config, transcript: str, meta: dict
+    client: anthropic.Anthropic,
+    cfg: Config,
+    transcript: str,
+    meta: dict,
+    glossary_block: str = "",
 ) -> EpisodeSummary:
     """Extract a structured summary for one episode, chunking very long transcripts."""
     model = cfg.summarize.map_model
     if len(transcript) <= MAX_TRANSCRIPT_CHARS:
-        return _call_map(client, model, transcript, meta)
+        return _call_map(client, model, transcript, meta, glossary_block)
     chunks = _chunk_transcript(transcript, MAX_CHUNK_CHARS)
-    parts = [_call_map(client, model, chunk, meta) for chunk in chunks]
+    parts = [_call_map(client, model, chunk, meta, glossary_block) for chunk in chunks]
     return _merge_episode_summaries(parts)
 
 
-def _call_reduce(client: anthropic.Anthropic, model: str, day: str, episodes_json: str) -> str:
+def _reduce_user_content(day: str, episodes_json: str, glossary_block: str = "") -> str:
+    """Pure builder for the reduce step's user message - kept separate from `_call_reduce`
+    so tests can assert the glossary block lands here without touching the network."""
+    content = f"{day} のエピソード要約(JSON配列):\n{episodes_json}"
+    if glossary_block:
+        content += f"\n\n{glossary_block}"
+    return content
+
+
+def _call_reduce(
+    client: anthropic.Anthropic,
+    model: str,
+    day: str,
+    episodes_json: str,
+    glossary_block: str = "",
+) -> str:
     """Reduce step: turn the day's episode summaries into a Japanese Markdown digest.
 
     `claude-opus-5` has adaptive thinking on by default, so `thinking` is omitted;
@@ -221,7 +257,7 @@ def _call_reduce(client: anthropic.Anthropic, model: str, day: str, episodes_jso
     `claude-opus-5`, so per the task's guidance we use the plain `client.messages`
     call here instead of guessing at an unlisted beta/model pairing.
     """
-    user_content = f"{day} のエピソード要約(JSON配列):\n{episodes_json}"
+    user_content = _reduce_user_content(day, episodes_json, glossary_block)
     try:
         with client.messages.stream(
             model=model,
@@ -243,11 +279,17 @@ def _call_reduce(client: anthropic.Anthropic, model: str, day: str, episodes_jso
     return "".join(block.text for block in message.content if block.type == "text")
 
 
-def summarize_day(client: anthropic.Anthropic, cfg: Config, day: str, episodes: list[dict]) -> str:
+def summarize_day(
+    client: anthropic.Anthropic,
+    cfg: Config,
+    day: str,
+    episodes: list[dict],
+    glossary_block: str = "",
+) -> str:
     """Reduce step: build the day's Markdown digest from episode JSONs only (no
     raw transcript is ever sent here)."""
     episodes_json = json.dumps(episodes, ensure_ascii=False, indent=2)
-    return _call_reduce(client, cfg.summarize.reduce_model, day, episodes_json)
+    return _call_reduce(client, cfg.summarize.reduce_model, day, episodes_json, glossary_block)
 
 
 def _upsert_summary(
@@ -294,10 +336,31 @@ def run_day(
     """Build the day's episodes, summarize any that need it, roll up a day digest,
     store both in `summaries`, and write the digest to `<digests>/{day}.md`.
 
+    If `cfg.correct.enabled`, first runs the Claude correction pass over the day's ASR
+    text (`correct.correct_day`) before building episodes. Corrected text changes each
+    episode's transcript, and episode/day summaries are cached by a hash of transcript
+    content rather than by episode id (see `_content_key` below), so a corrected day's
+    summaries are naturally recomputed without any extra invalidation logic here.
+
     Episode/day summaries already stored under `PROMPT_VERSION` are reused unless
     `force` is set. A day with no utterances never touches the API.
     """
     tz = cfg.summarize.timezone
+
+    if cfg.correct.enabled:
+        start_utc, end_utc = local_day_bounds(day, tz)
+        has_utterances = (
+            conn.execute(
+                "SELECT 1 FROM utterances WHERE abs_start_utc >= ? AND abs_start_utc < ? LIMIT 1",
+                (start_utc, end_utc),
+            ).fetchone()
+            is not None
+        )
+        if has_utterances:
+            if client is None:
+                client = anthropic.Anthropic()
+            correct.correct_day(conn, cfg, day, client=client)
+
     episode_ids = build_episodes(conn, cfg, day)
 
     cfg.paths.digests.mkdir(parents=True, exist_ok=True)
@@ -313,6 +376,8 @@ def run_day(
 
     if client is None:
         client = anthropic.Anthropic()
+
+    glossary_block = load_glossary(cfg).prompt_block()
 
     episode_payloads: list[dict] = []
     for episode_id in episode_ids:
@@ -337,7 +402,7 @@ def run_day(
                 "kind": erow["kind"],
                 "source_mix": erow["source_mix"],
             }
-            ep_summary = summarize_episode(client, cfg, transcript, meta)
+            ep_summary = summarize_episode(client, cfg, transcript, meta, glossary_block)
             _upsert_summary(
                 conn,
                 scope="episode",
@@ -381,7 +446,7 @@ def run_day(
             day_row = None
 
     if day_row is None:
-        markdown = summarize_day(client, cfg, day, episode_payloads)
+        markdown = summarize_day(client, cfg, day, episode_payloads, glossary_block)
         _upsert_summary(
             conn,
             scope="day",

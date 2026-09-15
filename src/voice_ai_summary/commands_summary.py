@@ -72,6 +72,40 @@ def summarize(
 
 
 @app.command()
+def correct(
+    day: str = typer.Option(None, "--day", help="Local date YYYY-MM-DD (default: today)."),
+    force: bool = typer.Option(False, "--force", help="Re-correct even if already corrected."),
+    show: bool = typer.Option(
+        False, "--show", help="Print a before/after diff of corrected lines."
+    ),
+) -> None:
+    """Run the Claude correction pass over a local day's ASR text."""
+    from .config import load_config
+    from .correct import correct_day
+    from .db import connect
+    from .timeutil import local_day_bounds, today_local
+
+    cfg = load_config()
+    cfg.ensure_dirs()
+    conn = connect(cfg.paths.db_path)
+    day = day or today_local(cfg.summarize.timezone)
+
+    changed = correct_day(conn, cfg, day, force=force)
+    typer.echo(f"{day}: corrected {changed} utterance(s)")
+
+    if show:
+        start_utc, end_utc = local_day_bounds(day, cfg.summarize.timezone)
+        rows = conn.execute(
+            "SELECT raw_text, text FROM utterances"
+            " WHERE raw_text IS NOT NULL AND abs_start_utc >= ? AND abs_start_utc < ?"
+            " ORDER BY abs_start_utc",
+            (start_utc, end_utc),
+        ).fetchall()
+        for row in rows:
+            typer.echo(f"{row['raw_text']} → {row['text']}")
+
+
+@app.command()
 def show(
     day: str = typer.Option(None, "--day", help="Local date YYYY-MM-DD (default: today)."),
 ) -> None:
