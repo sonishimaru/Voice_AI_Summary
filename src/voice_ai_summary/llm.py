@@ -32,6 +32,11 @@ PRICES: dict[str, tuple[float, float]] = {
 }
 
 _usage_path: Path | None = None
+_daily_budget_usd: float | None = None
+
+
+class BudgetExceeded(RuntimeError):
+    """Today's recorded API spend is over `[llm] daily_budget_usd`."""
 
 
 def api_key() -> str | None:
@@ -40,8 +45,10 @@ def api_key() -> str | None:
 
 def make_client(cfg: Config) -> anthropic.Anthropic:
     """Build the client and point usage tracking at this data directory."""
-    global _usage_path
+    global _usage_path, _daily_budget_usd
     _usage_path = cfg.paths.root / USAGE_FILENAME
+    _daily_budget_usd = cfg.llm.daily_budget_usd
+    _enforce_budget()
     key = api_key()
     if not key:
         raise RuntimeError(
@@ -50,9 +57,37 @@ def make_client(cfg: Config) -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=key)
 
 
-def set_usage_path(path: Path | None) -> None:
-    global _usage_path
+def set_usage_path(path: Path | None, *, daily_budget_usd: float | None = None) -> None:
+    global _usage_path, _daily_budget_usd
     _usage_path = path
+    _daily_budget_usd = daily_budget_usd
+
+
+def spent_today(path: Path) -> float:
+    """Estimated USD recorded since local midnight."""
+    if not path.is_file():
+        return 0.0
+    today = datetime.now().astimezone().date()
+    total = 0.0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        at = datetime.strptime(rec["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        if at.astimezone().date() == today:
+            total += price_record(rec) or 0.0
+    return total
+
+
+def _enforce_budget() -> None:
+    if _usage_path is None or _daily_budget_usd is None:
+        return
+    spent = spent_today(_usage_path)
+    if spent > _daily_budget_usd:
+        raise BudgetExceeded(
+            f"today's Claude API spend (${spent:.2f}) exceeds [llm] daily_budget_usd "
+            f"(${_daily_budget_usd:.2f}); raise the limit in config.toml to continue"
+        )
 
 
 def track_usage(purpose: str, model: str, response: Any) -> None:
@@ -72,6 +107,8 @@ def track_usage(purpose: str, model: str, response: Any) -> None:
     _usage_path.parent.mkdir(parents=True, exist_ok=True)
     with _usage_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # Checked after every call so a runaway loop stops within one call of the cap.
+    _enforce_budget()
 
 
 def price_record(rec: dict) -> float | None:

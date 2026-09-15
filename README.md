@@ -89,6 +89,8 @@ vas が行った Claude API 呼び出しはすべて `<data_dir>/usage.jsonl` �
 vas usage --days 30
 ```
 
+`[llm] daily_budget_usd`（既定 $2）を超えると、その日は API を呼ぶコマンドがすべて停止します。
+
 **注意**: `ANTHROPIC_API_KEY` をシェル全体に export すると、同じ Mac で動かす Claude Code などもそのキーで（サブスクリプションではなく API 従量課金で）動きます。vas には専用の `VAS_ANTHROPIC_API_KEY` を使い、`ANTHROPIC_API_KEY` は必要なときだけ設定してください。
 
 ## 文字起こし精度のチューニング

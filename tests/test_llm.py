@@ -59,3 +59,30 @@ def test_track_usage_is_noop_without_path(tmp_path) -> None:
     llm.set_usage_path(None)
     llm.track_usage("map", "claude-haiku-4-5", SimpleNamespace(usage=SimpleNamespace()))
     assert not (tmp_path / "usage.jsonl").exists()
+
+
+def test_daily_budget_stops_further_calls(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VAS_ANTHROPIC_API_KEY", "k")
+    cfg = Config()
+    cfg.paths.data_dir = tmp_path
+    cfg.llm.daily_budget_usd = 1.0
+    llm.make_client(cfg)
+    big = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=300_000,
+            output_tokens=0,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        )
+    )
+    try:
+        # The record is written first, then the cap is checked: $1.50 > $1.00.
+        with pytest.raises(llm.BudgetExceeded):
+            llm.track_usage("reduce", "claude-opus-5", big)
+        assert llm.spent_today(tmp_path / "usage.jsonl") == pytest.approx(1.5)
+        with pytest.raises(llm.BudgetExceeded):
+            llm.make_client(cfg)
+        cfg.llm.daily_budget_usd = 10.0
+        llm.make_client(cfg)
+    finally:
+        llm.set_usage_path(None)
