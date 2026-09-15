@@ -50,7 +50,9 @@ def render_worker_plist(vas_bin: str, log_dir: Path) -> str:
     return plistlib.dumps(plist_dict).decode("utf-8")
 
 
-def render_digest_plist(vas_bin: str, log_dir: Path, hour: int, minute: int) -> str:
+def render_digest_plist(
+    vas_bin: str, log_dir: Path, hour: int, minute: int, *, deliver: bool = True
+) -> str:
     """Render plist XML for the daily digest trigger.
 
     Args:
@@ -58,13 +60,15 @@ def render_digest_plist(vas_bin: str, log_dir: Path, hour: int, minute: int) -> 
         log_dir: Directory for stdout/stderr logs.
         hour: Hour of day (0-23) in local time.
         minute: Minute of hour (0-59).
+        deliver: Pass `--deliver`. With no channel enabled `vas digest --deliver` is an
+            error, so a digest-only setup would fail nightly after writing the file.
 
     Returns:
         Plist XML string.
     """
     plist_dict = {
         "Label": DIGEST_LABEL,
-        "ProgramArguments": _program_args(vas_bin, "digest", "--deliver"),
+        "ProgramArguments": _program_args(vas_bin, "digest", *(["--deliver"] if deliver else [])),
         "StartCalendarInterval": {
             "Hour": hour,
             "Minute": minute,
@@ -114,7 +118,11 @@ def install(cfg: Config, *, vas_bin: str | None = None, dry_run: bool = False) -
     # Write and load digest service
     digest_path = agents_dir / f"{DIGEST_LABEL}.plist"
     digest_plist = render_digest_plist(
-        vas_bin, log_dir, cfg.schedule.digest_hour, cfg.schedule.digest_minute
+        vas_bin,
+        log_dir,
+        cfg.schedule.digest_hour,
+        cfg.schedule.digest_minute,
+        deliver=cfg.deliver.slack or cfg.deliver.email,
     )
     if not dry_run:
         digest_path.write_text(digest_plist, encoding="utf-8")

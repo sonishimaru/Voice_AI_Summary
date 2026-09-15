@@ -81,6 +81,35 @@ class TestPlistRendering:
         assert plist["StartCalendarInterval"]["Hour"] == 22
         assert plist["StartCalendarInterval"]["Minute"] == 30
 
+    def test_render_digest_plist_without_delivery(self, tmp_path: Path) -> None:
+        """With no channel configured the job only writes the digest file: asking it to
+        deliver would exit non-zero every night."""
+        plist_xml = render_digest_plist("/usr/local/bin/vas", tmp_path, 22, 0, deliver=False)
+        plist = plistlib.loads(plist_xml.encode("utf-8"))
+
+        assert plist["ProgramArguments"] == ["/bin/zsh", "-lc", "/usr/local/bin/vas digest"]
+
+    def test_install_drops_deliver_when_no_channel_enabled(self, tmp_path: Path) -> None:
+        cfg = Config()
+        assert not cfg.deliver.slack and not cfg.deliver.email
+
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            install(cfg, vas_bin="/usr/local/bin/vas", dry_run=False)
+
+        digest_plist = plistlib.loads(
+            (tmp_path / "Library" / "LaunchAgents" / f"{DIGEST_LABEL}.plist").read_bytes()
+        )
+        assert "--deliver" not in digest_plist["ProgramArguments"][2]
+
+        cfg.deliver.slack = True
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            install(cfg, vas_bin="/usr/local/bin/vas", dry_run=False)
+
+        digest_plist = plistlib.loads(
+            (tmp_path / "Library" / "LaunchAgents" / f"{DIGEST_LABEL}.plist").read_bytes()
+        )
+        assert "--deliver" in digest_plist["ProgramArguments"][2]
+
     def test_render_digest_plist_custom_time(self, tmp_path: Path) -> None:
         """Digest plist should use custom hour and minute."""
         log_dir = tmp_path / "logs"
