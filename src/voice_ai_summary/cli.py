@@ -27,4 +27,9 @@ def _root(
 
 
 # Subcommand modules register themselves on `app` at import time.
-from . import commands  # noqa: E402,F401
+from . import (  # noqa: E402
+    commands,  # noqa: F401
+    commands_deliver,  # noqa: F401
+    commands_pipeline,  # noqa: F401
+    commands_summary,  # noqa: F401
+)
