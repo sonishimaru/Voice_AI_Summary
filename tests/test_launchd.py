@@ -21,6 +21,19 @@ from voice_ai_summary.launchd import (
 )
 
 
+@pytest.fixture(autouse=True)
+def no_real_launchctl():
+    """Keep the test run out of the developer's own launchd domain.
+
+    `install`/`uninstall` shell out to `launchctl bootstrap gui/<uid> <plist>` on macOS,
+    and the tests below call them with `dry_run=False`. Without this, a test run
+    registers services pointing at pytest tmp directories, which then outlive the run
+    and fight with a real `vas install-launchd`.
+    """
+    with patch("subprocess.run") as mock_run:
+        yield mock_run
+
+
 class TestPlistRendering:
     """Test plist XML generation."""
 
