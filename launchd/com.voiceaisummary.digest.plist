@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict/>
+	<key>Label</key>
+	<string>com.voiceaisummary.digest</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/vas</string>
+		<string>digest</string>
+		<string>--deliver</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>~/Library/Logs/VoiceAISummary/com.voiceaisummary.digest.err</string>
+	<key>StandardOutPath</key>
+	<string>~/Library/Logs/VoiceAISummary/com.voiceaisummary.digest.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>22</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+</dict>
+</plist>
