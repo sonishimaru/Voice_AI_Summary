@@ -279,8 +279,8 @@ final class RecordingController: ObservableObject {
         defaultInputListenerBlock = inputBlock
         defaultOutputListenerBlock = outputBlock
 
-        _ = AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &inputAddress, DispatchQueue.main, inputBlock)
-        _ = AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &outputAddress, DispatchQueue.main, outputBlock)
+        _ = AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &inputAddress, DispatchQueue.main, inputBlock)
+        _ = AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &outputAddress, DispatchQueue.main, outputBlock)
     }
 
     // MARK: - Helpers

@@ -205,7 +205,7 @@ final class ProcessTapCapture {
             mElement: kAudioObjectPropertyElementMain
         )
         var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        let status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, nil, &size, &deviceID)
+        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID)
         guard status == noErr else { throw CaptureError.propertyReadFailed(status) }
         return deviceID
     }
