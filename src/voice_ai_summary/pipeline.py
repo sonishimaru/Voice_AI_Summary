@@ -122,3 +122,31 @@ def process_pending(
         except Exception:
             logger.exception("failed to process recording %s", rec_id)
     return processed
+
+
+def retry_failed(conn: sqlite3.Connection, cfg: Config) -> list[int]:
+    """Clear the error flag on failed recordings so `process_pending` picks them up again.
+
+    A recording ingested while the recorder still had it open lands in the store under its
+    `.part` name; once the recorder has closed it the file is valid, so it is renamed here.
+    """
+    rows = conn.execute(
+        "SELECT id, storage_path FROM recordings WHERE error IS NOT NULL"
+    ).fetchall()
+    ids: list[int] = []
+    for row in rows:
+        storage_path = row["storage_path"]
+        if storage_path.endswith(".part"):
+            src = cfg.paths.store / storage_path
+            dst = src.with_name(src.name[: -len(".part")])
+            if src.exists():
+                src.rename(dst)
+            storage_path = storage_path[: -len(".part")]
+        conn.execute(
+            "UPDATE recordings SET error = NULL, processed_at = NULL, storage_path = ?"
+            " WHERE id = ?",
+            (storage_path, row["id"]),
+        )
+        ids.append(row["id"])
+    conn.commit()
+    return ids

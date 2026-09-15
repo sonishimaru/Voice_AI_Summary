@@ -117,10 +117,15 @@ def ingest_inbox(conn: sqlite3.Connection, cfg: Config) -> list[int]:
     if not cfg.paths.inbox.is_dir():
         return []
     now = datetime.now(UTC).timestamp()
+    # `.part` is the recorder's "still open" marker; mtime alone is not enough because
+    # the encoder flushes to disk only every few seconds.
     candidates = [
         p
         for p in cfg.paths.inbox.iterdir()
-        if p.is_file() and p.suffix != ".json" and (now - p.stat().st_mtime) >= 5
+        if p.is_file()
+        and p.suffix not in (".json", ".part")
+        and not p.name.startswith(".")
+        and (now - p.stat().st_mtime) >= 5
     ]
     candidates.sort(key=lambda p: p.stat().st_mtime)
 

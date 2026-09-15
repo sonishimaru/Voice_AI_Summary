@@ -63,6 +63,26 @@ def process(
 
 
 @app.command()
+def retry() -> None:
+    """Re-queue recordings that failed to process, then process them."""
+    from .asr import get_backend
+    from .config import load_config
+    from .db import connect
+    from .pipeline import process_pending, retry_failed
+
+    cfg = load_config()
+    cfg.ensure_dirs()
+    conn = connect(cfg.paths.db_path)
+    ids = retry_failed(conn, cfg)
+    if not ids:
+        typer.echo("no failed recordings")
+        return
+    typer.echo(f"re-queued {len(ids)} recording(s): {ids}")
+    count = process_pending(conn, cfg, get_backend(cfg))
+    typer.echo(f"processed {count} recording(s)")
+
+
+@app.command()
 def worker(
     once: bool = typer.Option(False, "--once", help="Run a single ingest+process pass and exit."),
 ) -> None:

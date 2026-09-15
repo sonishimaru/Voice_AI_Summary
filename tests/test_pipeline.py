@@ -111,3 +111,39 @@ def test_process_recording_sets_error_on_failure(vas: tuple[Config, object]) -> 
 
     row = conn.execute("SELECT error FROM recordings WHERE id = ?", (rec_id,)).fetchone()
     assert row["error"]
+
+
+def test_retry_failed_renames_part_and_reprocesses(vas, monkeypatch) -> None:
+    from voice_ai_summary.pipeline import process_pending, retry_failed
+
+    cfg, conn = vas
+    wav = cfg.paths.inbox / "mac_mic_dev1_20260915T010203Z.wav"
+    _write_wav(wav, seconds=2)
+    rec_id = ingest_file(conn, cfg, wav)
+    # Simulate an ingest that grabbed the recorder's still-open file.
+    stored = (
+        cfg.paths.store
+        / conn.execute("SELECT storage_path FROM recordings WHERE id = ?", (rec_id,)).fetchone()[
+            "storage_path"
+        ]
+    )
+    part = stored.with_name(stored.name + ".part")
+    stored.rename(part)
+    conn.execute(
+        "UPDATE recordings SET error = 'boom', storage_path = ? WHERE id = ?",
+        (str(part.relative_to(cfg.paths.store)), rec_id),
+    )
+    conn.commit()
+
+    assert retry_failed(conn, cfg) == [rec_id]
+    assert stored.exists() and not part.exists()
+    row = conn.execute(
+        "SELECT error, processed_at FROM recordings WHERE id = ?", (rec_id,)
+    ).fetchone()
+    assert row["error"] is None and row["processed_at"] is None
+
+    monkeypatch.setattr(
+        vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, None)]
+    )
+    assert process_pending(conn, cfg, FakeBackend(["再処理"])) == 1
+    assert conn.execute("SELECT text FROM utterances").fetchone()["text"] == "再処理"

@@ -124,3 +124,17 @@ def test_ingest_inbox_skips_recently_modified_files(vas: tuple[Config, object]) 
 
     ids = ingest_inbox(conn, cfg)
     assert ids == []
+
+
+def test_ingest_inbox_skips_in_progress_and_hidden_files(vas: tuple[Config, object]) -> None:
+    cfg, conn = vas
+    part = cfg.paths.inbox / "mac_mic_dev1_20260915T010203Z.m4a.part"
+    hidden = cfg.paths.inbox / ".DS_Store"
+    _write_wav(part)
+    hidden.write_bytes(b"x")
+    old = time.time() - 60
+    os.utime(part, (old, old))
+    os.utime(hidden, (old, old))
+
+    assert ingest_inbox(conn, cfg) == []
+    assert part.exists()
