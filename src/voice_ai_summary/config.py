@@ -35,18 +35,43 @@ class PathsConfig(BaseModel):
         return self.root / "digests"
 
 
+DEFAULT_FASTER_WHISPER_MODEL = "kotoba-tech/kotoba-whisper-v2.0-faster"
+DEFAULT_MLX_MODEL = "mlx-community/whisper-large-v3-turbo"
+
+
 class AsrConfig(BaseModel):
-    model: str = "kotoba-tech/kotoba-whisper-v2.0-faster"
+    backend: str = "faster-whisper"  # faster-whisper | mlx
+    model: str = DEFAULT_FASTER_WHISPER_MODEL
     device: str = "auto"
     compute_type: str = "default"
     language: str = "ja"
     beam_size: int = 5
+    # Domain vocabulary (names, products, jargon) biases decoding toward these spellings.
+    hotwords: list[str] = Field(default_factory=list)
+    initial_prompt: str = ""
+
+    @property
+    def resolved_model(self) -> str:
+        """The MLX backend needs an MLX-converted model; swap the default when unset."""
+        if self.backend == "mlx" and self.model == DEFAULT_FASTER_WHISPER_MODEL:
+            return DEFAULT_MLX_MODEL
+        return self.model
+
+    @property
+    def prompt(self) -> str | None:
+        parts = [self.initial_prompt.strip()] if self.initial_prompt.strip() else []
+        if self.hotwords:
+            parts.append("、".join(self.hotwords) + "。")
+        return " ".join(parts) or None
 
 
 class VadConfig(BaseModel):
     threshold: float = 0.5
     min_speech_ms: int = 250
     min_silence_ms: int = 500
+    # Neighbouring speech regions closer than this are transcribed as one chunk so the
+    # model sees whole sentences instead of 1-2 s fragments.
+    merge_gap_ms: int = 2000
     max_speech_s: float = 30.0
     pad_ms: int = 200
 

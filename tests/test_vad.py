@@ -57,3 +57,19 @@ def test_detect_speech_runs_real_silero_model() -> None:
     for region in result:
         assert isinstance(region, SpeechRegion)
         assert region.start_ms < region.end_ms
+
+
+def test_detect_speech_merges_across_short_pauses(monkeypatch) -> None:
+    """Sub-2 s pauses between phrases must not split a sentence into fragments."""
+    from voice_ai_summary import vad as vad_module
+    from voice_ai_summary.config import VadConfig
+
+    fake_regions = [
+        {"start": 0, "end": 16000},  # 0-1 s
+        {"start": 24000, "end": 40000},  # 1.5-2.5 s (0.5 s pause)
+        {"start": 56000, "end": 72000},  # 3.5-4.5 s (1.0 s pause)
+        {"start": 160000, "end": 176000},  # 10-11 s (5.5 s pause → new chunk)
+    ]
+    monkeypatch.setattr(vad_module, "_run_silero", lambda samples, cfg: fake_regions)
+    regions = vad_module.detect_speech(np.zeros(16000 * 12, dtype=np.float32), VadConfig())
+    assert [(r.start_ms, r.end_ms) for r in regions] == [(0, 4500), (10000, 11000)]

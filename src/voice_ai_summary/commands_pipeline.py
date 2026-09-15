@@ -83,6 +83,39 @@ def retry() -> None:
 
 
 @app.command()
+def reprocess(
+    day: str | None = typer.Option(None, "--day", help="Local date YYYY-MM-DD to re-transcribe."),
+    all_recordings: bool = typer.Option(False, "--all", help="Re-transcribe every recording."),
+    no_process: bool = typer.Option(False, "--no-process", help="Only reset; don't transcribe."),
+) -> None:
+    """Re-transcribe recordings with the current ASR/VAD settings."""
+    from .asr import get_backend
+    from .config import load_config
+    from .db import connect
+    from .pipeline import process_pending, reset_recordings
+    from .timeutil import local_day_bounds
+
+    if bool(day) == all_recordings:
+        raise typer.BadParameter("pass exactly one of --day or --all")
+    cfg = load_config()
+    cfg.ensure_dirs()
+    conn = connect(cfg.paths.db_path)
+    if all_recordings:
+        rows = conn.execute("SELECT id FROM recordings").fetchall()
+    else:
+        start, end = local_day_bounds(day, cfg.summarize.timezone)
+        rows = conn.execute(
+            "SELECT id FROM recordings WHERE started_at_utc >= ? AND started_at_utc < ?",
+            (start, end),
+        ).fetchall()
+    ids = [r["id"] for r in rows]
+    typer.echo(f"reset {reset_recordings(conn, ids)} recording(s)")
+    if ids and not no_process:
+        count = process_pending(conn, cfg, get_backend(cfg))
+        typer.echo(f"processed {count} recording(s)")
+
+
+@app.command()
 def worker(
     once: bool = typer.Option(False, "--once", help="Run a single ingest+process pass and exit."),
 ) -> None:

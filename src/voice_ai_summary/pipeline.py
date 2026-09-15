@@ -150,3 +150,24 @@ def retry_failed(conn: sqlite3.Connection, cfg: Config) -> list[int]:
         ids.append(row["id"])
     conn.commit()
     return ids
+
+
+def reset_recordings(conn: sqlite3.Connection, recording_ids: list[int]) -> int:
+    """Drop transcripts for the given recordings and mark them pending again.
+
+    Used to re-transcribe after changing the ASR model, vocabulary or VAD chunking.
+    Summaries are keyed by transcript content, so they recompute on the next digest.
+    """
+    if not recording_ids:
+        return 0
+    placeholders = ",".join("?" for _ in recording_ids)
+    with transaction(conn):
+        conn.execute(
+            f"DELETE FROM utterances WHERE recording_id IN ({placeholders})", recording_ids
+        )
+        conn.execute(f"DELETE FROM segments WHERE recording_id IN ({placeholders})", recording_ids)
+        conn.execute(
+            f"UPDATE recordings SET processed_at = NULL, error = NULL WHERE id IN ({placeholders})",
+            recording_ids,
+        )
+    return len(recording_ids)

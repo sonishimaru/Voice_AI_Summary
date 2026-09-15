@@ -147,3 +147,22 @@ def test_retry_failed_renames_part_and_reprocesses(vas, monkeypatch) -> None:
     )
     assert process_pending(conn, cfg, FakeBackend(["再処理"])) == 1
     assert conn.execute("SELECT text FROM utterances").fetchone()["text"] == "再処理"
+
+
+def test_reset_recordings_clears_transcript_and_requeues(vas, monkeypatch) -> None:
+    from voice_ai_summary.pipeline import process_pending, reset_recordings
+
+    cfg, conn = vas
+    wav = cfg.paths.inbox / "mac_mic_dev1_20260915T010203Z.wav"
+    _write_wav(wav, seconds=2)
+    rec_id = ingest_file(conn, cfg, wav)
+    monkeypatch.setattr(
+        vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, None)]
+    )
+    process_pending(conn, cfg, FakeBackend(["一回目"]))
+
+    assert reset_recordings(conn, [rec_id]) == 1
+    assert conn.execute("SELECT COUNT(*) AS n FROM utterances").fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) AS n FROM segments").fetchone()["n"] == 0
+    assert process_pending(conn, cfg, FakeBackend(["二回目"])) == 1
+    assert conn.execute("SELECT text FROM utterances").fetchone()["text"] == "二回目"

@@ -164,3 +164,22 @@ def test_build_episodes_respects_local_day_boundary_for_timezone(vas) -> None:
 
     row = conn.execute("SELECT episode_id FROM utterances").fetchone()
     assert row["episode_id"] == episode_ids[0]
+
+
+def test_system_only_episode_is_media(vas) -> None:
+    cfg, conn = vas
+    started = "2026-09-15T03:14:00Z"
+    rec = _insert_recording(conn, source="mac_system", started_at_utc=started, sha256="m" * 64)
+    for i in range(3):
+        _insert_utterance(
+            conn,
+            recording_id=rec,
+            rec_started_at_utc=started,
+            t_start_ms=i * 2_000,
+            t_end_ms=i * 2_000 + 1_000,
+            speaker="other",
+        )
+    conn.commit()
+
+    build_episodes(conn, cfg, "2026-09-15")
+    assert [r["kind"] for r in conn.execute("SELECT kind FROM episodes")] == ["media"]

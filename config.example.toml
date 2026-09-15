@@ -6,18 +6,27 @@
 data_dir = "~/Library/Application Support/VoiceAISummary"
 
 [asr]
-# faster-whisper model name or local path. Japanese default: kotoba-whisper-v2.0 (CTranslate2 build).
+# backend = "faster-whisper" runs on CPU (CTranslate2). On Apple Silicon, "mlx" runs on the
+# GPU (pip install "voice-ai-summary[mlx]") and makes whisper-large-v3-turbo practical.
+backend = "faster-whisper"
+# faster-whisper: "kotoba-tech/kotoba-whisper-v2.0-faster" (Japanese-tuned, fast) or
+#                 "large-v3-turbo" / "large-v3" (slower on CPU, often more accurate).
+# mlx:            "mlx-community/whisper-large-v3-turbo" (default when backend = "mlx").
 model = "kotoba-tech/kotoba-whisper-v2.0-faster"
-device = "auto"          # auto | cpu | cuda
-compute_type = "default" # default | int8 | float16 | ...
+device = "auto"          # auto | cpu | cuda  (faster-whisper only)
+compute_type = "default" # default | int8 | float16  (faster-whisper only; int8 is ~2x faster on CPU)
 language = "ja"
 beam_size = 5
+# Names, products and jargon that ASR keeps misspelling. Biases decoding toward these.
+hotwords = []            # e.g. ["西丸", "安田さん", "チョコレート株式会社"]
+initial_prompt = ""      # optional free-text context, e.g. "社内の打ち合わせの録音です。"
 
 [vad]
 threshold = 0.5           # Silero speech probability threshold (lower = more recall)
 min_speech_ms = 250
 min_silence_ms = 500      # gap that closes a speech region
-max_speech_s = 30         # split long regions for the ASR window
+merge_gap_ms = 2000       # regions closer than this are transcribed together (context!)
+max_speech_s = 30         # split long chunks for the ASR window
 pad_ms = 200              # padding added around each region
 
 [episodes]

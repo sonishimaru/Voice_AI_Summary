@@ -76,9 +76,11 @@ def build_episodes(conn: sqlite3.Connection, cfg: Config, day: str) -> list[int]
         for grp in groups:
             sources = grp["sources"]
             speakers = grp["speakers"]
-            if "other" in speakers or {"mac_mic", "mac_system"} <= sources:
+            if "me" in speakers and "other" in speakers:
                 kind = "call"
-            elif speakers <= {"me"}:
+            elif speakers == {"other"}:
+                kind = "media"  # system audio only: video / audio playback, not a conversation
+            elif speakers == {"me"}:
                 kind = "solo"
             else:
                 kind = "ambient"

@@ -1,4 +1,4 @@
-"""ASR backends: faster-whisper (real transcription) and a deterministic fake for tests."""
+"""ASR backends: faster-whisper (CPU), mlx-whisper (Apple GPU) and a deterministic fake."""
 
 from __future__ import annotations
 
@@ -33,14 +33,14 @@ class FasterWhisperBackend:
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
         self._model = None
-        self.name = f"faster-whisper:{cfg.asr.model}"
+        self.name = f"faster-whisper:{cfg.asr.resolved_model}"
 
     def _get_model(self):
         if self._model is None:
             from faster_whisper import WhisperModel
 
             self._model = WhisperModel(
-                self._cfg.asr.model,
+                self._cfg.asr.resolved_model,
                 device=self._cfg.asr.device,
                 compute_type=self._cfg.asr.compute_type,
             )
@@ -48,12 +48,15 @@ class FasterWhisperBackend:
 
     def transcribe(self, samples16k: np.ndarray, *, language: str | None) -> list[Utterance]:
         model = self._get_model()
+        asr = self._cfg.asr
         segments, _info = model.transcribe(
             samples16k,
             language=language,
-            beam_size=self._cfg.asr.beam_size,
+            beam_size=asr.beam_size,
             vad_filter=False,
             condition_on_previous_text=False,
+            initial_prompt=asr.prompt,
+            hotwords=" ".join(asr.hotwords) or None,
         )
         return [
             Utterance(
@@ -64,6 +67,37 @@ class FasterWhisperBackend:
                 avg_logprob=seg.avg_logprob,
             )
             for seg in segments
+        ]
+
+
+class MlxWhisperBackend:
+    """mlx-whisper: runs Whisper on the Apple Silicon GPU (macOS only)."""
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self.name = f"mlx-whisper:{cfg.asr.resolved_model}"
+
+    def transcribe(self, samples16k: np.ndarray, *, language: str | None) -> list[Utterance]:
+        import mlx_whisper
+
+        asr = self._cfg.asr
+        result = mlx_whisper.transcribe(
+            samples16k,
+            path_or_hf_repo=asr.resolved_model,
+            language=language,
+            initial_prompt=asr.prompt,
+            condition_on_previous_text=False,
+            verbose=None,
+        )
+        return [
+            Utterance(
+                t_start_ms=int(round(seg["start"] * 1000)),
+                t_end_ms=int(round(seg["end"] * 1000)),
+                text=seg["text"].strip(),
+                lang=language,
+                avg_logprob=seg.get("avg_logprob"),
+            )
+            for seg in result["segments"]
         ]
 
 
@@ -93,6 +127,11 @@ class FakeBackend:
 
 
 def get_backend(cfg: Config) -> ASRBackend:
-    if os.environ.get("VAS_ASR_BACKEND") == "fake":
+    backend = os.environ.get("VAS_ASR_BACKEND") or cfg.asr.backend
+    if backend == "fake":
         return FakeBackend()
-    return FasterWhisperBackend(cfg)
+    if backend == "mlx":
+        return MlxWhisperBackend(cfg)
+    if backend == "faster-whisper":
+        return FasterWhisperBackend(cfg)
+    raise ValueError(f"unknown ASR backend: {backend!r} (faster-whisper | mlx)")

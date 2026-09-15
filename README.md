@@ -81,6 +81,17 @@ vas ingest ~/Downloads/zoom_recording.m4a   # 手持ちの録音を取り込む�
 2. `vas worker --once` → `vas status` で `recordings` が増え、`vas search <喋った単語>` でヒットする。
 3. `vas digest --deliver` で Slack / メールに日本語サマリが届く。
 
+## 文字起こし精度のチューニング
+
+精度が物足りないときは、上から順に試してください（`~/.config/voice-ai-summary/config.toml`）。設定を変えたら `vas reprocess --day YYYY-MM-DD` で再文字起こしして比較できます。
+
+1. **語彙ヒント** `[asr] hotwords = ["西丸", "安田さん", "社名"]` — 人名・製品名の誤変換に最も効く。
+2. **チャンク結合** `[vad] merge_gap_ms`（既定 2000）— 短い間で切らず、文単位で Whisper に渡す。
+3. **モデル** `[asr] model = "large-v3-turbo"` — kotoba-whisper より遅いが固有名詞や長文に強いことが多い。CPU では `compute_type = "int8"` 推奨。
+4. **MLX バックエンド（Apple Silicon の GPU）** `uv pip install -e ".[mlx]"` のうえ `[asr] backend = "mlx"` — `whisper-large-v3-turbo` を GPU で回せるので、大きいモデルが現実的な速度になる。
+
+音声側では、録音アプリのビットレート（32kbps）を上げるより、Zoom 側の「オリジナルサウンド」を有効にする方が効きます。
+
 ## 開発
 
 ```bash

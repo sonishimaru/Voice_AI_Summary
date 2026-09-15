@@ -42,7 +42,7 @@ def detect_speech(samples16k: np.ndarray, cfg: VadConfig) -> list[SpeechRegion]:
         )
         for ts in timestamps
     ]
-    return merge_regions(regions, cfg.min_silence_ms, int(cfg.max_speech_s * 1000))
+    return merge_regions(regions, cfg.merge_gap_ms, int(cfg.max_speech_s * 1000))
 
 
 def merge_regions(
