@@ -20,7 +20,11 @@ import functools
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
+import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
 
@@ -40,8 +44,15 @@ server = MCPServer(
         '`recent` to see the last few minutes of transcript ("what was just said") - '
         "note this can lag the live conversation by several minutes because of file "
         "rotation, and the tool's header says by how much, "
-        "`rebuild_day` to (re)run summarization for a day (this calls the Claude API and "
-        "costs money), `status`/`api_usage` to check pipeline health and spend, "
+        "`rebuild_day` to (re)run summarization for a day - this calls the Claude API "
+        "and costs money, and for a large day can take several minutes, well past "
+        "this session's tool-call timeout, so it starts the work in the background "
+        "and returns a job id immediately instead of waiting; follow up with "
+        "`job_status` (by job id, or with no id to list recent jobs) to see progress "
+        "and get the resulting digest or error once it finishes - calling "
+        "`rebuild_day` again for a day already running just hands back the same job "
+        "instead of paying for the work twice, "
+        "`status`/`api_usage` to check pipeline health and spend, "
         "`throughput` to check whether local transcription is running faster or slower "
         "than realtime (e.g. after switching ASR backend) and see the pending backlog's "
         "estimated time to clear, "
@@ -84,6 +95,116 @@ def _tool_safe(func: F) -> F:
             return f"{type(exc).__name__}: {exc}"
 
     return wrapper  # type: ignore[return-value]
+
+
+# --- Background job registry -----------------------------------------------------
+#
+# Claude Desktop cuts a tool call off at roughly 60 seconds, but `rebuild_day` can run
+# for minutes on a large day. Rather than let the call time out while the (paid) work
+# keeps going invisibly - and risk the user retrying it, doubling the API spend - long
+# tools run on a background daemon thread and hand back a `Job` id immediately;
+# `job_status` polls it. Kept deliberately simple: one dict of `Job`s guarded by one
+# lock, no persistence (jobs vanish on server restart, same as anything else in this
+# process).
+
+
+@dataclass
+class Job:
+    """One background job's state. Mutated only while holding `_jobs_lock`."""
+
+    id: str
+    kind: str
+    key: str
+    started_at: float
+    state: str = "running"  # "running" | "done" | "failed"
+    progress: str = "running"
+    finished_at: float | None = None
+    result: str | None = None
+    error: str | None = None
+
+
+_jobs: dict[str, Job] = {}
+_jobs_lock = threading.Lock()
+
+# Cap how many recent jobs `job_status()` (no id) lists, so a long-lived server doesn't
+# dump an ever-growing history.
+_JOB_LIST_LIMIT = 20
+
+
+def _start_job(kind: str, key: str, fn: Callable[[Job], str]) -> tuple[Job, bool]:
+    """Start `fn(job)` on a background daemon thread and return `(job, started)`
+    immediately, without waiting for it to finish.
+
+    Guards one job per `(kind, key)` at a time: if a job with the same kind and key is
+    already running, that job is returned with `started=False` and no new thread is
+    started - this is what stops a Claude-Desktop-timeout-triggered retry of the same
+    tool call from doubling a paid Claude API workload. The check-and-create is one
+    atomic section under `_jobs_lock`, so two concurrent callers can never both "win".
+
+    `fn` receives the `Job` itself (so it can call `_set_progress` as it goes) and
+    should return the job's result string. Any exception `fn` raises is caught and
+    captured onto the job record (state becomes "failed") rather than propagating -
+    daemon threads are otherwise silent on failure, and this would otherwise both hide
+    the error from the user and prevent `job_status` from ever reporting it.
+    """
+    with _jobs_lock:
+        for existing in _jobs.values():
+            if existing.kind == kind and existing.key == key and existing.state == "running":
+                return existing, False
+        job = Job(id=uuid.uuid4().hex[:12], kind=kind, key=key, started_at=time.time())
+        _jobs[job.id] = job
+
+    def _worker() -> None:
+        try:
+            result = fn(job)
+        except Exception as exc:  # noqa: BLE001 - captured onto the job, never re-raised
+            with _jobs_lock:
+                job.state = "failed"
+                job.error = f"{type(exc).__name__}: {exc}"
+                job.finished_at = time.time()
+            return
+        with _jobs_lock:
+            job.state = "done"
+            job.result = result
+            job.finished_at = time.time()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return job, True
+
+
+def _set_progress(job: Job, text: str) -> None:
+    """Update `job`'s latest progress line - called from the job's worker thread."""
+    with _jobs_lock:
+        job.progress = text
+
+
+def _elapsed(job: Job) -> str:
+    """Human-readable time since `job` started (its total run time, once finished)."""
+    end = job.finished_at if job.finished_at is not None else time.time()
+    secs = max(0.0, end - job.started_at)
+    if secs < 60:
+        return f"{secs:.0f}s"
+    return f"{secs / 60:.1f}min"
+
+
+def _format_job_summary(job: Job) -> str:
+    return f"{job.id}  {job.kind}({job.key})  {job.state}  elapsed={_elapsed(job)}"
+
+
+def _format_job_detail(job: Job) -> str:
+    lines = [
+        f"job {job.id}: {job.kind}({job.key})",
+        f"state: {job.state}",
+        f"elapsed: {_elapsed(job)}",
+        f"progress: {job.progress}",
+    ]
+    if job.state == "done":
+        lines.append("")
+        lines.append("result:")
+        lines.append(job.result or "")
+    elif job.state == "failed":
+        lines.append(f"error: {job.error}")
+    return "\n".join(lines)
 
 
 def _format_utterance_row(row: sqlite3.Row, tz: str) -> str:
@@ -289,28 +410,118 @@ def recent(minutes: int = 30, limit: int = 200) -> str:
     return "\n".join(lines)
 
 
-@_tool_safe
-def rebuild_day(day: str = "", force: bool = False) -> str:
-    """Rebuild a local day's summary and return the resulting Markdown digest.
+def _run_rebuild_day(job: Job, day: str, force: bool) -> str:
+    """Background body of `rebuild_day`, run on the job's worker thread.
 
-    THIS CALLS THE CLAUDE API AND COSTS MONEY (subject to `[llm] daily_budget_usd` in
-    config.toml; check `api_usage` for recent spend). `day` is a local date
-    `YYYY-MM-DD`, default today. The Claude correction pass over the day's ASR text
-    runs first whenever `[correct] enabled` is set in config.toml, then episodes and
-    the daily digest are rebuilt. Summaries already cached for unchanged content are
-    reused unless `force=True`, which recomputes the day regardless of caching.
+    `summarize.run_day` (and the `correct.correct_day` it may call first) expose no
+    callback or counter for which stage or episode is currently running, and this
+    module must not change either of those (another agent owns them right now). So
+    the only honest progress available is set once, up front, from what can be
+    observed without touching them: how many utterances the day has, and which
+    stages `run_day` is about to go through - not a fabricated percentage.
     """
     from .config import load_config
     from .db import connect
     from .summarize import run_day
-    from .timeutil import today_local
+    from .timeutil import local_day_bounds
 
     cfg = load_config()
     cfg.ensure_dirs()
     conn = connect(cfg.paths.db_path)
+    tz = cfg.summarize.timezone
+
+    start_utc, end_utc = local_day_bounds(day, tz)
+    n = conn.execute(
+        "SELECT COUNT(*) AS n FROM utterances WHERE abs_start_utc >= ? AND abs_start_utc < ?",
+        (start_utc, end_utc),
+    ).fetchone()["n"]
+    stages = (
+        "a correction pass over the ASR text, then per-episode summarization, then the daily reduce"
+        if cfg.correct.enabled
+        else "per-episode summarization, then the daily reduce"
+    )
+    _set_progress(
+        job,
+        f"{n} utterance(s) for {day}; running {stages}. summarize.run_day exposes no "
+        "finer-grained progress than this (no per-episode count, no percentage) - "
+        "this is simply still running.",
+    )
+    return run_day(conn, cfg, day, force=force)
+
+
+@_tool_safe
+def rebuild_day(day: str = "", force: bool = False) -> str:
+    """Start rebuilding a local day's summary in the background and return
+    IMMEDIATELY with a job id - it does not wait for the rebuild to finish.
+
+    THIS CALLS THE CLAUDE API AND COSTS MONEY (subject to `[llm] daily_budget_usd` in
+    config.toml; check `api_usage` for recent spend), and for a day with thousands of
+    utterances can take several minutes - well past this session's ~60s tool-call
+    timeout. The rebuild (and its API spend) keeps running in the server process even
+    after this call returns; nothing about that work is visible or cancellable except
+    through `job_status`. Call `job_status(job_id=...)` with the id this returns to
+    check progress and, once it finishes, get the resulting Markdown digest (or the
+    error, if it failed). Calling `rebuild_day` again for the same `day` while a job
+    for it is still running does NOT start a second (paid) job - it returns the
+    handle to the one already running instead, so a Claude-Desktop-timeout retry
+    cannot double the API spend. `day` is a local date `YYYY-MM-DD`, default today.
+    The Claude correction pass over the day's ASR text runs first whenever
+    `[correct] enabled` is set in config.toml, then episodes and the daily digest are
+    rebuilt. Summaries already cached for unchanged content are reused unless
+    `force=True`, which recomputes the day regardless of caching.
+    """
+    from .config import load_config
+    from .timeutil import today_local
+
+    cfg = load_config()
     day = day or today_local(cfg.summarize.timezone)
 
-    return run_day(conn, cfg, day, force=force)
+    def _work(job: Job) -> str:
+        return _run_rebuild_day(job, day, force)
+
+    job, started = _start_job("rebuild_day", day, _work)
+    if not started:
+        return (
+            f"A rebuild for {day} is already running as job {job.id} (elapsed "
+            f"{_elapsed(job)}). Not starting a second one - that would double the "
+            f"paid Claude API work. Call job_status(job_id={job.id!r}) to check on it."
+        )
+    return (
+        f"Started job {job.id}: rebuilding {day} in the background. This calls the "
+        "Claude API and costs money, and keeps running even though this call has "
+        f"already returned. Call job_status(job_id={job.id!r}) to check progress and "
+        "get the resulting digest (or the error) once it's done."
+    )
+
+
+@_tool_safe
+def job_status(job_id: str = "") -> str:
+    """Check on a background job started by `rebuild_day` (or list recent ones).
+
+    Read-only and free - never calls the Claude API itself. With `job_id`, reports
+    that job's kind and key (e.g. the day, for a rebuild), its state ("running",
+    "done", or "failed"), how long it has been running (or took in total), its latest
+    progress line, and - once finished - the result (for a rebuild, the digest
+    Markdown) or the error message. An unknown `job_id` is reported as such rather
+    than raising. With no `job_id`, lists up to the most recent jobs, newest first,
+    each with the same state/elapsed-time summary - use this when a job id from an
+    earlier, timed-out call was never seen.
+    """
+    if not job_id:
+        with _jobs_lock:
+            jobs = sorted(_jobs.values(), key=lambda j: j.started_at, reverse=True)
+        if not jobs:
+            return "No background jobs have been started yet."
+        shown = jobs[:_JOB_LIST_LIMIT]
+        lines = [f"{len(jobs)} job(s), newest first (showing {len(shown)}):"]
+        lines.extend(_format_job_summary(j) for j in shown)
+        return "\n".join(lines)
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        return f"No job with id {job_id!r}. Call job_status() with no id to list recent jobs."
+    return _format_job_detail(job)
 
 
 @_tool_safe
@@ -1118,6 +1329,7 @@ for _fn in (
     transcript,
     recent,
     rebuild_day,
+    job_status,
     status,
     api_usage,
     throughput,
