@@ -34,15 +34,20 @@ def _pending_and_errored_counts(
     return pending, errored
 
 
-def _catch_up_pending(conn: sqlite3.Connection, cfg: Config, budget_s: int) -> None:
-    """Transcribe globally-pending recordings (oldest first) in small batches, stopping
-    once `budget_s` wall-clock seconds have elapsed.
+def _catch_up_pending(
+    conn: sqlite3.Connection, cfg: Config, budget_s: int, within: tuple[str, str]
+) -> None:
+    """Transcribe the digest day's pending recordings (oldest first within that day) in
+    small batches, stopping once `budget_s` wall-clock seconds have elapsed.
 
-    Delegates the actual transcription to `pipeline.process_pending` - this just bounds
-    how much of it a single `vas digest` run is willing to wait for, so a dead worker's
-    backlog cannot turn the nightly digest into an hours-long batch job. The elapsed time
-    is re-checked between batches (not just once up front), so the budget is actually
-    respected rather than merely advisory.
+    Delegates the actual transcription to `pipeline.process_pending`, bounded by
+    `within` (the day's `(start_utc, end_utc)`) - this just bounds how much of it a
+    single `vas digest` run is willing to wait for, so a dead worker's backlog cannot
+    turn the nightly digest into an hours-long batch job. Without the bound,
+    `process_pending` picks globally-oldest-first, so the whole budget could go to a
+    days-old backlog while the day actually being summarized stays untranscribed. The
+    elapsed time is re-checked between batches (not just once up front), so the budget
+    is actually respected rather than merely advisory.
     """
     from .asr import get_backend
     from .pipeline import process_pending
@@ -50,7 +55,7 @@ def _catch_up_pending(conn: sqlite3.Connection, cfg: Config, budget_s: int) -> N
     backend = get_backend(cfg)
     deadline = time.monotonic() + budget_s
     while time.monotonic() < deadline:
-        if not process_pending(conn, cfg, backend, limit=_CATCHUP_BATCH):
+        if not process_pending(conn, cfg, backend, limit=_CATCHUP_BATCH, within=within):
             break
 
 
@@ -64,7 +69,7 @@ def _catch_up_and_count_missing(conn: sqlite3.Connection, cfg: Config, day: str)
 
     budget_s = cfg.schedule.digest_catchup_budget_s
     if pending and budget_s > 0:
-        _catch_up_pending(conn, cfg, budget_s)
+        _catch_up_pending(conn, cfg, budget_s, (start_utc, end_utc))
         pending, errored = _pending_and_errored_counts(conn, start_utc, end_utc)
 
     return pending + errored
@@ -142,13 +147,20 @@ def digest(
         typer.echo(markdown)
     else:
         # Deliver to channels
-        from .deliver import deliver_digest
+        from .deliver import deliver_digest, enabled_channels
 
         if not channel:
-            # No specific channels requested; use enabled ones from config
-            if not cfg.deliver.slack and not cfg.deliver.email and not cfg.deliver.repo:
+            # No specific channels requested; use enabled ones from config. Must check
+            # exactly the set `deliver_digest` itself would use - a hand-maintained
+            # subset here previously omitted `notify` (on by default), so a config with
+            # only `notify` enabled hit this guard and exited before `deliver_digest`
+            # ever ran.
+            if not enabled_channels(cfg):
                 typer.echo("No delivery channels enabled in config.")
-                typer.echo("Set [deliver] slack=true, email=true, or repo=true in config.toml,")
+                typer.echo(
+                    "Set [deliver] slack=true, email=true, notify=true, or repo=true in "
+                    "config.toml,"
+                )
                 typer.echo("and provide secrets: VAS_SLACK_WEBHOOK_URL, VAS_SMTP_PASSWORD")
                 raise typer.Exit(1)
 

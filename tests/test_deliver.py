@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import typer
 
 from voice_ai_summary import commands_deliver
 from voice_ai_summary import summarize as summarize_mod
@@ -386,23 +387,71 @@ class TestDeliverDigest:
 
         assert results == {}
 
+    def test_deliver_digest_skips_no_data_digest_with_incompleteness_banner(
+        self, tmp_path: Path
+    ) -> None:
+        """`_insert_incomplete_banner` rewrites a no-data placeholder's Markdown before
+        `deliver_digest` ever sees it - the placeholder must still be recognised as
+        having no data to deliver, and in particular the repo channel must never
+        receive it (it would overwrite a real, already-mirrored digest file)."""
+        from voice_ai_summary.commands_deliver import _insert_incomplete_banner
+
+        db_path = tmp_path / "test.sqlite3"
+        conn = connect(db_path)
+
+        cfg = Config()
+        cfg.deliver.slack = True
+        cfg.deliver.repo = True
+        cfg.deliver.repo_path = str(tmp_path / "repo")
+
+        no_data_markdown = "# 2026-09-16 の記録\n\n記録なし\n"
+        banner_markdown = _insert_incomplete_banner(no_data_markdown, missing=3)
+        # Sanity check: this really is the rewritten shape, not the raw placeholder.
+        assert banner_markdown != no_data_markdown
+        assert summarize_mod.is_no_data_digest(banner_markdown)
+
+        with (
+            patch("voice_ai_summary.deliver.send_slack") as mock_slack,
+            patch("voice_ai_summary.deliver.publish_to_repo") as mock_publish,
+        ):
+            with patch.dict("os.environ", {"VAS_SLACK_WEBHOOK_URL": "https://example.com"}):
+                results = deliver_digest(
+                    conn, cfg, "2026-09-16", banner_markdown, channels=["slack", "repo"]
+                )
+
+        assert results == {
+            "slack": "skipped: no-data digest",
+            "repo": "skipped: no-data digest",
+        }
+        mock_slack.assert_not_called()
+        mock_publish.assert_not_called()
+
 
 class _FakeGitRunner:
     """Records every `git -C <repo> ...` call and returns a canned result per subcommand.
 
     `results` maps the git subcommand (e.g. "push") to (returncode, stderr). Anything not
-    listed succeeds with empty output.
+    listed succeeds with empty output. `stdouts` maps a subcommand to its stdout; a
+    `rev-parse` call defaults to "main" (a plain, non-detached branch name) so tests that
+    don't care about branch resolution don't have to configure it.
     """
 
-    def __init__(self, results: dict[str, tuple[int, str]] | None = None) -> None:
+    def __init__(
+        self,
+        results: dict[str, tuple[int, str]] | None = None,
+        stdouts: dict[str, str] | None = None,
+    ) -> None:
         self.calls: list[tuple[list[str], dict]] = []
         self.results = results or {}
+        self.stdouts = stdouts or {}
 
     def __call__(self, args: list[str], **kwargs: object) -> SimpleNamespace:
         self.calls.append((args, kwargs))
         subcommand = args[3]
         returncode, stderr = self.results.get(subcommand, (0, ""))
-        return SimpleNamespace(returncode=returncode, stdout="", stderr=stderr)
+        default_stdout = "main" if subcommand == "rev-parse" else ""
+        stdout = self.stdouts.get(subcommand, default_stdout)
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
 class TestRepoDelivery:
@@ -426,7 +475,8 @@ class TestRepoDelivery:
         assert written.read_text(encoding="utf-8") == "# Digest content"
 
     def test_add_diff_commit_push_order(self, tmp_path: Path) -> None:
-        """add, diff --cached, commit, push run in that order, all with -C <repo>."""
+        """rev-parse (branch resolution), pull, add, diff --cached, commit, push run in
+        that order, all with -C <repo>."""
         repo = self._make_repo(tmp_path)
         cfg = DeliverConfig(repo=True, repo_path=str(repo))
         runner = _FakeGitRunner(results={"diff": (1, "")})
@@ -434,7 +484,7 @@ class TestRepoDelivery:
         publish_to_repo(cfg, "2026-09-15", "# Digest", runner=runner)
 
         subcommands = [call_args[3] for call_args, _ in runner.calls]
-        assert subcommands == ["pull", "add", "diff", "commit", "push"]
+        assert subcommands == ["rev-parse", "pull", "add", "diff", "commit", "push"]
         for call_args, _ in runner.calls:
             assert call_args[0] == "git"
             assert call_args[1] == "-C"
@@ -486,6 +536,43 @@ class TestRepoDelivery:
 
         assert path == "digests/2026-09-15.md"
         subcommands = [call_args[3] for call_args, _ in runner.calls]
+        assert "commit" in subcommands
+        assert "push" in subcommands
+
+    def test_no_branch_configured_pulls_and_pushes_the_same_resolved_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """With `repo_branch` empty, the checkout's actual current branch (as reported
+        by `git rev-parse --abbrev-ref HEAD`, here a non-default branch) is resolved
+        once and used as both the pull target and the push target - not the literal
+        "HEAD", which `git pull` would instead resolve against the *remote's* default
+        branch."""
+        repo = self._make_repo(tmp_path)
+        cfg = DeliverConfig(repo=True, repo_path=str(repo))
+        runner = _FakeGitRunner(
+            results={"diff": (1, "")}, stdouts={"rev-parse": "feature/my-branch"}
+        )
+
+        publish_to_repo(cfg, "2026-09-15", "# Digest", runner=runner)
+
+        pull_call = next(call_args for call_args, _ in runner.calls if call_args[3] == "pull")
+        push_call = next(call_args for call_args, _ in runner.calls if call_args[3] == "push")
+        assert pull_call[-1] == "feature/my-branch"
+        assert push_call[-1] == "HEAD:feature/my-branch"
+
+    def test_detached_head_skips_pull_but_still_pushes(self, tmp_path: Path) -> None:
+        """A detached checkout (rev-parse reports "HEAD" itself) has no local branch
+        name to pull into - guessing one would risk fast-forwarding onto an unrelated
+        remote ref, so the pull is skipped entirely rather than attempted with a
+        guessed ref. The rest of the flow (commit/push) still runs."""
+        repo = self._make_repo(tmp_path)
+        cfg = DeliverConfig(repo=True, repo_path=str(repo))
+        runner = _FakeGitRunner(results={"diff": (1, "")}, stdouts={"rev-parse": "HEAD"})
+
+        publish_to_repo(cfg, "2026-09-15", "# Digest", runner=runner)
+
+        subcommands = [call_args[3] for call_args, _ in runner.calls]
+        assert "pull" not in subcommands
         assert "commit" in subcommands
         assert "push" in subcommands
 
@@ -705,10 +792,20 @@ class TestDigestCatchUp:
     def test_incompleteness_reaches_the_notification_too(
         self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """A day that has a real digest (not a no-data placeholder) but is still
+        incomplete surfaces the banner in the notification headline too."""
         cfg, conn = vas
         monkeypatch.setattr(commands_deliver, "load_config", lambda: cfg)
         day = "2026-09-15"
         start_utc, _end_utc = local_day_bounds(day, cfg.summarize.timezone)
+        monkeypatch.setattr(
+            vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, 0.9)]
+        )
+        # A real, transcribable recording so the day has actual content (not a no-data
+        # placeholder, which the delivery guard must never send anywhere - including
+        # notify) - plus an errored one that catch-up cannot fix, so the day still
+        # reports as incomplete.
+        self._ingest_pending(cfg, conn, start_utc, "20260915T000000Z")
         self._insert_errored(conn, start_utc, "e" * 64)
         self._stub_summarize(monkeypatch, day)
 
@@ -793,3 +890,93 @@ class TestDigestCatchUp:
         from voice_ai_summary.deliver.notify import _INCOMPLETE_PREFIX
 
         assert _INCOMPLETE_PREFIX not in out
+
+    def test_catch_up_only_transcribes_the_digest_days_recordings(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Catch-up must bound `process_pending` to the digest day (via `within=`) -
+        otherwise `process_pending`'s global oldest-first order can spend the whole
+        `digest_catchup_budget_s` transcribing an unrelated, older day's backlog while
+        the day actually being summarized stays untranscribed."""
+        cfg, conn = vas
+        monkeypatch.setattr(commands_deliver, "load_config", lambda: cfg)
+        day = "2026-09-15"
+        other_day = "2026-09-10"
+        start_utc, _end_utc = local_day_bounds(day, cfg.summarize.timezone)
+        other_start_utc, _ = local_day_bounds(other_day, cfg.summarize.timezone)
+        monkeypatch.setattr(
+            vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, 0.9)]
+        )
+        # An older, unrelated day's pending recording: globally-oldest-first (no `within`
+        # bound) would pick this up ahead of the digest day's own recording. Different
+        # durations keep the two files' content (and thus dedup sha256) distinct.
+        other_id = self._ingest_pending(cfg, conn, other_start_utc, "other_day", seconds=1.0)
+        same_id = self._ingest_pending(cfg, conn, start_utc, "digest_day", seconds=1.5)
+        self._stub_summarize(monkeypatch, day)
+
+        commands_deliver.digest(day=day, deliver=False, force=False, channel=None)
+
+        def _is_processed(rec_id: int) -> bool:
+            row = conn.execute(
+                "SELECT processed_at FROM recordings WHERE id = ?", (rec_id,)
+            ).fetchone()
+            return row["processed_at"] is not None
+
+        assert _is_processed(same_id), "the digest day's own recording should be transcribed"
+        assert not _is_processed(other_id), (
+            "catch-up must not spend its budget on a different day's backlog"
+        )
+
+
+class TestDigestDeliverChannelGuard:
+    """`vas digest --deliver`'s "no delivery channels enabled" guard must agree with the
+    set of channels `deliver.deliver_digest` actually considers enabled (derived from
+    `deliver.enabled_channels`), not a separately hand-maintained list - see
+    `commands_deliver.digest`."""
+
+    _EPISODE_SUMMARY = EpisodeSummary(
+        title="テスト会話", kind_guess="solo", summary_ja="テスト要約です。"
+    )
+
+    def _stub_summarize(self, monkeypatch: pytest.MonkeyPatch, day: str) -> None:
+        markdown = f"# {day} の記録\n\n## ハイライト\n\n- テストのハイライト\n"
+        monkeypatch.setattr(summarize_mod, "_call_map", lambda *a, **k: self._EPISODE_SUMMARY)
+        monkeypatch.setattr(summarize_mod, "_call_reduce", lambda *a, **k: markdown)
+        monkeypatch.setattr(summarize_mod.correct, "correct_day", lambda *a, **k: 0)
+        monkeypatch.setattr(summarize_mod, "make_client", lambda cfg: object())
+
+    def test_notify_only_reaches_deliver_digest(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fresh config has only `notify` enabled (its default is True, every other
+        channel defaults to False). `vas digest --deliver` must still reach
+        `deliver_digest` instead of exiting 1 on the "no channels enabled" guard."""
+        cfg, conn = vas
+        monkeypatch.setattr(commands_deliver, "load_config", lambda: cfg)
+        assert cfg.deliver.notify
+        assert not (cfg.deliver.slack or cfg.deliver.email or cfg.deliver.repo)
+        day = "2026-09-15"
+        self._stub_summarize(monkeypatch, day)
+
+        with patch("voice_ai_summary.deliver.deliver_digest") as mock_deliver:
+            mock_deliver.return_value = {"notify": "ok"}
+            commands_deliver.digest(day=day, deliver=True, force=False, channel=None)
+
+        mock_deliver.assert_called_once()
+
+    def test_genuinely_no_channels_still_exits(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With every channel (including `notify`) disabled, the guard still exits 1
+        before `deliver_digest` is ever called."""
+        cfg, conn = vas
+        cfg.deliver.notify = False
+        monkeypatch.setattr(commands_deliver, "load_config", lambda: cfg)
+        day = "2026-09-15"
+        self._stub_summarize(monkeypatch, day)
+
+        with patch("voice_ai_summary.deliver.deliver_digest") as mock_deliver:
+            with pytest.raises(typer.Exit):
+                commands_deliver.digest(day=day, deliver=True, force=False, channel=None)
+
+        mock_deliver.assert_not_called()

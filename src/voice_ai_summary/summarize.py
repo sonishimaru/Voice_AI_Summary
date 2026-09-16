@@ -330,22 +330,36 @@ def _no_data_markdown(day: str) -> str:
 
 
 def is_no_data_digest(markdown: str) -> bool:
-    """True iff `markdown` is exactly the placeholder `_no_data_markdown` produces for
-    some day (heading, blank line, "記録なし", trailing newline) - not merely a digest
-    that happens to mention the phrase somewhere.
+    """True iff `markdown` is the placeholder `_no_data_markdown` produces for some day
+    (heading, "記録なし"), ignoring blank lines and, in particular, any incompleteness
+    banner `commands_deliver._insert_incomplete_banner` has inserted ahead of it - not
+    merely a digest that happens to mention the phrase somewhere.
+
+    `_insert_incomplete_banner` rewrites the Markdown *before* delivery ever sees it, so
+    without stripping the banner line back out here, an incomplete day's placeholder
+    would stop matching this shape right when a backlog makes the placeholder likely -
+    exactly the situation the "never deliver a no-data digest" guard exists for. The
+    banner is identified by `deliver.notify._INCOMPLETE_PREFIX`, the one place that
+    marker is defined; imported locally to avoid a circular import, since
+    `deliver/__init__.py` imports this function.
 
     Shared between `run_day` (which must never let this placeholder clobber a real,
     already-stored digest) and `deliver.deliver_digest` (which must never send this
     placeholder anywhere, especially not to the repo channel, where it would overwrite
     a good mirrored file) so the "no data" shape is defined in exactly one place.
     """
-    lines = markdown.splitlines()
+    from .deliver.notify import _INCOMPLETE_PREFIX
+
+    lines = [
+        line
+        for line in markdown.splitlines()
+        if line != "" and not line.startswith(_INCOMPLETE_PREFIX)
+    ]
     return (
-        len(lines) == 3
+        len(lines) == 2
         and lines[0].startswith("# ")
         and lines[0].endswith(" の記録")
-        and lines[1] == ""
-        and lines[2] == "記録なし"
+        and lines[1] == "記録なし"
     )
 
 

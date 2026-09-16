@@ -38,11 +38,29 @@ def publish_to_repo(
 
     if cfg.repo_branch:
         _run(runner, repo, ["checkout", cfg.repo_branch])
+        branch = cfg.repo_branch
+    else:
+        # No branch configured: resolve whatever is actually checked out and pull/push
+        # that ref explicitly, rather than the literal "HEAD". `git pull ... HEAD`
+        # resolves HEAD against the *remote*, not this local checkout, so it only
+        # happened to work when the checkout was on the remote's default branch - on
+        # any other branch it either fails outright or fast-forwards this checkout onto
+        # an unrelated remote ref. `git push origin HEAD` has no such ambiguity (it
+        # always pushes the local current branch), so resolving the local branch name
+        # here keeps the pull aimed at the same ref the push already uses.
+        branch = _run(runner, repo, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
 
-    pull_target = cfg.repo_branch or "HEAD"
-    pull = _run(runner, repo, ["pull", "--ff-only", cfg.repo_remote, pull_target], check=False)
-    if pull.returncode != 0:
-        log.warning("git pull failed for %s, continuing offline: %s", repo, pull.stderr.strip())
+    detached = branch == "HEAD"
+    if detached:
+        # `rev-parse --abbrev-ref HEAD` prints "HEAD" itself when there is no local
+        # branch to resolve. Guessing a target here (e.g. falling back to the literal
+        # "HEAD", which resolves on the *remote*) risks fast-forwarding onto an
+        # unrelated ref, so skip the pull entirely and proceed offline.
+        log.warning("repo %s has a detached HEAD; skipping pull", repo)
+    else:
+        pull = _run(runner, repo, ["pull", "--ff-only", cfg.repo_remote, branch], check=False)
+        if pull.returncode != 0:
+            log.warning("git pull failed for %s, continuing offline: %s", repo, pull.stderr.strip())
 
     rel_path = Path(cfg.repo_subdir) / f"{day}.md"
     abs_path = repo / rel_path
@@ -54,7 +72,7 @@ def publish_to_repo(
     diff = _run(runner, repo, ["diff", "--cached", "--quiet", "--", str(rel_path)], check=False)
     if diff.returncode != 0:
         _run(runner, repo, ["commit", "-m", f"Add digest for {day}", "--", str(rel_path)])
-        push_target = f"HEAD:{cfg.repo_branch}" if cfg.repo_branch else "HEAD"
+        push_target = "HEAD" if detached else f"HEAD:{branch}"
         _run(runner, repo, ["push", cfg.repo_remote, push_target])
 
     return str(rel_path)

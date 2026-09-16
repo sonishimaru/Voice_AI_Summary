@@ -13,6 +13,30 @@ from .repo import publish_to_repo
 from .slack import send_slack
 
 
+def enabled_channels(cfg: Config) -> list[str]:
+    """Which channels `deliver_digest` sends to when no explicit `channels` list is
+    given - every channel enabled in `cfg.deliver`, in the same order `deliver_digest`
+    builds `to_deliver` below.
+
+    Callers that need to know up front whether *any* channel would be attempted (e.g.
+    `commands_deliver`'s "no delivery channels enabled" guard) must derive that from
+    this function rather than re-listing the channels themselves - a hand-maintained
+    second list drifts out of sync with this one (notably: it used to omit `notify`,
+    the channel that is enabled by default, so `vas digest --deliver` exited before
+    `deliver_digest` ever ran).
+    """
+    channels: list[str] = []
+    if cfg.deliver.slack:
+        channels.append("slack")
+    if cfg.deliver.email:
+        channels.append("email")
+    if cfg.deliver.repo:
+        channels.append("repo")
+    if cfg.deliver.notify:
+        channels.append("notify")
+    return channels
+
+
 def deliver_digest(
     conn: sqlite3.Connection,
     cfg: Config,
@@ -43,16 +67,7 @@ def deliver_digest(
     results: dict[str, str] = {}
 
     # Determine which channels to process
-    to_deliver = channels or []
-    if not to_deliver:
-        if cfg.deliver.slack:
-            to_deliver.append("slack")
-        if cfg.deliver.email:
-            to_deliver.append("email")
-        if cfg.deliver.repo:
-            to_deliver.append("repo")
-        if cfg.deliver.notify:
-            to_deliver.append("notify")
+    to_deliver = list(channels) if channels else enabled_channels(cfg)
 
     if is_no_data_digest(markdown):
         # A "no data" placeholder is never useful to deliver, and through the repo
