@@ -127,11 +127,13 @@ vas usage --days 30
 vas vocab show                                   # 現在の用語集を表示
 vas vocab add "西丸" --alias にしまる --note "ユーザー本人の姓"
 
-export VAS_SLACK_USER_TOKEN=xoxp-...             # Slack ユーザートークン（scope: search:read）
+export VAS_SLACK_USER_TOKEN=xoxp-...             # Slack ユーザートークン
 vas vocab import-slack                           # 直近90日分の自分の発言から用語集を生成
+vas vocab import-slack --scope channels          # 参加している全チャンネルの会話から語彙を広く収集
+vas vocab import-slack --scope channels --channel design --channel sales   # チャンネルを限定
 ```
 
-`VAS_SLACK_USER_TOKEN` は **ユーザートークン**（`xoxp-`）である必要があります（`search.messages` はボットトークンでは使えません）。抽出には `[correct] model` と同じモデルが既定で使われます。
+`VAS_SLACK_USER_TOKEN` は **ユーザートークン**（`xoxp-`）である必要があります（`search.messages` はボットトークンでは使えません）。必要な User Token Scopes: `search:read`（自分の発言）、`channels:read` `groups:read` `channels:history` `groups:history`（`--scope channels`）。チャンネル収集は投稿者を問わず固有名詞・社内用語を広く拾い、表記ルール（style_notes）は自分の発言からのみ学習します。DM は対象外です。抽出には `[correct] model` と同じモデルが既定で使われます。
 
 ## 開発
 

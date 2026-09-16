@@ -52,8 +52,10 @@ model = "claude-haiku-4-5"
 batch_chars = 6000   # characters per correction call; long days are split into batches
 
 # The personal glossary (`vas vocab ...`) can be built from your own Slack messages:
-#   export VAS_SLACK_USER_TOKEN=xoxp-...    # Slack *user* token, scope: search:read
-#   vas vocab import-slack
+#   export VAS_SLACK_USER_TOKEN=xoxp-...    # Slack *user* token; scopes: search:read (+ channels:read,
+#                                           #   groups:read, channels:history, groups:history for --scope channels)
+#   vas vocab import-slack                   # your own messages
+#   vas vocab import-slack --scope channels  # every channel you belong to
 # (search.messages needs a user token; a bot token won't work.)
 
 [deliver]

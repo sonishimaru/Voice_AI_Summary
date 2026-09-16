@@ -258,7 +258,7 @@ def test_extract_glossary_chunks_and_merges(monkeypatch) -> None:
     long_messages = ["メッセージ" + str(i) * 400 for i in range(60)]  # forces >=2 chunks
     calls: list[str] = []
 
-    def fake_call_extract(client, model, text, existing_block) -> Glossary:
+    def fake_call_extract(client, model, text, existing_block, **kwargs) -> Glossary:
         calls.append(text)
         return Glossary(terms=[Term(term=f"用語{len(calls)}")])
 
@@ -281,7 +281,7 @@ def test_extract_glossary_splits_chunk_when_output_truncated(monkeypatch) -> Non
 
     calls: list[int] = []
 
-    def fake_call_extract(client, model, text, existing_block) -> Glossary:
+    def fake_call_extract(client, model, text, existing_block, **kwargs) -> Glossary:
         lines = text.split("\n")
         calls.append(len(lines))
         if len(lines) > 2:
@@ -293,3 +293,101 @@ def test_extract_glossary_splits_chunk_when_output_truncated(monkeypatch) -> Non
 
     assert calls[0] == 5 and max(calls[1:]) <= 3
     assert [t.term for t in result.terms] == ["a", "c", "d"]
+
+
+def _channel_handler(request: httpx.Request) -> httpx.Response:
+    path = request.url.path
+    q = dict(request.url.params)
+    if path == "/api/users.conversations":
+        assert q["types"] == "public_channel,private_channel"
+        if q.get("cursor") == "c2":
+            return httpx.Response(
+                200, json={"ok": True, "channels": [{"id": "C2", "name": "design"}]}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [{"id": "C1", "name": "general"}],
+                "response_metadata": {"next_cursor": "c2"},
+            },
+        )
+    if path == "/api/conversations.history":
+        assert float(q["oldest"]) > 0
+        if q["channel"] == "C1":
+            if q.get("cursor") == "h2":
+                return httpx.Response(
+                    200,
+                    json={"ok": True, "messages": [{"text": "般務連絡です"}], "has_more": False},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "has_more": True,
+                    "response_metadata": {"next_cursor": "h2"},
+                    "messages": [
+                        {"text": "安田さんに見積もりを送りました"},
+                        {"subtype": "channel_join", "text": "joined"},
+                        {"bot_id": "B1", "text": "bot noise"},
+                        {"text": "   "},
+                    ],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"ok": True, "has_more": False, "messages": [{"text": "ドット歯磨きのラフ"}]},
+        )
+    raise AssertionError(path)
+
+
+def test_import_channel_messages_walks_channels_and_filters_noise() -> None:
+    from voice_ai_summary.slack_import import import_channel_messages
+
+    with httpx.Client(transport=httpx.MockTransport(_channel_handler)) as client_http:
+        lines = import_channel_messages(client_http, "xoxp-test", days=30)
+
+    assert lines == [
+        "#general",
+        "安田さんに見積もりを送りました",
+        "般務連絡です",
+        "#design",
+        "ドット歯磨きのラフ",
+    ]
+
+
+def test_import_channel_messages_respects_channel_filter_and_caps() -> None:
+    from voice_ai_summary.slack_import import import_channel_messages
+
+    with httpx.Client(transport=httpx.MockTransport(_channel_handler)) as client_http:
+        only_design = import_channel_messages(client_http, "xoxp-test", channels=["#design"])
+        capped = import_channel_messages(client_http, "xoxp-test", per_channel=1)
+
+    assert only_design == ["#design", "ドット歯磨きのラフ"]
+    assert capped == ["#general", "安田さんに見積もりを送りました", "#design", "ドット歯磨きのラフ"]
+
+
+def test_extract_glossary_uses_channel_prompt_for_other_authors(monkeypatch) -> None:
+    captured: list[str] = []
+
+    class _Parsed:
+        parsed_output = Glossary(terms=[Term(term="ドット歯磨き")])
+        usage = None
+
+    class _Messages:
+        def parse(self, **kwargs):
+            captured.append(kwargs["system"])
+            return _Parsed()
+
+    class _Client:
+        messages = _Messages()
+
+    own = extract_glossary(_Client(), "m", ["自分の発言"], Glossary())
+    chan = extract_glossary(
+        _Client(), "m", ["#general", "他人の発言"], Glossary(), own_messages=False
+    )
+
+    assert "ユーザー本人のSlackメッセージ" in captured[0]
+    assert "参加しているSlackチャンネル" in captured[1]
+    assert "style_notes は出力しないでください" in captured[1]
+    assert [t.term for t in own.terms] == [t.term for t in chan.terms] == ["ドット歯磨き"]
