@@ -296,6 +296,82 @@ class TestDeliverDigest:
         assert row["status"] == "error"
         assert "Network error" in row["detail"]
 
+    def test_deliver_digest_skips_no_data_digest_on_every_channel(self, tmp_path: Path) -> None:
+        """A no-data placeholder digest must not reach any channel - and especially not
+        the repo channel, where it would overwrite a real, already-mirrored file."""
+        db_path = tmp_path / "test.sqlite3"
+        conn = connect(db_path)
+
+        cfg = Config()
+        cfg.deliver.slack = True
+        cfg.deliver.repo = True
+        cfg.deliver.repo_path = str(tmp_path / "repo")
+
+        no_data_markdown = "# 2026-09-16 の記録\n\n記録なし\n"
+
+        with (
+            patch("voice_ai_summary.deliver.send_slack") as mock_slack,
+            patch("voice_ai_summary.deliver.publish_to_repo") as mock_publish,
+        ):
+            with patch.dict("os.environ", {"VAS_SLACK_WEBHOOK_URL": "https://example.com"}):
+                results = deliver_digest(
+                    conn, cfg, "2026-09-16", no_data_markdown, channels=["slack", "repo"]
+                )
+
+        assert results == {
+            "slack": "skipped: no-data digest",
+            "repo": "skipped: no-data digest",
+        }
+        mock_slack.assert_not_called()
+        mock_publish.assert_not_called()
+
+        # Nothing was recorded as delivered either.
+        rows = conn.execute("SELECT * FROM deliveries WHERE scope_key = '2026-09-16'").fetchall()
+        assert rows == []
+
+    def test_deliver_digest_skips_no_data_digest_even_with_force(self, tmp_path: Path) -> None:
+        """force=True still must not deliver a no-data placeholder."""
+        db_path = tmp_path / "test.sqlite3"
+        conn = connect(db_path)
+
+        cfg = Config()
+        cfg.deliver.repo = True
+        cfg.deliver.repo_path = str(tmp_path / "repo")
+
+        no_data_markdown = "# 2026-09-16 の記録\n\n記録なし\n"
+
+        with patch("voice_ai_summary.deliver.publish_to_repo") as mock_publish:
+            results = deliver_digest(
+                conn, cfg, "2026-09-16", no_data_markdown, channels=["repo"], force=True
+            )
+
+        assert results == {"repo": "skipped: no-data digest"}
+        mock_publish.assert_not_called()
+
+    def test_deliver_digest_normal_digest_delivers_as_before(self, tmp_path: Path) -> None:
+        """Regression check: a real digest still delivers exactly as it did before the
+        no-data guard was added."""
+        db_path = tmp_path / "test.sqlite3"
+        conn = connect(db_path)
+
+        cfg = Config()
+        cfg.deliver.slack = True
+
+        real_markdown = "# 2026-09-16 の記録\n\n## ハイライト\n\n- 本物のダイジェスト\n"
+
+        with patch("voice_ai_summary.deliver.send_slack") as mock_slack:
+            with patch.dict("os.environ", {"VAS_SLACK_WEBHOOK_URL": "https://example.com"}):
+                results = deliver_digest(conn, cfg, "2026-09-16", real_markdown, channels=["slack"])
+
+        assert results == {"slack": "ok"}
+        mock_slack.assert_called_once()
+
+        row = conn.execute(
+            "SELECT status FROM deliveries WHERE scope_key = ? AND channel = ?",
+            ("2026-09-16", "slack"),
+        ).fetchone()
+        assert row["status"] == "ok"
+
     def test_deliver_digest_no_enabled_channels(self, tmp_path: Path) -> None:
         """No delivery if no channels enabled."""
         db_path = tmp_path / "test.sqlite3"
