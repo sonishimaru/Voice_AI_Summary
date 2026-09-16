@@ -184,6 +184,115 @@ def test_run_day_empty_day_skips_api_and_writes_no_data_markdown(vas, fake_calls
     assert day_row["markdown"] == markdown
 
 
+def test_run_day_no_episodes_keeps_existing_stored_digest(vas, fake_calls) -> None:
+    """A day that currently has no episodes but already has a stored digest (e.g. a
+    replayed run racing a still-in-progress correction pass) must not have that digest
+    flattened to the "記録なし" placeholder - in the DB or on disk."""
+    cfg, conn = vas
+    day = "2026-09-16"
+    original_markdown = "# 2026-09-16 の記録\n\n## ハイライト\n\n- 本物のダイジェスト\n"
+    cfg.paths.digests.mkdir(parents=True, exist_ok=True)
+    digest_path = cfg.paths.digests / f"{day}.md"
+    digest_path.write_text(original_markdown, encoding="utf-8")
+    conn.execute(
+        "INSERT INTO summaries(scope, scope_key, model, prompt_version, json, markdown, created_at)"
+        " VALUES ('day', ?, 'claude-opus-5', ?, '{}', ?, '2026-09-16T00:00:00Z')",
+        (day, summarize_mod.PROMPT_VERSION, original_markdown),
+    )
+    conn.commit()
+
+    markdown = run_day(conn, cfg, day)
+
+    assert markdown == original_markdown
+    assert fake_calls["map"] == 0
+    assert fake_calls["reduce"] == 0
+
+    row = conn.execute(
+        "SELECT * FROM summaries WHERE scope='day' AND scope_key=?", (day,)
+    ).fetchone()
+    assert row["markdown"] == original_markdown
+    assert row["json"] == "{}"  # untouched - not re-upserted
+
+    assert digest_path.read_bytes() == original_markdown.encode("utf-8")
+
+
+def test_run_day_no_episodes_force_still_keeps_existing_digest(vas, fake_calls) -> None:
+    """`force=True` recomputes summaries; it must not license clobbering an existing
+    digest with the no-data placeholder when there are no episodes to recompute from."""
+    cfg, conn = vas
+    day = "2026-09-16"
+    original_markdown = "# 2026-09-16 の記録\n\n## ハイライト\n\n- 本物のダイジェスト\n"
+    cfg.paths.digests.mkdir(parents=True, exist_ok=True)
+    digest_path = cfg.paths.digests / f"{day}.md"
+    digest_path.write_text(original_markdown, encoding="utf-8")
+    conn.execute(
+        "INSERT INTO summaries(scope, scope_key, model, prompt_version, json, markdown, created_at)"
+        " VALUES ('day', ?, 'claude-opus-5', ?, '{}', ?, '2026-09-16T00:00:00Z')",
+        (day, summarize_mod.PROMPT_VERSION, original_markdown),
+    )
+    conn.commit()
+
+    markdown = run_day(conn, cfg, day, force=True)
+
+    assert markdown == original_markdown
+    assert fake_calls["map"] == 0
+    assert fake_calls["reduce"] == 0
+    assert digest_path.read_bytes() == original_markdown.encode("utf-8")
+
+
+def test_run_day_no_episodes_nothing_stored_writes_placeholder(vas, fake_calls) -> None:
+    """No episodes and no pre-existing digest anywhere: the placeholder is written, as
+    it was before this guard existed."""
+    cfg, conn = vas
+    day = "2026-09-16"
+
+    markdown = run_day(conn, cfg, day)
+
+    assert "記録なし" in markdown
+    assert fake_calls["map"] == 0
+    assert fake_calls["reduce"] == 0
+
+    digest_path = cfg.paths.digests / f"{day}.md"
+    assert digest_path.read_text(encoding="utf-8") == markdown
+
+    row = conn.execute(
+        "SELECT * FROM summaries WHERE scope='day' AND scope_key=?", (day,)
+    ).fetchone()
+    assert row is not None
+    assert row["markdown"] == markdown
+
+
+def test_run_day_no_episodes_restores_missing_file_from_db(vas, fake_calls) -> None:
+    """The DB has a good digest but the mirrored file is missing (e.g. deleted by hand) -
+    the file should be restored from the DB rather than left inconsistent, and the DB
+    row must stay untouched."""
+    cfg, conn = vas
+    day = "2026-09-16"
+    original_markdown = "# 2026-09-16 の記録\n\n## ハイライト\n\n- 本物のダイジェスト\n"
+    conn.execute(
+        "INSERT INTO summaries(scope, scope_key, model, prompt_version, json, markdown, created_at)"
+        " VALUES ('day', ?, 'claude-opus-5', ?, '{}', ?, '2026-09-16T00:00:00Z')",
+        (day, summarize_mod.PROMPT_VERSION, original_markdown),
+    )
+    conn.commit()
+    digest_path = cfg.paths.digests / f"{day}.md"
+    assert not digest_path.exists()
+
+    markdown = run_day(conn, cfg, day)
+
+    assert markdown == original_markdown
+    assert fake_calls["map"] == 0
+    assert fake_calls["reduce"] == 0
+    assert digest_path.is_file()
+    assert digest_path.read_bytes() == original_markdown.encode("utf-8")
+
+    row = conn.execute(
+        "SELECT * FROM summaries WHERE scope='day' AND scope_key=?", (day,)
+    ).fetchone()
+    assert row["markdown"] == original_markdown
+    assert row["json"] == "{}"
+
+
 def test_run_day_recomputes_when_new_utterances_arrive(vas, fake_calls, monkeypatch) -> None:
     """Late-processed audio changes an episode's transcript → the map step runs again; the
     day rollup is re-run only when the episode summaries it consumes actually changed."""

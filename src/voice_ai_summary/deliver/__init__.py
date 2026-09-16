@@ -6,6 +6,7 @@ import sqlite3
 
 from ..config import Config
 from ..db import utcnow_iso
+from ..summarize import is_no_data_digest
 from .email import send_email
 from .notify import send_notification
 from .repo import publish_to_repo
@@ -32,8 +33,12 @@ def deliver_digest(
         force: Skip idempotency checks and resend.
 
     Returns:
-        Dict mapping channel name to status: "ok", "skipped", or "error: <reason>".
-        Missing secrets are treated as errors with descriptive messages.
+        Dict mapping channel name to status: "ok", "skipped", "skipped: no-data digest",
+        or "error: <reason>". Missing secrets are treated as errors with descriptive
+        messages. A `markdown` that is the "no data" placeholder (see
+        `summarize.is_no_data_digest`) is never delivered to any channel, regardless of
+        force - there's nothing worth sending, and sending it to the repo channel would
+        overwrite a real digest already mirrored there.
     """
     results: dict[str, str] = {}
 
@@ -48,6 +53,17 @@ def deliver_digest(
             to_deliver.append("repo")
         if cfg.deliver.notify:
             to_deliver.append("notify")
+
+    if is_no_data_digest(markdown):
+        # A "no data" placeholder is never useful to deliver, and through the repo
+        # channel it's actively harmful: `publish_to_repo` would overwrite a real,
+        # already-mirrored digest file with an empty one. Skip every channel up front,
+        # before any channel-specific network/subprocess call is made, and say why -
+        # same idea as the per-channel "skipped"/"error: <reason>" statuses below, just
+        # decided once for the whole digest instead of per channel.
+        for channel in to_deliver:
+            results[channel] = "skipped: no-data digest"
+        return results
 
     for channel in to_deliver:
         # Check if already delivered
