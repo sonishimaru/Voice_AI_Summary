@@ -6,9 +6,9 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-if TYPE_CHECKING:
-    import numpy as np
+import numpy as np
 
+if TYPE_CHECKING:
     from .config import Config
 
 
@@ -59,6 +59,33 @@ def _merged_hotwords(cfg: Config, extra_hotwords: list[str]) -> list[str]:
     return merged
 
 
+# Speech sits around this RMS once levelled; the gain cap keeps a silent chunk from being
+# amplified into noise the decoder then hallucinates over.
+_TARGET_RMS = 0.05
+_TARGET_PEAK = 0.95
+_MAX_GAIN = 20.0
+
+
+def normalize_samples(samples: np.ndarray, mode: str) -> np.ndarray:
+    """Scale a chunk to a workable level. `mode` is "none", "peak" or "rms"."""
+    if mode == "none" or len(samples) == 0:
+        return samples
+    if mode == "peak":
+        current = float(np.abs(samples).max())
+        target = _TARGET_PEAK
+    elif mode == "rms":
+        current = float(np.sqrt((samples.astype("float64") ** 2).mean()))
+        target = _TARGET_RMS
+    else:
+        raise ValueError(f"unknown [asr] normalize mode: {mode}")
+    if current <= 0:
+        return samples
+    gain = min(target / current, _MAX_GAIN)
+    if gain <= 1.0:
+        return samples
+    return np.clip(samples * gain, -1.0, 1.0).astype("float32")
+
+
 def _prompt_for(cfg: Config, hotwords: list[str]) -> str | None:
     """Same formula as `AsrConfig.prompt`, but over a (possibly glossary-extended) list."""
     parts = [cfg.asr.initial_prompt.strip()] if cfg.asr.initial_prompt.strip() else []
@@ -92,7 +119,7 @@ class FasterWhisperBackend:
         asr = self._cfg.asr
         hotwords = _merged_hotwords(self._cfg, self._extra_hotwords)
         segments, _info = model.transcribe(
-            samples16k,
+            normalize_samples(samples16k, asr.normalize),
             language=language,
             beam_size=asr.beam_size,
             vad_filter=False,
@@ -126,7 +153,7 @@ class MlxWhisperBackend:
         asr = self._cfg.asr
         hotwords = _merged_hotwords(self._cfg, self._extra_hotwords)
         result = mlx_whisper.transcribe(
-            samples16k,
+            normalize_samples(samples16k, asr.normalize),
             path_or_hf_repo=asr.resolved_model,
             language=language,
             initial_prompt=_prompt_for(self._cfg, hotwords),

@@ -40,7 +40,7 @@ def process_recording(
         length_ms = duration_ms(samples)
         speaker = speaker_for_source(row["source"])
 
-        regions = vad_module.detect_speech(samples, cfg.vad)
+        regions = vad_module.detect_speech(samples, cfg.vad.for_source(row["source"]))
 
         # Transcribe first, write second: a 15-minute recording takes minutes to decode,
         # and holding the write lock for that long locks out the worker (or `vas

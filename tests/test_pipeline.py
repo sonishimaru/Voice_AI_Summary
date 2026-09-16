@@ -198,3 +198,15 @@ def test_reset_recordings_clears_transcript_and_requeues(vas, monkeypatch) -> No
     assert conn.execute("SELECT COUNT(*) AS n FROM segments").fetchone()["n"] == 0
     assert process_pending(conn, cfg, FakeBackend(["二回目"])) == 1
     assert conn.execute("SELECT text FROM utterances").fetchone()["text"] == "二回目"
+
+
+def test_vad_threshold_can_be_overridden_per_source() -> None:
+    """The mic track records far quieter than the system track; one threshold
+    over-triggers on the quiet one and under-triggers on the loud one."""
+    from voice_ai_summary.config import VadConfig
+
+    cfg = VadConfig(threshold=0.5, threshold_by_source={"mac_mic": 0.7})
+
+    assert cfg.for_source("mac_mic").threshold == 0.7
+    assert cfg.for_source("mac_system").threshold == 0.5
+    assert cfg.for_source("mac_system") is cfg

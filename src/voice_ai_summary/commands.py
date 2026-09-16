@@ -29,8 +29,23 @@ def status() -> None:
     typer.echo(f"db       : {cfg.paths.db_path}")
     typer.echo(f"asr model: {cfg.asr.model}")
     typer.echo(f"inbox files      : {inbox}")
+    # Silent transcription failures look exactly like a quiet day in the counts above, so
+    # surface the shape that means "we heard speech and wrote nothing down": a settings
+    # change once emptied every recording for 17 hours before anyone noticed.
+    silent = conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM recordings r
+        WHERE r.processed_at IS NOT NULL
+          AND EXISTS (SELECT 1 FROM segments s WHERE s.recording_id = r.id)
+          AND NOT EXISTS (SELECT 1 FROM utterances u WHERE u.recording_id = r.id)
+        """
+    ).fetchone()["n"]
     typer.echo(f"recordings       : {rec} (pending: {pending})")
     typer.echo(f"utterances       : {utt}")
+    typer.echo(
+        f"speech, no text  : {silent}"
+        + ("  <- ASR は無音でないのに何も返していません" if silent else "")
+    )
 
 
 @app.command()

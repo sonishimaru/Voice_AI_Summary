@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from voice_ai_summary.asr import (
     MAX_HOTWORD_CHARS,
     FasterWhisperBackend,
     _merged_hotwords,
     get_backend,
+    normalize_samples,
 )
 from voice_ai_summary.config import DEFAULT_MLX_MODEL, Config
 
@@ -113,3 +115,29 @@ def test_hotwords_are_capped_to_what_the_decoder_will_read() -> None:
     assert merged[0] == "安田さん"
     assert len(" ".join(merged)) <= MAX_HOTWORD_CHARS
     assert len(merged) < len(glossary_terms)
+
+
+def test_normalize_samples_lifts_a_quiet_chunk_and_leaves_a_loud_one() -> None:
+    quiet = np.full(1000, 0.1, dtype=np.float32)
+    assert float(np.abs(normalize_samples(quiet, "peak")).max()) == pytest.approx(0.95, abs=0.01)
+
+    faint = np.full(1000, 0.01, dtype=np.float32)
+    assert float(np.sqrt((normalize_samples(faint, "rms") ** 2).mean())) == pytest.approx(
+        0.05, abs=0.001
+    )
+
+    # Normalizing only ever adds gain - a chunk already at full scale is left alone.
+    loud = np.full(1000, 1.0, dtype=np.float32)
+    assert np.array_equal(normalize_samples(loud, "peak"), loud)
+    assert np.array_equal(normalize_samples(loud, "rms"), loud)
+    assert np.array_equal(
+        normalize_samples(np.full(1000, 0.8, dtype=np.float32), "none"),
+        np.full(1000, 0.8, dtype=np.float32),
+    )
+
+
+def test_normalize_samples_caps_the_gain_on_near_silence() -> None:
+    """Amplifying room tone to speech level just gives the decoder noise to invent over,
+    so the gain is capped instead of reaching the target."""
+    room_tone = np.full(1000, 0.002, dtype=np.float32)
+    assert float(np.abs(normalize_samples(room_tone, "peak")).max()) == pytest.approx(0.04)
