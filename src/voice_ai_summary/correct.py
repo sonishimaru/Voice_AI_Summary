@@ -143,7 +143,8 @@ def correct_day(
     rows the model no longer corrects fall back to that original.
 
     The API is never touched when there is nothing to correct - `client` (default
-    `anthropic.Anthropic()`) is only constructed once there is at least one row to send.
+    `make_client(cfg)`, which also enforces the daily budget) is only constructed once
+    there is at least one row to send.
     """
     tz = cfg.summarize.timezone
     start_utc, end_utc = local_day_bounds(day, tz)
