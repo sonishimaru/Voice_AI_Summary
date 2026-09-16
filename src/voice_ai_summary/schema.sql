@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS recordings (
     ingested_at     TEXT NOT NULL,
     processed_at    TEXT,
     error           TEXT,
-    claimed_at      TEXT                        -- set while a caller owns this row for processing (pipeline.py)
+    claimed_at      TEXT,                       -- set while a caller owns this row for processing (pipeline.py)
+    processing_ms   INTEGER                     -- wall time for VAD+ASR in process_recording (pipeline.py)
 );
 CREATE INDEX IF NOT EXISTS idx_recordings_started ON recordings(started_at_utc);
 CREATE INDEX IF NOT EXISTS idx_recordings_unprocessed ON recordings(processed_at) WHERE processed_at IS NULL;
