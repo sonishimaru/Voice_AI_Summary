@@ -26,10 +26,32 @@ def _abs_start_utc(started_at_utc: str, t_start_ms: int) -> str:
     return (started + timedelta(milliseconds=t_start_ms)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _clear_transcript(conn: sqlite3.Connection, recording_ids: list[int]) -> None:
+    """Delete `segments`/`utterances` rows for the given recordings.
+
+    The `utterances_ad` trigger in `schema.sql` mirrors each deleted row into
+    `utterances_fts` (an external-content FTS5 table), so this is the one place that
+    removes utterances - anything that drops or replaces a recording's transcript must
+    go through here rather than issuing its own `DELETE FROM utterances`, or the FTS
+    index goes stale. Caller is expected to be inside a `transaction(conn)` block.
+    """
+    if not recording_ids:
+        return
+    placeholders = ",".join("?" for _ in recording_ids)
+    conn.execute(f"DELETE FROM utterances WHERE recording_id IN ({placeholders})", recording_ids)
+    conn.execute(f"DELETE FROM segments WHERE recording_id IN ({placeholders})", recording_ids)
+
+
 def process_recording(
     conn: sqlite3.Connection, cfg: Config, recording_id: int, backend: ASRBackend
 ) -> int:
-    """Run VAD + ASR for one recording, insert segments/utterances. Returns utterance count."""
+    """Run VAD + ASR for one recording, insert segments/utterances. Returns utterance count.
+
+    Idempotent: any segments/utterances already stored for this recording (from an
+    earlier run) are deleted, in the same transaction, before the new ones are
+    inserted - so re-processing the same recording replaces its transcript instead of
+    appending a second copy of it.
+    """
     row = conn.execute("SELECT * FROM recordings WHERE id = ?", (recording_id,)).fetchone()
     if row is None:
         raise ValueError(f"no such recording: {recording_id}")
@@ -54,6 +76,7 @@ def process_recording(
 
         utterance_count = 0
         with transaction(conn):
+            _clear_transcript(conn, [recording_id])
             conn.execute(
                 "UPDATE recordings SET duration_ms = ? WHERE id = ?", (length_ms, recording_id)
             )
@@ -167,12 +190,26 @@ def reset_recordings(conn: sqlite3.Connection, recording_ids: list[int]) -> int:
         return 0
     placeholders = ",".join("?" for _ in recording_ids)
     with transaction(conn):
-        conn.execute(
-            f"DELETE FROM utterances WHERE recording_id IN ({placeholders})", recording_ids
-        )
-        conn.execute(f"DELETE FROM segments WHERE recording_id IN ({placeholders})", recording_ids)
+        _clear_transcript(conn, recording_ids)
         conn.execute(
             f"UPDATE recordings SET processed_at = NULL, error = NULL WHERE id IN ({placeholders})",
             recording_ids,
         )
     return len(recording_ids)
+
+
+def delete_recording(conn: sqlite3.Connection, recording_id: int) -> bool:
+    """Permanently delete one recording's row along with its segments/utterances.
+
+    Does NOT touch the audio file on disk - callers that want that removed too must do
+    it themselves. Returns False (no-op) if the recording does not exist. Uses
+    `_clear_transcript` so `utterances_fts` stays consistent, same as `reset_recordings`
+    and `process_recording`.
+    """
+    with transaction(conn):
+        row = conn.execute("SELECT id FROM recordings WHERE id = ?", (recording_id,)).fetchone()
+        if row is None:
+            return False
+        _clear_transcript(conn, [recording_id])
+        conn.execute("DELETE FROM recordings WHERE id = ?", (recording_id,))
+    return True
