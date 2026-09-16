@@ -22,9 +22,13 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from mcp.server.mcpserver import MCPServer
+
+if TYPE_CHECKING:
+    from .asr import ASRBackend
+    from .config import Config
 
 server = MCPServer(
     name="voice-ai-summary",
@@ -383,6 +387,29 @@ def retry_failed() -> str:
     )
 
 
+_backend_cache: dict[tuple[str, str], ASRBackend] = {}
+
+
+def _cached_backend(cfg: Config) -> ASRBackend:
+    """An ASR backend reused across tool calls.
+
+    Claude Desktop keeps this server process alive between calls, and a fresh
+    `FasterWhisperBackend` reloads the model on its first transcription -- tens of
+    seconds. Clearing a backlog means calling `process_pending` repeatedly, so building
+    a new backend each time would spend most of the wall clock loading the same model
+    over and over. Keyed by backend and model so a config change still takes effect.
+    """
+    import os
+
+    from .asr import get_backend
+
+    key = (os.environ.get("VAS_ASR_BACKEND") or cfg.asr.backend, cfg.asr.resolved_model)
+    if key not in _backend_cache:
+        _backend_cache.clear()
+        _backend_cache[key] = get_backend(cfg)
+    return _backend_cache[key]
+
+
 @_tool_safe
 def process_pending(limit: int = 3) -> str:
     """Transcribe up to `limit` pending recordings with the local ASR backend.
@@ -395,7 +422,6 @@ def process_pending(limit: int = 3) -> str:
     (see `worker_status`) is not running. The very first call may also need to download
     the ASR model, which can be slow - if it seems to hang, that is likely why.
     """
-    from .asr import get_backend
     from .config import load_config
     from .db import connect
     from .pipeline import process_pending as run_process_pending
@@ -404,7 +430,7 @@ def process_pending(limit: int = 3) -> str:
     cfg.ensure_dirs()
     conn = connect(cfg.paths.db_path)
 
-    backend = get_backend(cfg)
+    backend = _cached_backend(cfg)
     processed = run_process_pending(conn, cfg, backend, limit=limit)
     remaining = conn.execute(
         "SELECT COUNT(*) AS n FROM recordings WHERE processed_at IS NULL AND error IS NULL"

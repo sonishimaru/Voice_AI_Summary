@@ -14,7 +14,7 @@ backend = "faster-whisper"
 # mlx:            "mlx-community/whisper-large-v3-turbo" (default when backend = "mlx").
 model = "kotoba-tech/kotoba-whisper-v2.0-faster"
 device = "auto"          # auto | cpu | cuda  (faster-whisper only)
-compute_type = "default" # default | int8 | float16  (faster-whisper only; int8 is ~2x faster on CPU)
+compute_type = "auto"    # auto | default | int8 | float16  (faster-whisper のみ。auto はデバイスが速く回せる精度を選ぶ)
 language = "ja"
 beam_size = 5
 # Names, products and jargon that ASR keeps misspelling. Biases decoding toward these.

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from voice_ai_summary import mcp_server
+from voice_ai_summary.asr import FakeBackend
 from voice_ai_summary.config import Config
 from voice_ai_summary.summarize import PROMPT_VERSION
 
@@ -595,3 +596,37 @@ class TestServiceLogs:
         assert "line45" in result
         assert "line44" not in result
         assert "(empty)" in result
+
+
+class TestBackendCache:
+    """Claude Desktop keeps the server alive between calls, so the ASR model should be
+    loaded once, not once per `process_pending` call."""
+
+    def test_backend_is_reused_across_calls(self, vas, monkeypatch) -> None:
+        cfg, _conn = vas
+        builds = []
+
+        def _fake_get_backend(config):
+            builds.append(config.asr.resolved_model)
+            return FakeBackend()
+
+        monkeypatch.setattr("voice_ai_summary.asr.get_backend", _fake_get_backend)
+        mcp_server._backend_cache.clear()
+
+        first = mcp_server._cached_backend(cfg)
+        second = mcp_server._cached_backend(cfg)
+
+        assert first is second
+        assert len(builds) == 1
+
+    def test_changing_the_model_rebuilds_it(self, vas, monkeypatch) -> None:
+        cfg, _conn = vas
+        monkeypatch.setattr("voice_ai_summary.asr.get_backend", lambda config: FakeBackend())
+        mcp_server._backend_cache.clear()
+
+        first = mcp_server._cached_backend(cfg)
+        cfg.asr.model = "some/other-model"
+        second = mcp_server._cached_backend(cfg)
+
+        assert first is not second
+        assert len(mcp_server._backend_cache) == 1, "the stale entry should not be kept"

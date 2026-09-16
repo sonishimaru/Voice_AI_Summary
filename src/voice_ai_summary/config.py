@@ -43,7 +43,10 @@ class AsrConfig(BaseModel):
     backend: str = "faster-whisper"  # faster-whisper | mlx
     model: str = DEFAULT_FASTER_WHISPER_MODEL
     device: str = "auto"
-    compute_type: str = "default"
+    # "auto" lets CTranslate2 pick the fastest precision the device supports (int8 on
+    # Apple Silicon CPU); "default" keeps the model's stored float32 and is several times
+    # slower. Ignored by the mlx backend, which has its own precision.
+    compute_type: str = "auto"
     language: str = "ja"
     beam_size: int = 5
     # Domain vocabulary (names, products, jargon) biases decoding toward these spellings.
