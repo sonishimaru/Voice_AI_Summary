@@ -24,7 +24,7 @@ import pydantic
 from pydantic import BaseModel, Field
 
 from .config import Config
-from .llm import track_usage
+from .llm import check_budget, track_usage
 
 log = logging.getLogger(__name__)
 
@@ -228,14 +228,44 @@ note は 30 文字以内、style_notes は各 40 文字以内で簡潔に。1 �
 """
 
 
+_EXTRACT_SYSTEM_CHANNELS = """あなたはユーザーが参加しているSlackチャンネルの会話から、
+ユーザー向けの用語集を作るアシスタントです。
+入力はチャンネルに投稿されたメッセージ(投稿者はさまざま。1行1メッセージ)で、
+"#チャンネル名" の行から次の "#" の行までが同じチャンネルです。チャンネル名自体も
+プロジェクト名・チーム名などの手がかりになります。
+
+以下を幅広く抽出してください:
+- 固有名詞: 人名(敬称の付け方も含む)、社名、取引先、製品名、サービス名、
+  プロジェクト名、チーム名、社内用語・略語、業界用語
+  - 読み方や別表記があれば aliases に入れてください
+  - どんな人・ものかが分かる短い note を付けてください
+- style_notes は出力しないでください(他人の書き方はユーザーの表記ルールではありません)。
+
+推測で内容を作らず、メッセージ本文に根拠がある項目だけを挙げてください。
+note は 30 文字以内で簡潔に。1 回の出力は重要度の高い順に最大 80 項目までとし、
+一般的な語や一度しか出てこない些末な語は含めないでください。
+すでに分かっている用語集(重複させないための参考。ここにある用語は、別表記・敬称違い・
+略語と正式名の関係であっても出力しないでください):
+{existing}
+"""
+
+
 def _call_extract(
-    client: anthropic.Anthropic, model: str, text: str, existing_block: str
+    client: anthropic.Anthropic,
+    model: str,
+    text: str,
+    existing_block: str,
+    *,
+    own_messages: bool = True,
 ) -> Glossary:
     """Network call: extract glossary terms/style notes from one batch of Slack messages.
 
+    `own_messages=False` uses the channel-wide prompt (many authors, no style notes).
     Structured outputs guarantee schema-valid JSON, so no assistant prefill is used.
     """
-    system = _EXTRACT_SYSTEM.replace("{existing}", existing_block or "(なし)")
+    template = _EXTRACT_SYSTEM if own_messages else _EXTRACT_SYSTEM_CHANNELS
+    system = template.replace("{existing}", existing_block or "(なし)")
+    check_budget()
     try:
         response = client.messages.parse(
             model=model,
@@ -282,22 +312,39 @@ def _chunk_messages(messages: list[str], max_chars: int) -> list[str]:
 
 
 def extract_glossary(
-    client: anthropic.Anthropic, model: str, messages: list[str], existing: Glossary
+    client: anthropic.Anthropic,
+    model: str,
+    messages: list[str],
+    existing: Glossary,
+    *,
+    own_messages: bool = True,
 ) -> Glossary:
     """Extract glossary terms/style notes from Slack `messages`, chunked to stay under the
-    model's context window, merging each chunk's extraction into `existing` progressively."""
+    model's context window, merging each chunk's extraction into `existing` progressively.
+
+    `own_messages=False` means the messages come from the user's channels (any author):
+    vocabulary is extracted broadly, style notes are not.
+    """
     result = existing
     for chunk in _chunk_messages(messages, MAX_EXTRACT_CHARS):
-        result = _extract_chunk(client, model, chunk, result)
+        result = _extract_chunk(client, model, chunk, result, own_messages=own_messages)
     return result
 
 
 def _extract_chunk(
-    client: anthropic.Anthropic, model: str, chunk: str, existing: Glossary
+    client: anthropic.Anthropic,
+    model: str,
+    chunk: str,
+    existing: Glossary,
+    *,
+    own_messages: bool = True,
 ) -> Glossary:
     """Extract from one chunk, halving it (by lines) whenever the output was truncated."""
     try:
-        return existing.merge(_call_extract(client, model, chunk, existing.prompt_block()))
+        extracted = _call_extract(
+            client, model, chunk, existing.prompt_block(), own_messages=own_messages
+        )
+        return existing.merge(extracted)
     except OutputTruncated:
         lines = chunk.split("\n")
         if len(lines) < 2:
@@ -306,5 +353,9 @@ def _extract_chunk(
             "glossary extraction output truncated; retrying with %d lines split", len(lines)
         )
         mid = len(lines) // 2
-        result = _extract_chunk(client, model, "\n".join(lines[:mid]), existing)
-        return _extract_chunk(client, model, "\n".join(lines[mid:]), result)
+        result = _extract_chunk(
+            client, model, "\n".join(lines[:mid]), existing, own_messages=own_messages
+        )
+        return _extract_chunk(
+            client, model, "\n".join(lines[mid:]), result, own_messages=own_messages
+        )

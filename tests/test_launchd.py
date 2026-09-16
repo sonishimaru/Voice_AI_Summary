@@ -154,9 +154,10 @@ class TestInstallUninstall:
         with patch("pathlib.Path.home", return_value=tmp_path):
             install(cfg, vas_bin="/usr/local/bin/vas", dry_run=True)
 
-        # Check that files would be created
+        # dry_run writes nothing at all
         agents_dir = tmp_path / "Library" / "LaunchAgents"
-        assert (agents_dir / f"{WORKER_LABEL}.plist").is_dir() is False  # dry_run so not created
+        assert not (agents_dir / f"{WORKER_LABEL}.plist").exists()
+        assert not agents_dir.exists()
 
     def test_install_creates_directories(self, tmp_path: Path) -> None:
         """Install should create LaunchAgents and log directories."""

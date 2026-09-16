@@ -210,3 +210,29 @@ def test_vad_threshold_can_be_overridden_per_source() -> None:
     assert cfg.for_source("mac_mic").threshold == 0.7
     assert cfg.for_source("mac_system").threshold == 0.5
     assert cfg.for_source("mac_system") is cfg
+
+
+def test_search_day_uses_local_dates_and_tolerates_fts_syntax(vas, monkeypatch) -> None:
+    """`--day` is a local date, and punctuation is searched literally, not as FTS syntax."""
+    from voice_ai_summary.search import fts_query
+
+    cfg, conn = vas
+    # 2026-09-14T16:00:00Z is 2026-09-15 01:00 JST.
+    rec = conn.execute(
+        "INSERT INTO recordings(source, device_id, started_at_utc, tz_offset, sha256,"
+        " storage_path, original_name, ingested_at)"
+        " VALUES ('mac_mic', 'd', '2026-09-14T16:00:00Z', '+09:00', ?, 'x', 'x', 'x')",
+        ("f" * 64,),
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO utterances(recording_id, t_start_ms, t_end_ms, abs_start_utc, text, speaker)"
+        " VALUES (?, 0, 500, '2026-09-14T16:00:00Z', 'A-1 の見積もりです', 'me')",
+        (rec,),
+    )
+    conn.commit()
+
+    assert len(search(conn, "見積もり", day="2026-09-15", tz="Asia/Tokyo")) == 1
+    assert search(conn, "見積もり", day="2026-09-14", tz="Asia/Tokyo") == []
+    assert len(search(conn, "A-1", tz="Asia/Tokyo")) == 1  # would be a syntax error unquoted
+    assert search(conn, '"foo', tz="Asia/Tokyo") == []
+    assert fts_query('A-1 "b c"') == '"A-1" "b c"'

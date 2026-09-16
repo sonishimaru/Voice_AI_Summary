@@ -8,7 +8,8 @@ dependencies = [
     "av>=14",
     "numpy>=1.26",
     "typer>=0.12",
-    "anthropic>=0.60",
+    # messages.parse / output_config land in 0.73; earlier SDKs fail at the first summarize.
+    "anthropic>=0.73",
     "httpx>=0.27",
     "pydantic>=2.7",
 ]
@@ -23,7 +24,7 @@ dev = [
 ]
 
 [project.scripts]
-vas = "voice_ai_summary.cli:app"
+vas = "voice_ai_summary.cli:main"
 
 [build-system]
 requires = ["hatchling"]

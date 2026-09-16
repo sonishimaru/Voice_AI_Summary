@@ -83,8 +83,9 @@ def install_launchd(
 
     cfg = load_config()
     plist_paths = install(cfg, dry_run=dry_run)
+    verb = "Would install" if dry_run else "Installed"
     for path in plist_paths:
-        typer.echo(f"Installed: {path}")
+        typer.echo(f"{verb}: {path}")
 
 
 @app.command()

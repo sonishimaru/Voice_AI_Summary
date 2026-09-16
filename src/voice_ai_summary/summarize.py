@@ -20,7 +20,7 @@ from .config import Config
 from .db import utcnow_iso
 from .episodes import build_episodes, episode_transcript
 from .glossary import load_glossary
-from .llm import make_client, track_usage
+from .llm import check_budget, make_client, track_usage
 from .timeutil import fmt_hm, local_day_bounds
 
 log = logging.getLogger(__name__)
@@ -157,6 +157,7 @@ def _call_map(
     (and would 400 on these models anyway). `claude-haiku-4-5` needs no `thinking` param.
     """
     user_content = _map_user_content(transcript, meta, glossary_block)
+    check_budget()
     try:
         response = client.messages.parse(
             model=model,
@@ -260,6 +261,7 @@ def _call_reduce(
     call here instead of guessing at an unlisted beta/model pairing.
     """
     user_content = _reduce_user_content(day, episodes_json, glossary_block)
+    check_budget()
     try:
         with client.messages.stream(
             model=model,

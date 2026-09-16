@@ -138,10 +138,11 @@ def search(
     from .config import load_config
     from .db import connect
     from .search import search as run_search
+    from .timeutil import fmt_hm
 
     cfg = load_config()
     cfg.ensure_dirs()
     conn = connect(cfg.paths.db_path)
-    for row in run_search(conn, query, limit=limit, day=day):
-        ts = row["abs_start_utc"][11:19]
-        typer.echo(f"{ts} [{row['speaker']}] {row['text']}")
+    tz = cfg.summarize.timezone
+    for row in run_search(conn, query, limit=limit, day=day, tz=tz):
+        typer.echo(f"{fmt_hm(row['abs_start_utc'], tz)} [{row['speaker']}] {row['text']}")

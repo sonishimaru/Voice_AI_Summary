@@ -76,13 +76,44 @@ def test_daily_budget_stops_further_calls(tmp_path, monkeypatch) -> None:
         )
     )
     try:
-        # The record is written first, then the cap is checked: $1.50 > $1.00.
-        with pytest.raises(llm.BudgetExceeded):
-            llm.track_usage("reduce", "claude-opus-5", big)
+        # Recording never raises: a response that was paid for is always returned.
+        llm.check_budget()
+        llm.track_usage("reduce", "claude-opus-5", big)  # $1.50 > $1.00
         assert llm.spent_today(tmp_path / "usage.jsonl") == pytest.approx(1.5)
+
+        # The *next* call, and the next client, are what stop.
+        with pytest.raises(llm.BudgetExceeded):
+            llm.check_budget()
         with pytest.raises(llm.BudgetExceeded):
             llm.make_client(cfg)
+
         cfg.llm.daily_budget_usd = 10.0
         llm.make_client(cfg)
+        llm.check_budget()
+    finally:
+        llm.set_usage_path(None)
+
+
+def test_unknown_model_is_priced_at_the_top_of_the_table(tmp_path) -> None:
+    """An unrecognised model must not silently disable the daily cap."""
+    llm.set_usage_path(tmp_path / "usage.jsonl", daily_budget_usd=1.0)
+    try:
+        llm.track_usage(
+            "map",
+            "claude-something-unreleased",
+            SimpleNamespace(
+                usage=SimpleNamespace(
+                    input_tokens=1_000_000,
+                    output_tokens=0,
+                    cache_creation_input_tokens=0,
+                    cache_read_input_tokens=0,
+                )
+            ),
+        )
+        assert llm.spent_today(tmp_path / "usage.jsonl") == pytest.approx(
+            max(llm.PRICES.values())[0]
+        )
+        with pytest.raises(llm.BudgetExceeded):
+            llm.check_budget()
     finally:
         llm.set_usage_path(None)
