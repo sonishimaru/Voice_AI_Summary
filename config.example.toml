@@ -32,6 +32,11 @@ pad_ms = 200              # padding added around each region
 [episodes]
 gap_minutes = 5           # silence longer than this starts a new episode
 
+[llm]
+# Safety cap on Claude API spend per local day, in USD (estimated from list prices).
+# When today's recorded spend exceeds it, every vas command that would call the API stops.
+daily_budget_usd = 2.0
+
 [summarize]
 # Per-episode extraction (map) and daily rollup (reduce).
 map_model = "claude-haiku-4-5"

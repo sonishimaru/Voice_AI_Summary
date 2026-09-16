@@ -55,11 +55,11 @@ def vocab_import_slack(
     Needs `VAS_SLACK_USER_TOKEN`, a Slack *user* token (`xoxp-…`) with the `search:read`
     scope - `search.messages` is not available to bot tokens.
     """
-    import anthropic
     import httpx
 
     from .config import load_config
     from .glossary import extract_glossary, load_glossary, save_glossary
+    from .llm import make_client
     from .slack_import import import_from_slack
 
     cfg = load_config()
@@ -75,9 +75,7 @@ def vocab_import_slack(
         return
 
     existing = load_glossary(cfg)
-    updated = extract_glossary(
-        anthropic.Anthropic(), model or cfg.correct.model, messages, existing
-    )
+    updated = extract_glossary(make_client(cfg), model or cfg.correct.model, messages, existing)
     save_glossary(cfg, updated)
     typer.echo(
         f"glossary now has {len(updated.terms)} term(s), {len(updated.style_notes)} style note(s)"

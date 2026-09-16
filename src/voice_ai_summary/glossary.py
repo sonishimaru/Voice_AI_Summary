@@ -24,6 +24,7 @@ import pydantic
 from pydantic import BaseModel, Field
 
 from .config import Config
+from .llm import track_usage
 
 log = logging.getLogger(__name__)
 
@@ -256,6 +257,7 @@ def _call_extract(
     except anthropic.APIStatusError as e:
         log.error("glossary extraction model %s returned status %s", model, e.status_code)
         raise
+    track_usage("glossary", model, response)
     return response.parsed_output
 
 

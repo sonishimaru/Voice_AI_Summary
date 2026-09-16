@@ -46,7 +46,7 @@ cp config.example.toml ~/.config/voice-ai-summary/config.toml   # 必要に応�
 秘密情報は環境変数のみで渡します（`~/.zshenv` などに）:
 
 ```bash
-export ANTHROPIC_API_KEY=...              # 要約用
+export VAS_ANTHROPIC_API_KEY=...          # 要約・校正用（vas 専用。ANTHROPIC_API_KEY でも可）
 export VAS_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...   # Slack 配信を使う場合
 export VAS_SMTP_PASSWORD=...              # メール配信を使う場合（Gmail はアプリパスワード）
 ```
@@ -85,6 +85,18 @@ vas ingest ~/Downloads/zoom_recording.m4a   # 手持ちの録音を取り込む�
 1. 録音アプリを起動し、Zoom か動画を再生しながら数分喋る → `~/Library/Application Support/VoiceAISummary/inbox/` に `mac_mic_*.m4a` と `mac_system_*.m4a` ができる（15 分ごと、または一時停止時）。
 2. `vas worker --once` → `vas status` で `recordings` が増え、`vas search <喋った単語>` でヒットする。
 3. `vas digest --deliver` で Slack / メールに日本語サマリが届く。
+
+## API 費用の確認
+
+vas が行った Claude API 呼び出しはすべて `<data_dir>/usage.jsonl` に記録され、`vas usage` で用途・モデル別のトークン数と概算費用を確認できます。
+
+```bash
+vas usage --days 30
+```
+
+`[llm] daily_budget_usd`（既定 $2）を超えると、その日は API を呼ぶコマンドがすべて停止します。
+
+**注意**: `ANTHROPIC_API_KEY` をシェル全体に export すると、同じ Mac で動かす Claude Code などもそのキーで（サブスクリプションではなく API 従量課金で）動きます。vas には専用の `VAS_ANTHROPIC_API_KEY` を使い、`ANTHROPIC_API_KEY` は必要なときだけ設定してください。
 
 ## 文字起こし精度のチューニング
 

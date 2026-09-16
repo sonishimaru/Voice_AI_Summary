@@ -111,7 +111,13 @@ class ScheduleConfig(BaseModel):
     worker_poll_seconds: int = 30
 
 
+class LlmConfig(BaseModel):
+    # Hard stop: once today's recorded API spend exceeds this, vas refuses further calls.
+    daily_budget_usd: float = 2.0
+
+
 class Config(BaseModel):
+    llm: LlmConfig = Field(default_factory=LlmConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
     asr: AsrConfig = Field(default_factory=AsrConfig)
     vad: VadConfig = Field(default_factory=VadConfig)
