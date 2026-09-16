@@ -17,14 +17,24 @@ def utcnow_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Long enough to outlast another process's write burst, short enough to surface a
+# genuine deadlock. Transcription itself must stay outside the write lock (pipeline.py).
+BUSY_TIMEOUT_S = 30.0
+
+
 def connect(db_path: Path | str) -> sqlite3.Connection:
     """Open (creating if needed) the database and apply the schema."""
     path = Path(db_path)
     if str(path) != ":memory:":
         path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=BUSY_TIMEOUT_S)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    if str(path) != ":memory:":
+        # The worker, `vas reprocess` and a CLI call can all be open at once. WAL lets
+        # readers through while one of them writes; the timeout covers the rest.
+        conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute(f"PRAGMA busy_timeout = {int(BUSY_TIMEOUT_S * 1000)}")
     apply_schema(conn)
     return conn
 

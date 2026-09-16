@@ -42,23 +42,28 @@ def process_recording(
 
         regions = vad_module.detect_speech(samples, cfg.vad)
 
+        # Transcribe first, write second: a 15-minute recording takes minutes to decode,
+        # and holding the write lock for that long locks out the worker (or `vas
+        # reprocess`) running alongside - it fails with "database is locked".
+        decoded = []
+        for region in regions:
+            start_sample = int(region.start_ms * SAMPLE_RATE / 1000)
+            end_sample = int(region.end_ms * SAMPLE_RATE / 1000)
+            chunk = samples[start_sample:end_sample]
+            decoded.append((region, backend.transcribe(chunk, language=cfg.asr.language)))
+
         utterance_count = 0
         with transaction(conn):
             conn.execute(
                 "UPDATE recordings SET duration_ms = ? WHERE id = ?", (length_ms, recording_id)
             )
-            for region in regions:
+            for region, utterances in decoded:
                 cur = conn.execute(
                     "INSERT INTO segments (recording_id, start_ms, end_ms, speech_prob) "
                     "VALUES (?, ?, ?, ?)",
                     (recording_id, region.start_ms, region.end_ms, region.prob),
                 )
                 segment_id = cur.lastrowid
-
-                start_sample = int(region.start_ms * SAMPLE_RATE / 1000)
-                end_sample = int(region.end_ms * SAMPLE_RATE / 1000)
-                chunk = samples[start_sample:end_sample]
-                utterances = backend.transcribe(chunk, language=cfg.asr.language)
 
                 for utt in utterances:
                     text = utt.text.strip()
