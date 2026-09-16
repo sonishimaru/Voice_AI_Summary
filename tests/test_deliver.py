@@ -2,17 +2,25 @@
 
 from __future__ import annotations
 
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from voice_ai_summary import commands_deliver
+from voice_ai_summary import summarize as summarize_mod
+from voice_ai_summary import vad as vad_module
 from voice_ai_summary.config import Config, DeliverConfig
 from voice_ai_summary.db import connect
 from voice_ai_summary.deliver import deliver_digest
 from voice_ai_summary.deliver.repo import publish_to_repo
 from voice_ai_summary.deliver.slack import _chunk_markdown, _markdown_to_mrkdwn, send_slack
+from voice_ai_summary.ingest import ingest_file
+from voice_ai_summary.summarize import EpisodeSummary
+from voice_ai_summary.timeutil import local_day_bounds
+from voice_ai_summary.vad import SpeechRegion
 
 
 class TestSlackMarkdownConversion:
@@ -533,3 +541,179 @@ def test_notify_is_the_default_channel(tmp_path: Path) -> None:
 
     assert results == {"notify": "ok"}
     assert calls and calls[0][0] == "osascript"
+
+
+class TestDigestCatchUp:
+    """`vas digest`: transcribe a pending backlog first (bounded by a wall-clock
+    budget), then mark an incomplete day in the digest Markdown, stdout, and the
+    notification alike - see `commands_deliver._catch_up_and_count_missing`."""
+
+    _EPISODE_SUMMARY = EpisodeSummary(
+        title="テスト会話", kind_guess="solo", summary_ja="テスト要約です。"
+    )
+
+    @staticmethod
+    def _day_markdown(day: str) -> str:
+        return f"# {day} の記録\n\n## ハイライト\n\n- テストのハイライト\n"
+
+    def _stub_summarize(self, monkeypatch: pytest.MonkeyPatch, day: str) -> None:
+        """Stub the two network calls `run_day` makes, so no anthropic client is needed."""
+        monkeypatch.setattr(summarize_mod, "_call_map", lambda *a, **k: self._EPISODE_SUMMARY)
+        monkeypatch.setattr(summarize_mod, "_call_reduce", lambda *a, **k: self._day_markdown(day))
+        monkeypatch.setattr(summarize_mod.correct, "correct_day", lambda *a, **k: 0)
+        monkeypatch.setattr(summarize_mod, "make_client", lambda cfg: object())
+
+    @staticmethod
+    def _write_wav(path: Path, seconds: float = 1.0) -> None:
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * int(seconds * 16000))
+
+    def _ingest_pending(
+        self, cfg: Config, conn: object, started_at_utc: str, name: str, seconds: float = 1.0
+    ) -> int:
+        """A real, still-pending recording inside the day (VAD is faked by the caller)."""
+        src = cfg.paths.inbox / f"mac_mic_dev1_{name}.wav"
+        self._write_wav(src, seconds=seconds)
+        rec_id = ingest_file(conn, cfg, src, started_at_utc=started_at_utc, move=True)
+        assert rec_id is not None
+        conn.commit()
+        return rec_id
+
+    def _insert_errored(self, conn: object, started_at_utc: str, sha: str) -> None:
+        """A permanently-errored recording: catch-up cannot fix it, so it stays missing."""
+        conn.execute(
+            """
+            INSERT INTO recordings(
+                source, device_id, started_at_utc, tz_offset, duration_ms,
+                sha256, storage_path, original_name, ingested_at, error
+            ) VALUES ('mac_mic', 'dev1', ?, '+00:00', 1000, ?, 'store/errored.wav',
+                      'errored.wav', ?, 'decode failed')
+            """,
+            (started_at_utc, sha, started_at_utc),
+        )
+        conn.commit()
+
+    def test_catch_up_transcribes_pending_and_flags_the_remaining_backlog(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch, capsys: object
+    ) -> None:
+        cfg, conn = vas
+        monkeypatch.setattr(commands_deliver, "load_config", lambda: cfg)
+        day = "2026-09-15"
+        start_utc, _end_utc = local_day_bounds(day, cfg.summarize.timezone)
+        monkeypatch.setattr(
+            vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, 0.9)]
+        )
+        self._ingest_pending(cfg, conn, start_utc, "20260915T000000Z")
+        self._insert_errored(conn, start_utc, "e" * 64)
+        self._stub_summarize(monkeypatch, day)
+
+        commands_deliver.digest(day=day, deliver=False, force=False, channel=None)
+        out = capsys.readouterr().out  # type: ignore[attr-defined]
+
+        # The pending recording was transcribed by the catch-up pass...
+        pending_left = conn.execute(
+            "SELECT COUNT(*) FROM recordings WHERE processed_at IS NULL AND error IS NULL"
+        ).fetchone()[0]
+        assert pending_left == 0
+        # ...but the errored one is still there, so the day is reported as incomplete -
+        # in the stdout note and (via the embedded banner) in the digest Markdown too.
+        assert "不完全" in out
+        assert "1" in out
+        from voice_ai_summary.deliver.notify import _INCOMPLETE_PREFIX
+
+        assert _INCOMPLETE_PREFIX in out
+
+    def test_incompleteness_reaches_the_notification_too(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, conn = vas
+        monkeypatch.setattr(commands_deliver, "load_config", lambda: cfg)
+        day = "2026-09-15"
+        start_utc, _end_utc = local_day_bounds(day, cfg.summarize.timezone)
+        self._insert_errored(conn, start_utc, "e" * 64)
+        self._stub_summarize(monkeypatch, day)
+
+        calls: list[list[str]] = []
+        with patch(
+            "voice_ai_summary.deliver.notify.subprocess.run",
+            lambda args, **kw: (
+                calls.append(args) or SimpleNamespace(returncode=0, stdout="", stderr="")
+            ),
+        ):
+            commands_deliver.digest(day=day, deliver=True, force=False, channel=["notify"])
+
+        assert calls, "expected a notification to be sent"
+        script = calls[0][2]
+        assert "不完全" in script
+        assert "1" in script
+
+    def test_budget_is_respected_and_stops_early(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch, capsys: object
+    ) -> None:
+        cfg, conn = vas
+        monkeypatch.setattr(commands_deliver, "load_config", lambda: cfg)
+        monkeypatch.setattr(commands_deliver, "_CATCHUP_BATCH", 1)
+        day = "2026-09-15"
+        start_utc, _end_utc = local_day_bounds(day, cfg.summarize.timezone)
+        monkeypatch.setattr(
+            vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, 0.9)]
+        )
+        self._ingest_pending(cfg, conn, start_utc, "a_20260915T000000Z", seconds=1.0)
+        self._ingest_pending(cfg, conn, start_utc, "b_20260915T000000Z", seconds=1.5)
+        self._stub_summarize(monkeypatch, day)
+
+        # Clock reads: once for the deadline, once to allow the first (one-recording)
+        # batch, then a big jump so the loop's second elapsed-check sees the budget as
+        # spent - re-checked between batches, exactly as the real clock would be.
+        clock_values = iter([0.0, 0.0, 1_000_000.0])
+        monkeypatch.setattr(commands_deliver.time, "monotonic", lambda: next(clock_values))
+
+        commands_deliver.digest(day=day, deliver=False, force=False, channel=None)
+        out = capsys.readouterr().out  # type: ignore[attr-defined]
+
+        pending_left = conn.execute(
+            "SELECT COUNT(*) FROM recordings WHERE processed_at IS NULL AND error IS NULL"
+        ).fetchone()[0]
+        assert pending_left == 1  # only the first batch ran before the budget ran out
+        assert "不完全" in out
+
+    def test_budget_of_zero_skips_catch_up_entirely(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch, capsys: object
+    ) -> None:
+        cfg, conn = vas
+        cfg.schedule.digest_catchup_budget_s = 0
+        monkeypatch.setattr(commands_deliver, "load_config", lambda: cfg)
+        day = "2026-09-15"
+        start_utc, _end_utc = local_day_bounds(day, cfg.summarize.timezone)
+        monkeypatch.setattr(
+            vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, 0.9)]
+        )
+        self._ingest_pending(cfg, conn, start_utc, "20260915T000000Z")
+        self._stub_summarize(monkeypatch, day)
+
+        commands_deliver.digest(day=day, deliver=False, force=False, channel=None)
+        out = capsys.readouterr().out  # type: ignore[attr-defined]
+
+        row = conn.execute("SELECT processed_at FROM recordings").fetchone()
+        assert row["processed_at"] is None  # catch-up never ran
+        assert "不完全" in out
+
+    def test_clean_day_output_is_unchanged(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch, capsys: object
+    ) -> None:
+        """No pending/errored recordings -> byte-identical to today's (bannerless) output."""
+        cfg, conn = vas
+        monkeypatch.setattr(commands_deliver, "load_config", lambda: cfg)
+        day = "2026-09-15"
+        self._stub_summarize(monkeypatch, day)
+
+        commands_deliver.digest(day=day, deliver=False, force=False, channel=None)
+        out = capsys.readouterr().out  # type: ignore[attr-defined]
+
+        assert out == f"# {day} の記録\n\n記録なし\n\n"
+        from voice_ai_summary.deliver.notify import _INCOMPLETE_PREFIX
+
+        assert _INCOMPLETE_PREFIX not in out

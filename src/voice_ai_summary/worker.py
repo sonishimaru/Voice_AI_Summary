@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import logging
 import signal
+import sqlite3
 import time
+from collections.abc import Callable
 from typing import Any
 
 from .asr import get_backend
 from .config import Config
 from .db import connect
+from .deliver.notify import send_desktop_notification
 from .ingest import ingest_inbox
 from .pipeline import process_pending
 
@@ -26,12 +29,85 @@ class _Stop(BaseException):
     """
 
 
-def run_worker(cfg: Config, *, poll_seconds: int | None = None, once: bool = False) -> None:
+def _pending_count(conn: sqlite3.Connection) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM recordings WHERE processed_at IS NULL AND error IS NULL"
+    ).fetchone()[0]
+
+
+class _BacklogWatch:
+    """Tracks whether the pending-recording count has stayed at/above `count_threshold`
+    for at least `grace_s` without dropping back below it, and fires at most one
+    notification per such episode.
+
+    Armed again only once the backlog actually recovers (drops below the threshold) -
+    a worker that is merely slow, oscillating around the threshold without recovering,
+    must not get re-notified on every poll while still backlogged.
+    """
+
+    def __init__(
+        self,
+        *,
+        count_threshold: int,
+        grace_s: float,
+        clock: Callable[[], float],
+        notify: Callable[[int, float], None],
+    ) -> None:
+        self._count_threshold = count_threshold
+        self._grace_s = grace_s
+        self._clock = clock
+        self._notify = notify
+        self._backlog_since: float | None = None
+        self._fired = False
+
+    def observe(self, pending: int) -> None:
+        if self._count_threshold <= 0 or self._grace_s <= 0:
+            return
+        if pending < self._count_threshold:
+            self._backlog_since = None
+            self._fired = False
+            return
+        now = self._clock()
+        if self._backlog_since is None:
+            self._backlog_since = now
+            return
+        elapsed = now - self._backlog_since
+        if not self._fired and elapsed >= self._grace_s:
+            self._fired = True
+            try:
+                self._notify(pending, elapsed)
+            except Exception:
+                logger.exception("failed to send backlog alert notification")
+
+
+def _notify_backlog(pending: int, elapsed_s: float) -> None:
+    minutes = int(elapsed_s // 60)
+    send_desktop_notification(
+        f"{pending} 件の録音が {minutes} 分以上処理されずに残っています。"
+        "worker が動作しているか確認してください。",
+        title="文字起こしが滞留しています",
+    )
+
+
+def run_worker(
+    cfg: Config,
+    *,
+    poll_seconds: int | None = None,
+    once: bool = False,
+    clock: Callable[[], float] | None = None,
+) -> None:
     """Ingest + process in a loop until interrupted (or once, if `once` is set)."""
     cfg.ensure_dirs()
     conn = connect(cfg.paths.db_path)
     backend = get_backend(cfg)
     interval = poll_seconds if poll_seconds is not None else cfg.schedule.worker_poll_seconds
+
+    backlog_watch = _BacklogWatch(
+        count_threshold=cfg.schedule.backlog_alert_count,
+        grace_s=cfg.schedule.backlog_alert_minutes * 60,
+        clock=clock if clock is not None else time.monotonic,
+        notify=_notify_backlog,
+    )
 
     def _handle_signal(signum: int, _frame: Any) -> None:
         raise _Stop
@@ -48,6 +124,7 @@ def run_worker(cfg: Config, *, poll_seconds: int | None = None, once: bool = Fal
             processed = process_pending(conn, cfg, backend)
             if processed:
                 logger.info("processed %d recording(s)", processed)
+            backlog_watch.observe(_pending_count(conn))
             if once:
                 return
             time.sleep(interval)

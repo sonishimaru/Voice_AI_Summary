@@ -2,11 +2,87 @@
 
 from __future__ import annotations
 
+import sqlite3
+import time
+
 import typer
 
 from .cli import app
-from .config import load_config
+from .config import Config, load_config
 from .db import connect
+
+# How many recordings `_catch_up_pending` asks `pipeline.process_pending` to transcribe
+# per batch. Small so the elapsed-budget check between batches actually bites, instead
+# of one call draining an arbitrarily large backlog before the budget is next checked.
+_CATCHUP_BATCH = 5
+
+
+def _pending_and_errored_counts(
+    conn: sqlite3.Connection, start_utc: str, end_utc: str
+) -> tuple[int, int]:
+    """(pending, errored) recording counts for the local day covering `[start_utc, end_utc)`."""
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM recordings WHERE started_at_utc >= ? AND started_at_utc < ?"
+        " AND processed_at IS NULL AND error IS NULL",
+        (start_utc, end_utc),
+    ).fetchone()[0]
+    errored = conn.execute(
+        "SELECT COUNT(*) FROM recordings WHERE started_at_utc >= ? AND started_at_utc < ?"
+        " AND error IS NOT NULL",
+        (start_utc, end_utc),
+    ).fetchone()[0]
+    return pending, errored
+
+
+def _catch_up_pending(conn: sqlite3.Connection, cfg: Config, budget_s: int) -> None:
+    """Transcribe globally-pending recordings (oldest first) in small batches, stopping
+    once `budget_s` wall-clock seconds have elapsed.
+
+    Delegates the actual transcription to `pipeline.process_pending` - this just bounds
+    how much of it a single `vas digest` run is willing to wait for, so a dead worker's
+    backlog cannot turn the nightly digest into an hours-long batch job. The elapsed time
+    is re-checked between batches (not just once up front), so the budget is actually
+    respected rather than merely advisory.
+    """
+    from .asr import get_backend
+    from .pipeline import process_pending
+
+    backend = get_backend(cfg)
+    deadline = time.monotonic() + budget_s
+    while time.monotonic() < deadline:
+        if not process_pending(conn, cfg, backend, limit=_CATCHUP_BATCH):
+            break
+
+
+def _catch_up_and_count_missing(conn: sqlite3.Connection, cfg: Config, day: str) -> int:
+    """Run the catch-up pass (if enabled and there is anything to catch up on), then
+    return how many of `day`'s recordings are still pending or errored."""
+    from .timeutil import local_day_bounds
+
+    start_utc, end_utc = local_day_bounds(day, cfg.summarize.timezone)
+    pending, errored = _pending_and_errored_counts(conn, start_utc, end_utc)
+
+    budget_s = cfg.schedule.digest_catchup_budget_s
+    if pending and budget_s > 0:
+        _catch_up_pending(conn, cfg, budget_s)
+        pending, errored = _pending_and_errored_counts(conn, start_utc, end_utc)
+
+    return pending + errored
+
+
+def _insert_incomplete_banner(markdown: str, missing: int) -> str:
+    """Insert the incomplete-day banner right after the digest's top-level heading."""
+    from .deliver.notify import incomplete_banner
+
+    banner = incomplete_banner(missing)
+    lines = markdown.splitlines()
+    if lines and lines[0].startswith("# "):
+        return "\n".join([lines[0], "", banner, *lines[1:]])
+    return banner + "\n\n" + markdown
+
+
+def _incomplete_stdout_note(day: str, missing: int) -> str:
+    return f"警告: {day} は {missing} 件の録音が未処理/エラーのため、記録は不完全です。"
 
 
 @app.command()
@@ -48,10 +124,18 @@ def digest(
 
         day = today_local(cfg.summarize.timezone)
 
+    # Catch up on this day's backlog (if the worker fell behind), under a wall-clock
+    # budget - then find out whether anything is still pending or errored.
+    missing = _catch_up_and_count_missing(conn, cfg, day)
+
     # Generate the digest
     from .summarize import run_day
 
     markdown = run_day(conn, cfg, day, force=force)
+
+    if missing:
+        markdown = _insert_incomplete_banner(markdown, missing)
+        typer.echo(_incomplete_stdout_note(day, missing))
 
     if not deliver:
         # Just print to stdout

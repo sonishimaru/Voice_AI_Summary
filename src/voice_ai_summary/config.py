@@ -153,6 +153,15 @@ class ScheduleConfig(BaseModel):
     digest_hour: int = 22
     digest_minute: int = 0
     worker_poll_seconds: int = 30
+    # Wall-clock budget (seconds) `vas digest` may spend transcribing a pending backlog
+    # before giving up and summarizing whatever it has. Keeps a dead worker from turning
+    # the nightly digest into an hours-long transcription run. 0 disables catch-up.
+    digest_catchup_budget_s: int = 900
+    # Worker backlog alert: fire one macOS notification when the pending-recording count
+    # has stayed at/above `backlog_alert_count` for at least `backlog_alert_minutes`
+    # without dropping back below it. 0 for either disables the alert.
+    backlog_alert_count: int = 10
+    backlog_alert_minutes: int = 30
 
 
 class LlmConfig(BaseModel):

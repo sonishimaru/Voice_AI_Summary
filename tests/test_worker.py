@@ -73,3 +73,83 @@ def test_a_real_failure_is_still_recorded(
 
     row = conn.execute("SELECT error FROM recordings WHERE id = ?", (rec_id,)).fetchone()
     assert "decode failed" in row["error"]
+
+
+class TestBacklogWatch:
+    """`_BacklogWatch`: fire once per backlog episode, re-arm only after recovery."""
+
+    def test_fires_once_then_rearms_after_recovery(self) -> None:
+        # Consumed in order: two calls while first arming (call 1: arm, call 2: below
+        # grace), one call that crosses the grace period (fires), one call while already
+        # fired (must stay quiet), then two more once a second episode starts.
+        clock_values = iter([0, 40, 70, 80, 200, 300])
+        fired: list[tuple[int, float]] = []
+
+        watch = worker._BacklogWatch(
+            count_threshold=5,
+            grace_s=60,
+            clock=lambda: next(clock_values),
+            notify=lambda pending, elapsed: fired.append((pending, elapsed)),
+        )
+
+        watch.observe(6)  # t=0: backlog starts
+        watch.observe(6)  # t=40: below grace period, no fire yet
+        watch.observe(6)  # t=70: past grace period -> fires
+        assert fired == [(6, 70)]
+
+        watch.observe(6)  # t=80: still backlogged, already fired -> stays quiet
+        assert fired == [(6, 70)]
+
+        watch.observe(2)  # recovers: drops below threshold, no clock call, re-arms
+        watch.observe(6)  # t=200: new episode starts
+        watch.observe(6)  # t=300: past grace period again -> fires a second time
+
+        assert fired == [(6, 70), (6, 100)]
+
+    def test_disabled_when_threshold_or_grace_is_zero(self) -> None:
+        fired: list[tuple[int, float]] = []
+        watch = worker._BacklogWatch(
+            count_threshold=0,
+            grace_s=60,
+            clock=lambda: 999,
+            notify=lambda pending, elapsed: fired.append((pending, elapsed)),
+        )
+        for _ in range(5):
+            watch.observe(100)
+        assert fired == []
+
+
+def test_worker_survives_notification_failure(
+    vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backlog notification that raises must not stop the worker loop."""
+    cfg, _conn = vas
+    cfg.schedule.backlog_alert_count = 1
+    cfg.schedule.backlog_alert_minutes = 1  # 60s grace
+
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(worker, "process_pending", lambda conn, cfg, backend: 0)
+    monkeypatch.setattr(worker, "_pending_count", lambda conn: 5)  # always past threshold
+
+    def failing_notify(pending: int, elapsed: float) -> None:
+        raise RuntimeError("osascript boom")
+
+    monkeypatch.setattr(worker, "_notify_backlog", failing_notify)
+
+    calls = {"n": 0}
+
+    def bounded_ingest(conn: object, cfg: object) -> list:
+        # Bound the loop deterministically (no real time.sleep, no real osascript):
+        # let the alert fire once, then stop the worker via the normal shutdown path.
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise worker._Stop
+        return []
+
+    monkeypatch.setattr(worker, "ingest_inbox", bounded_ingest)
+
+    clock_values = iter([0.0, 100.0, 200.0])
+
+    # Must return normally (the _Stop is caught inside run_worker) despite the
+    # notification raising on the second poll.
+    worker.run_worker(cfg, clock=lambda: next(clock_values))

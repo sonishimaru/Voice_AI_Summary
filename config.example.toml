@@ -89,3 +89,13 @@ repo_remote = "origin"
 digest_hour = 22          # local time for the daily digest (launchd)
 digest_minute = 0
 worker_poll_seconds = 30
+# worker が止まっていた等でその日の録音が未処理のまま残っている場合、digest はまず
+# この秒数だけ文字起こしの追いつき処理を行う(0 で無効)。深夜バッチが延々と回り続け
+# ないよう、上限に達したらその時点で要約に進み、未処理/エラーが残っていればその旨を
+# 記録・通知する。
+digest_catchup_budget_s = 900
+# worker のバックログ通知: 未処理の録音数が backlog_alert_count 件以上のまま
+# backlog_alert_minutes 分以上減らなかったら、macOS 通知を1回だけ送る(いずれかを
+# 0 にすると無効)。バックログが backlog_alert_count 未満に戻ると再度アームされる。
+backlog_alert_count = 10
+backlog_alert_minutes = 30
