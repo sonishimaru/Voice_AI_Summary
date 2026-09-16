@@ -39,6 +39,28 @@ class BudgetExceeded(RuntimeError):
     """Today's recorded API spend is over `[llm] daily_budget_usd`."""
 
 
+def friendly_api_error(exc: anthropic.APIStatusError, model: str) -> RuntimeError | None:
+    """Turn a setup problem (billing, auth, unknown model) into an actionable message.
+
+    Returns None for anything that is genuinely unexpected, which keeps real bugs loud.
+    """
+    message = str(getattr(exc, "message", "") or exc)
+    if "credit balance" in message.lower():
+        return RuntimeError(
+            "Anthropic API credit balance is empty. Add credits at "
+            "https://platform.claude.com/settings/billing (this is separate from a "
+            "Claude.ai subscription), then run the command again."
+        )
+    if exc.status_code in (401, 403):
+        return RuntimeError(
+            "The Anthropic API rejected the key in VAS_ANTHROPIC_API_KEY "
+            f"(HTTP {exc.status_code}). Check that it is a valid API key."
+        )
+    if exc.status_code == 404:
+        return RuntimeError(f"Unknown model {model!r}. Check the model names in config.toml.")
+    return None
+
+
 def api_key() -> str | None:
     return os.environ.get("VAS_ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
 

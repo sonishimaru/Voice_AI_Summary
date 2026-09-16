@@ -24,7 +24,7 @@ import pydantic
 from pydantic import BaseModel, Field
 
 from .config import Config
-from .llm import check_budget, track_usage
+from .llm import check_budget, friendly_api_error, track_usage
 
 log = logging.getLogger(__name__)
 
@@ -286,6 +286,8 @@ def _call_extract(
         raise
     except anthropic.APIStatusError as e:
         log.error("glossary extraction model %s returned status %s", model, e.status_code)
+        if (friendly := friendly_api_error(e, model)) is not None:
+            raise friendly from None
         raise
     track_usage("glossary", model, response)
     return response.parsed_output

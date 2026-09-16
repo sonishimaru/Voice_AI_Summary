@@ -20,7 +20,7 @@ from .config import Config
 from .db import utcnow_iso
 from .episodes import build_episodes, episode_transcript
 from .glossary import load_glossary
-from .llm import check_budget, make_client, track_usage
+from .llm import check_budget, friendly_api_error, make_client, track_usage
 from .timeutil import fmt_hm, local_day_bounds
 
 log = logging.getLogger(__name__)
@@ -174,6 +174,8 @@ def _call_map(
         raise
     except anthropic.APIStatusError as e:
         log.error("map model %s returned status %s", model, e.status_code)
+        if (friendly := friendly_api_error(e, model)) is not None:
+            raise friendly from None
         raise
     track_usage("map", model, response)
     return response.parsed_output
@@ -280,6 +282,8 @@ def _call_reduce(
         raise
     except anthropic.APIStatusError as e:
         log.error("reduce model %s returned status %s", model, e.status_code)
+        if (friendly := friendly_api_error(e, model)) is not None:
+            raise friendly from None
         raise
     return "".join(block.text for block in message.content if block.type == "text")
 

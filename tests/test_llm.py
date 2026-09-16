@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import anthropic
+import httpx
 import pytest
 
 from voice_ai_summary import llm
@@ -117,3 +119,18 @@ def test_unknown_model_is_priced_at_the_top_of_the_table(tmp_path) -> None:
             llm.check_budget()
     finally:
         llm.set_usage_path(None)
+
+
+def test_friendly_api_error_maps_setup_problems() -> None:
+    def err(status: int, message: str) -> anthropic.APIStatusError:
+        response = httpx.Response(
+            status, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        )
+        return anthropic.APIStatusError(message, response=response, body=None)
+
+    low = llm.friendly_api_error(err(400, "Your credit balance is too low"), "m")
+    assert low is not None and "billing" in str(low)
+    assert "VAS_ANTHROPIC_API_KEY" in str(llm.friendly_api_error(err(401, "bad key"), "m"))
+    assert "config.toml" in str(llm.friendly_api_error(err(404, "no model"), "claude-x"))
+    # A genuine server fault stays an exception the caller must deal with.
+    assert llm.friendly_api_error(err(500, "overloaded"), "m") is None
