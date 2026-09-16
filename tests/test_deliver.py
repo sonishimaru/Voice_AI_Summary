@@ -296,6 +296,7 @@ class TestDeliverDigest:
         cfg = Config()
         cfg.deliver.slack = False
         cfg.deliver.email = False
+        cfg.deliver.notify = False  # on by default: the local-only channel
 
         results = deliver_digest(conn, cfg, "2026-09-15", "# Test")
 
@@ -463,3 +464,72 @@ class TestRepoDelivery:
 
         assert results["repo"].startswith("error:")
         assert "repo_path" in results["repo"]
+
+
+class TestNotifyDelivery:
+    """macOS notification channel: local-only, nothing leaves the machine."""
+
+    def test_headline_prefers_the_first_highlight_bullet(self) -> None:
+        from voice_ai_summary.deliver.notify import headline
+
+        md = "# 2026-09-15 の記録\n\n## ハイライト\n\n- **安田さん**に見積もりを送付\n- 二件目\n"
+        assert headline(md) == "安田さんに見積もりを送付"
+
+    def test_headline_falls_back_and_truncates(self) -> None:
+        from voice_ai_summary.deliver.notify import headline
+
+        assert headline("# 見出しだけ\n") == "本文を確認してください"
+        long_md = "## ハイライト\n- " + "あ" * 300
+        assert len(headline(long_md)) == 180 and headline(long_md).endswith("…")
+
+    def test_send_notification_builds_an_escaped_osascript_call(self) -> None:
+        from voice_ai_summary.deliver.notify import send_notification
+
+        calls: list[list[str]] = []
+
+        def runner(args, **kwargs):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        send_notification(
+            "2026-09-15", '## ハイライト\n- "引用" を含む行', path="/tmp/x.md", runner=runner
+        )
+
+        assert calls[0][0] == "osascript"
+        script = calls[0][2]
+        assert '\\"引用\\"' in script
+        assert 'with title "2026-09-15 のサマリ"' in script
+        assert "/tmp/x.md" in script
+
+    def test_send_notification_reports_failure(self) -> None:
+        from voice_ai_summary.deliver.notify import send_notification
+
+        def failing(args, **kwargs):
+            return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            send_notification("2026-09-15", "## ハイライト\n- x", runner=failing)
+
+        def missing(args, **kwargs):
+            raise FileNotFoundError
+
+        with pytest.raises(RuntimeError, match="macOS"):
+            send_notification("2026-09-15", "## ハイライト\n- x", runner=missing)
+
+
+def test_notify_is_the_default_channel(tmp_path: Path) -> None:
+    """A fresh config delivers the digest to the notification centre and nowhere else."""
+    conn = connect(tmp_path / "t.sqlite3")
+    cfg = Config()
+    calls: list[list[str]] = []
+
+    with patch(
+        "voice_ai_summary.deliver.notify.subprocess.run",
+        lambda args, **kw: (
+            calls.append(args) or SimpleNamespace(returncode=0, stdout="", stderr="")
+        ),
+    ):
+        results = deliver_digest(conn, cfg, "2026-09-15", "## ハイライト\n- 打ち合わせ")
+
+    assert results == {"notify": "ok"}
+    assert calls and calls[0][0] == "osascript"

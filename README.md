@@ -101,6 +101,13 @@ Slack / メールに加えて、日次サマリを **プライベートな git �
 
 digest には他の参加者の発言や取引先名も含まれるため、リポジトリは必ず **プライベート**にしてください。
 
+## 毎日サマリを受け取る（ローカル完結）
+
+`vas install-launchd` で常駐化すると、毎日 22:00（`[schedule] digest_hour`）にサマリが作られ、
+**macOS の通知**でハイライト 1 行が届きます（既定で有効 / `[deliver] notify`）。
+サマリ本文は Mac の外に出ません。通知を見たら `vas show`、または Claude Desktop の
+ローカルチャットで `~/Library/Application Support/VoiceAISummary/digests/` を読ませてください。
+
 ## 日次サマリをローカルで読む
 
 サマリは `<data_dir>/digests/YYYY-MM-DD.md` に保存されます（既定では外部に一切送信しません）。

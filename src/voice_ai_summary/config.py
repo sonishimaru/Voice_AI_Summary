@@ -103,6 +103,8 @@ class DeliverConfig(BaseModel):
     smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 587
     smtp_user: str = ""
+    # Local-only: a macOS notification that the digest is ready. Nothing is sent anywhere.
+    notify: bool = True
     repo: bool = False
     # Local clone of a *private* repo; digests contain other people's speech and client names.
     repo_path: str = ""

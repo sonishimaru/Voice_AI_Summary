@@ -72,6 +72,9 @@ smtp_user = ""
 # whatever git already uses to push (SSH key / credential helper) from repo_path.
 # The target repo MUST be private: the digest contains other people's speech and
 # client names, not just your own.
+# Local-only: post a macOS notification when the digest is ready. The digest itself stays
+# in <data_dir>/digests/; only a one-line headline reaches the notification centre.
+notify = true
 repo = false
 repo_path = ""          # e.g. "~/voice-digests", a local clone of a private repo
 repo_subdir = "digests" # written as <repo_path>/<repo_subdir>/<day>.md

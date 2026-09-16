@@ -7,6 +7,7 @@ import sqlite3
 from ..config import Config
 from ..db import utcnow_iso
 from .email import send_email
+from .notify import send_notification
 from .repo import publish_to_repo
 from .slack import send_slack
 
@@ -45,6 +46,8 @@ def deliver_digest(
             to_deliver.append("email")
         if cfg.deliver.repo:
             to_deliver.append("repo")
+        if cfg.deliver.notify:
+            to_deliver.append("notify")
 
     for channel in to_deliver:
         # Check if already delivered
@@ -67,6 +70,8 @@ def deliver_digest(
                 _deliver_email(cfg, markdown)
             elif channel == "repo":
                 detail = _deliver_repo(cfg, day, markdown)
+            elif channel == "notify":
+                send_notification(day, markdown, path=str(cfg.paths.digests / f"{day}.md"))
             else:
                 results[channel] = f"error: unknown channel {channel}"
                 continue
