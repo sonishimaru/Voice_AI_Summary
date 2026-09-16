@@ -27,7 +27,8 @@ def status() -> None:
         inbox = sum(1 for p in cfg.paths.inbox.iterdir() if p.is_file() and p.suffix != ".json")
     typer.echo(f"data_dir : {cfg.paths.root}")
     typer.echo(f"db       : {cfg.paths.db_path}")
-    typer.echo(f"asr model: {cfg.asr.model}")
+    typer.echo(f"asr backend: {cfg.asr.backend}")
+    typer.echo(f"asr model: {cfg.asr.resolved_model}")
     typer.echo(f"inbox files      : {inbox}")
     # Silent transcription failures look exactly like a quiet day in the counts above, so
     # surface the shape that means "we heard speech and wrote nothing down": a settings

@@ -16,8 +16,14 @@ from .pipeline import process_pending
 logger = logging.getLogger(__name__)
 
 
-class _Stop(Exception):
-    pass
+class _Stop(BaseException):
+    """Shutdown request from SIGINT/SIGTERM.
+
+    Deliberately a `BaseException`: it is raised from a signal handler, so it can land
+    anywhere -- including inside `process_recording`, whose `except Exception` would
+    otherwise record the shutdown as a transcription failure and carry on, ignoring the
+    signal. `launchctl kickstart -k` does exactly that on every worker restart.
+    """
 
 
 def run_worker(cfg: Config, *, poll_seconds: int | None = None, once: bool = False) -> None:
