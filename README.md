@@ -101,6 +101,21 @@ Slack / メールに加えて、日次サマリを **プライベートな git �
 
 digest には他の参加者の発言や取引先名も含まれるため、リポジトリは必ず **プライベート**にしてください。
 
+## 日次サマリをローカルで読む
+
+サマリは `<data_dir>/digests/YYYY-MM-DD.md` に保存されます（既定では外部に一切送信しません）。
+
+```bash
+vas show                       # 今日のサマリを表示
+vas show --day 2026-09-15
+vas digest-path                # 保存先のパスだけを表示
+open "$(vas digest-path)"      # エディタで開く
+```
+
+Mac の Claude Code から読ませる場合は、プロジェクト内で `claude` を起動して
+「`vas digest-path` のファイルを読んで要点を教えて」のように頼めば、音声も文字起こしも
+Mac の外に出ることなく相談できます。
+
 ## API 費用の確認
 
 vas が行った Claude API 呼び出しはすべて `<data_dir>/usage.jsonl` に記録され、`vas usage` で用途・モデル別のトークン数と概算費用を確認できます。

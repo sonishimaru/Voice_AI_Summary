@@ -278,3 +278,22 @@ def test_run_day_includes_glossary_block_in_map_and_reduce(vas, monkeypatch) -> 
 
     assert "西丸" in captured["map"]
     assert "西丸" in captured["reduce"]
+
+
+def test_digest_path_prints_the_local_file(vas) -> None:
+    from typer.testing import CliRunner
+
+    from voice_ai_summary.cli import app
+
+    cfg, _conn = vas
+    runner = CliRunner()
+
+    missing = runner.invoke(app, ["digest-path", "--day", "2026-09-15"])
+    assert missing.exit_code == 1
+
+    cfg.paths.digests.mkdir(parents=True, exist_ok=True)
+    (cfg.paths.digests / "2026-09-15.md").write_text("# test", encoding="utf-8")
+    found = runner.invoke(app, ["digest-path", "--day", "2026-09-15"])
+
+    assert found.exit_code == 0
+    assert found.output.strip() == str(cfg.paths.digests / "2026-09-15.md")

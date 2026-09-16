@@ -106,6 +106,24 @@ def correct(
 
 
 @app.command()
+def digest_path(
+    day: str = typer.Option(None, "--day", help="Local date YYYY-MM-DD (default: today)."),
+) -> None:
+    """Print the file path of a stored digest, for opening or reading it locally."""
+    from .config import load_config
+    from .timeutil import today_local
+
+    cfg = load_config()
+    cfg.ensure_dirs()
+    day = day or today_local(cfg.summarize.timezone)
+    path = cfg.paths.digests / f"{day}.md"
+    if not path.is_file():
+        typer.echo(f"No digest file for {day}. Run `vas digest --day {day}` first.", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(str(path))
+
+
+@app.command()
 def show(
     day: str = typer.Option(None, "--day", help="Local date YYYY-MM-DD (default: today)."),
 ) -> None:
