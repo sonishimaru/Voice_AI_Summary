@@ -31,7 +31,9 @@ class _RaisingBackend:
     def __init__(self, exc: BaseException) -> None:
         self._exc = exc
 
-    def transcribe(self, samples: object, language: str | None = None) -> list:
+    def transcribe(
+        self, samples: object, language: str | None = None, source: str | None = None
+    ) -> list:
         raise self._exc
 
 

@@ -62,6 +62,28 @@ class AsrConfig(BaseModel):
     # Level the chunk before decoding: "none" | "peak" | "rms". The mic track records far
     # quieter than the system track, and Whisper transcribes quiet speech worse.
     normalize: str = "none"
+    # Per-source overrides, e.g. {"mac_mic": "rms"}: one global `normalize` can't serve
+    # both tracks when only one of them is quiet. Same shape as
+    # `VadConfig.threshold_by_source` - see `for_source` below.
+    normalize_by_source: dict[str, str] = Field(default_factory=dict)
+    # Suppress Whisper's classic repetition-loop failure: drop an utterance whose text is
+    # identical to the one immediately before it, but only within a single decode call
+    # (see `asr.drop_consecutive_repeats`). On by default since it targets a decoder bug,
+    # not real speech; the switch exists in case it ever eats a genuine short repeated
+    # phrase.
+    drop_repeated_utterances: bool = True
+    # Decoder failure thresholds, passed straight through to faster-whisper/mlx-whisper.
+    # Defaulted to each library's own default (read from `WhisperModel.transcribe` /
+    # `mlx_whisper.transcribe`'s signatures, not measured) so leaving these unset changes
+    # nothing. See `config.example.toml` for which direction suppresses hallucination.
+    no_speech_threshold: float = 0.6
+    log_prob_threshold: float = -1.0
+    compression_ratio_threshold: float = 2.4
+
+    def for_source(self, source: str | None) -> AsrConfig:
+        """This config with `normalize` replaced by the override for `source`, if any."""
+        override = self.normalize_by_source.get(source)
+        return self if override is None else self.model_copy(update={"normalize": override})
 
     @property
     def resolved_model(self) -> str:

@@ -24,7 +24,9 @@ class Utterance:
 class ASRBackend(Protocol):
     name: str
 
-    def transcribe(self, samples16k: np.ndarray, *, language: str | None) -> list[Utterance]: ...
+    def transcribe(
+        self, samples16k: np.ndarray, *, language: str | None, source: str | None = None
+    ) -> list[Utterance]: ...
 
 
 # A vocabulary prompt costs transcription on kotoba-whisper-v2.0. Measured on three
@@ -86,6 +88,30 @@ def normalize_samples(samples: np.ndarray, mode: str) -> np.ndarray:
     return np.clip(samples * gain, -1.0, 1.0).astype("float32")
 
 
+def drop_consecutive_repeats(utterances: list[Utterance]) -> list[Utterance]:
+    """Drop an utterance whose stripped text equals the one immediately before it.
+
+    Whisper's classic failure mode on a decode call is a repetition loop: the same short
+    line emitted several times in a row inside one window. This filter only ever compares
+    an utterance to its immediate predecessor *within the list from a single
+    `transcribe()` call* - it must never be applied across separate calls, because a
+    person genuinely repeating themselves minutes (or even one region) apart is real
+    speech, not a decoder artifact, and two recordings of the same audio producing
+    identical text is a different bug, already handled elsewhere (idempotent
+    reprocessing). Comparing only adjacent entries, never all-pairs, is what keeps a
+    legitimate "yes, yes, okay" collapsing no more than the loop itself did.
+    """
+    out: list[Utterance] = []
+    prev_text: str | None = None
+    for utt in utterances:
+        text = utt.text.strip()
+        if out and text == prev_text:
+            continue
+        out.append(utt)
+        prev_text = text
+    return out
+
+
 def _prompt_for(cfg: Config, hotwords: list[str]) -> str | None:
     """Same formula as `AsrConfig.prompt`, but over a (possibly glossary-extended) list."""
     parts = [cfg.asr.initial_prompt.strip()] if cfg.asr.initial_prompt.strip() else []
@@ -114,9 +140,11 @@ class FasterWhisperBackend:
             )
         return self._model
 
-    def transcribe(self, samples16k: np.ndarray, *, language: str | None) -> list[Utterance]:
+    def transcribe(
+        self, samples16k: np.ndarray, *, language: str | None, source: str | None = None
+    ) -> list[Utterance]:
         model = self._get_model()
-        asr = self._cfg.asr
+        asr = self._cfg.asr.for_source(source)
         hotwords = _merged_hotwords(self._cfg, self._extra_hotwords)
         segments, _info = model.transcribe(
             normalize_samples(samples16k, asr.normalize),
@@ -126,8 +154,11 @@ class FasterWhisperBackend:
             condition_on_previous_text=False,
             initial_prompt=asr.initial_prompt.strip() or None,
             hotwords=" ".join(hotwords) or None,
+            no_speech_threshold=asr.no_speech_threshold,
+            log_prob_threshold=asr.log_prob_threshold,
+            compression_ratio_threshold=asr.compression_ratio_threshold,
         )
-        return [
+        utterances = [
             Utterance(
                 t_start_ms=int(round(seg.start * 1000)),
                 t_end_ms=int(round(seg.end * 1000)),
@@ -137,6 +168,9 @@ class FasterWhisperBackend:
             )
             for seg in segments
         ]
+        if asr.drop_repeated_utterances:
+            utterances = drop_consecutive_repeats(utterances)
+        return utterances
 
 
 class MlxWhisperBackend:
@@ -147,10 +181,12 @@ class MlxWhisperBackend:
         self._extra_hotwords = extra_hotwords or []
         self.name = f"mlx-whisper:{cfg.asr.resolved_model}"
 
-    def transcribe(self, samples16k: np.ndarray, *, language: str | None) -> list[Utterance]:
+    def transcribe(
+        self, samples16k: np.ndarray, *, language: str | None, source: str | None = None
+    ) -> list[Utterance]:
         import mlx_whisper
 
-        asr = self._cfg.asr
+        asr = self._cfg.asr.for_source(source)
         hotwords = _merged_hotwords(self._cfg, self._extra_hotwords)
         result = mlx_whisper.transcribe(
             normalize_samples(samples16k, asr.normalize),
@@ -159,8 +195,14 @@ class MlxWhisperBackend:
             initial_prompt=_prompt_for(self._cfg, hotwords),
             condition_on_previous_text=False,
             verbose=None,
+            # mlx-whisper names this `logprob_threshold` (no underscore before "prob"),
+            # unlike faster-whisper's `log_prob_threshold` - confirmed by reading
+            # mlx_whisper.transcribe's own signature, same defaults as faster-whisper.
+            no_speech_threshold=asr.no_speech_threshold,
+            logprob_threshold=asr.log_prob_threshold,
+            compression_ratio_threshold=asr.compression_ratio_threshold,
         )
-        return [
+        utterances = [
             Utterance(
                 t_start_ms=int(round(seg["start"] * 1000)),
                 t_end_ms=int(round(seg["end"] * 1000)),
@@ -170,6 +212,9 @@ class MlxWhisperBackend:
             )
             for seg in result["segments"]
         ]
+        if asr.drop_repeated_utterances:
+            utterances = drop_consecutive_repeats(utterances)
+        return utterances
 
 
 class FakeBackend:
@@ -181,7 +226,9 @@ class FakeBackend:
         self._texts = list(texts or ["テスト"])
         self._i = 0
 
-    def transcribe(self, samples16k: np.ndarray, *, language: str | None) -> list[Utterance]:
+    def transcribe(
+        self, samples16k: np.ndarray, *, language: str | None, source: str | None = None
+    ) -> list[Utterance]:
         from .audio import duration_ms
 
         text = self._texts[self._i % len(self._texts)]

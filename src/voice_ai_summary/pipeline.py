@@ -90,7 +90,12 @@ def process_recording(
             start_sample = int(region.start_ms * SAMPLE_RATE / 1000)
             end_sample = int(region.end_ms * SAMPLE_RATE / 1000)
             chunk = samples[start_sample:end_sample]
-            decoded.append((region, backend.transcribe(chunk, language=cfg.asr.language)))
+            decoded.append(
+                (
+                    region,
+                    backend.transcribe(chunk, language=cfg.asr.language, source=row["source"]),
+                )
+            )
         processing_ms = int(round((time.monotonic() - decode_start) * 1000))
 
         utterance_count = 0

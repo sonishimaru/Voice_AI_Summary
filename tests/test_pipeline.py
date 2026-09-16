@@ -99,7 +99,7 @@ def test_a_second_process_can_write_while_transcription_runs(
     writes_from_other_process: list[str] = []
 
     class _WritingBackend(FakeBackend):
-        def transcribe(self, samples, *, language):
+        def transcribe(self, samples, *, language, source=None):
             other = connect(cfg.paths.db_path)
             try:
                 other.execute("UPDATE recordings SET device_id = 'other' WHERE id = ?", (rec_id,))
@@ -107,7 +107,7 @@ def test_a_second_process_can_write_while_transcription_runs(
                 writes_from_other_process.append("ok")
             finally:
                 other.close()
-            return super().transcribe(samples, language=language)
+            return super().transcribe(samples, language=language, source=source)
 
     assert process_recording(conn, cfg, rec_id, _WritingBackend(["文字起こし"])) == 1
     assert writes_from_other_process == ["ok"]
@@ -308,6 +308,38 @@ def test_reset_recordings_clears_transcript_and_requeues(vas, monkeypatch) -> No
     assert conn.execute("SELECT text FROM utterances").fetchone()["text"] == "二回目"
 
 
+def test_process_recording_passes_the_recording_source_to_the_backend(
+    vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`process_recording` must thread `row["source"]` through to `backend.transcribe`
+    the same way it already threads it into `vad.for_source` - so a per-source ASR
+    override (e.g. `[asr.normalize_by_source]`) actually reaches the decoder."""
+    cfg, conn = vas
+    src = cfg.paths.inbox / "mac_mic_dev1_20260915T000000Z.wav"
+    _write_wav(src)
+    rec_id = ingest_file(conn, cfg, src)
+    monkeypatch.setattr(
+        vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, 0.9)]
+    )
+
+    received_sources: list[str | None] = []
+
+    class _SourceCapturingBackend(FakeBackend):
+        def transcribe(self, samples, *, language, source=None):
+            received_sources.append(source)
+            return super().transcribe(samples, language=language, source=source)
+
+    cfg.asr.normalize = "none"
+    cfg.asr.normalize_by_source = {"mac_mic": "rms"}
+
+    assert process_recording(conn, cfg, rec_id, _SourceCapturingBackend(["テスト"])) == 1
+
+    assert received_sources == ["mac_mic"]
+    # And that source resolves to the mic's override, not the global default.
+    assert cfg.asr.for_source(received_sources[0]).normalize == "rms"
+    assert cfg.asr.for_source("mac_system").normalize == "none"
+
+
 def test_vad_threshold_can_be_overridden_per_source() -> None:
     """The mic track records far quieter than the system track; one threshold
     over-triggers on the quiet one and under-triggers on the loud one."""
@@ -372,9 +404,9 @@ def test_process_pending_claim_lets_only_one_caller_transcribe(
             super().__init__(["テスト"])
             self._tag = tag
 
-        def transcribe(self, samples, *, language):
+        def transcribe(self, samples, *, language, source=None):
             calls.append(self._tag)
-            return super().transcribe(samples, language=language)
+            return super().transcribe(samples, language=language, source=source)
 
     other_conn = connect(cfg.paths.db_path)
     try:
@@ -384,12 +416,12 @@ def test_process_pending_claim_lets_only_one_caller_transcribe(
             and process the same still-pending recording - exactly the window the
             atomic claim in `process_pending` is meant to close."""
 
-            def transcribe(self, samples, *, language):
+            def transcribe(self, samples, *, language, source=None):
                 second_caller_processed = process_pending(
                     other_conn, cfg, _CountingBackend("second")
                 )
                 assert second_caller_processed == 0
-                return super().transcribe(samples, language=language)
+                return super().transcribe(samples, language=language, source=source)
 
         processed = process_pending(conn, cfg, _RacingBackend("first"))
     finally:

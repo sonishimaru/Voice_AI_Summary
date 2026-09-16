@@ -20,6 +20,27 @@ beam_size = 5
 # Names, products and jargon that ASR keeps misspelling. Biases decoding toward these.
 hotwords = []            # e.g. ["西丸", "安田さん", "チョコレート株式会社"]
 initial_prompt = ""      # optional free-text context, e.g. "社内の打ち合わせの録音です。"
+normalize = "none"       # none | peak | rms (レベルを揃えてから文字起こしする)
+# mac_mic (自分の声) は mac_system (Zoomなど相手の声) より録音レベルが低く、Whisperは
+# 小さい声を聞き取りにくい。normalize を全体で "rms" にすると相手側も余計に持ち上げてしまうので、
+# mac_mic だけ個別に上書きする。以下はコメントアウトの例(既定は空 = 上書きなし、動作は変わらない):
+# [asr.normalize_by_source]
+# mac_mic = "rms"
+# 文字起こしの繰り返しループ(同じ短い文が連続して出力される)を検知して間引く。デコーダの
+# バグに対する対策なので既定で有効。実際の発言を消してしまう場合はここで無効化する。
+drop_repeated_utterances = true
+# Whisperのデコード失敗しきい値。既定値はfaster-whisper/mlx-whisperそれぞれの既定値と同じ
+# (ライブラリのシグネチャを確認して転記。実測ではない)なので、変更しない限り動作は変わらない。
+# no_speech_threshold: 無音確率がこの値を超え、かつ log_prob_threshold 未満のときに「無音」と
+#   判定してテキストを捨てる。無音・雑音区間の幻覚(ありもしないテキスト)を抑えたいときは
+#   下げる(判定されやすくなる)。
+no_speech_threshold = 0.6
+# log_prob_threshold: 出力トークンの平均対数確率がこの値未満だと「失敗」扱いにする。
+#   自信のない出力を幻覚として弾きたいときは上げる(0に近づける = より厳しくなる)。
+log_prob_threshold = -1.0
+# compression_ratio_threshold: 出力テキストのgzip圧縮率がこの値を超えると「失敗」扱いにする
+#   (繰り返しの多いテキストほど圧縮率が高くなる)。繰り返しループを抑えたいときは下げる。
+compression_ratio_threshold = 2.4
 
 [vad]
 threshold = 0.5           # Silero speech probability threshold (lower = more recall)
