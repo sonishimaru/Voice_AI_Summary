@@ -185,18 +185,31 @@ def _claim_recording(conn: sqlite3.Connection, recording_id: int) -> bool:
 
 
 def process_pending(
-    conn: sqlite3.Connection, cfg: Config, backend: ASRBackend, limit: int | None = None
+    conn: sqlite3.Connection,
+    cfg: Config,
+    backend: ASRBackend,
+    limit: int | None = None,
+    *,
+    within: tuple[str, str] | None = None,
 ) -> int:
     """Process unprocessed, error-free recordings, oldest first. Returns count actually
     processed by this call - a recording already claimed by another caller is skipped,
-    not counted as a failure."""
-    sql = (
-        "SELECT id FROM recordings WHERE processed_at IS NULL AND error IS NULL "
-        "ORDER BY started_at_utc ASC"
-    )
+    not counted as a failure.
+
+    `within` is a `(start_utc, end_utc)` half-open bound on `started_at_utc`, for callers
+    that must not spend their budget elsewhere: the nightly digest catches up the day it
+    is about to summarize, and draining days-old audio instead would leave that day
+    untranscribed however long it ran.
+    """
+    sql = "SELECT id FROM recordings WHERE processed_at IS NULL AND error IS NULL"
+    params: tuple[str, ...] = ()
+    if within is not None:
+        sql += " AND started_at_utc >= ? AND started_at_utc < ?"
+        params = within
+    sql += " ORDER BY started_at_utc ASC"
     if limit is not None:
         sql += f" LIMIT {int(limit)}"
-    ids = [r["id"] for r in conn.execute(sql).fetchall()]
+    ids = [r["id"] for r in conn.execute(sql, params).fetchall()]
 
     processed = 0
     for rec_id in ids:
