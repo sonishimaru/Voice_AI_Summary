@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
 
 from .cli import app
@@ -40,6 +42,38 @@ def vocab_add(
     updated = glossary.merge(Glossary(terms=[Term(term=term, aliases=list(alias), note=note)]))
     save_glossary(cfg, updated)
     typer.echo(f"added/updated: {term}")
+
+
+@vocab_app.command("import")
+def vocab_import(
+    path: Path = typer.Argument(..., help="JSON file in the glossary.json format."),  # noqa: B008
+) -> None:
+    """Merge a glossary JSON file (e.g. produced by another tool) into the glossary.
+
+    Accepts `{"terms": [{"term", "aliases", "note"}], "style_notes": [...]}` or a bare list
+    of term objects. Existing entries are kept; aliases and notes are merged.
+    """
+    import json
+
+    from .config import load_config
+    from .glossary import Glossary, Term, load_glossary, save_glossary
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        data = {"terms": data}
+    incoming = Glossary(
+        terms=[Term.model_validate(t) for t in data.get("terms", []) if t.get("term")],
+        style_notes=[str(n) for n in data.get("style_notes", []) if n],
+    )
+    cfg = load_config()
+    before = load_glossary(cfg)
+    updated = before.merge(incoming)
+    save_glossary(cfg, updated)
+    typer.echo(
+        f"imported {len(incoming.terms)} term(s), {len(incoming.style_notes)} style note(s); "
+        f"glossary now has {len(updated.terms)} term(s) "
+        f"(+{len(updated.terms) - len(before.terms)})"
+    )
 
 
 @vocab_app.command("import-slack")

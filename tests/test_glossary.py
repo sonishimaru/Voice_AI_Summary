@@ -4,6 +4,7 @@ extraction. No network calls - `import_from_slack` uses `httpx.MockTransport` an
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -391,3 +392,38 @@ def test_extract_glossary_uses_channel_prompt_for_other_authors(monkeypatch) -> 
     assert "参加しているSlackチャンネル" in captured[1]
     assert "style_notes は出力しないでください" in captured[1]
     assert [t.term for t in own.terms] == [t.term for t in chan.terms] == ["ドット歯磨き"]
+
+
+def test_vocab_import_merges_json_file(vas, tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from voice_ai_summary.cli import app
+    from voice_ai_summary.glossary import load_glossary, save_glossary
+
+    cfg, _conn = vas
+    save_glossary(cfg, Glossary(terms=[Term(term="安田さん", note="取引先")]))
+    src = tmp_path / "slack_glossary.json"
+    src.write_text(
+        json.dumps(
+            {
+                "terms": [
+                    {"term": "安田さん", "aliases": ["安田"], "note": ""},
+                    {"term": "ドット歯磨き", "aliases": [], "note": "新製品の企画名"},
+                    {"term": ""},
+                ],
+                "style_notes": ["社名はカタカナで書く"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["vocab", "import", str(src)])
+
+    assert result.exit_code == 0, result.output
+    g = load_glossary(cfg)
+    by_term = {t.term: t for t in g.terms}
+    assert set(by_term) == {"安田さん", "ドット歯磨き"}
+    assert by_term["安田さん"].note == "取引先" and "安田" in by_term["安田さん"].aliases
+    assert g.style_notes == ["社名はカタカナで書く"]
+    assert "imported 2 term(s)" in result.output

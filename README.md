@@ -130,6 +130,7 @@ vas vocab add "西丸" --alias にしまる --note "ユーザー本人の姓"
 export VAS_SLACK_USER_TOKEN=xoxp-...             # Slack ユーザートークン
 vas vocab import-slack                           # 直近90日分の自分の発言から用語集を生成
 vas vocab import-slack --scope channels          # 参加している全チャンネルの会話から語彙を広く収集
+vas vocab import ~/Downloads/slack_glossary.json # 他ツール（ChatGPT 等）で作った用語集 JSON を取り込む
 vas vocab import-slack --scope channels --channel design --channel sales   # チャンネルを限定
 ```
 
