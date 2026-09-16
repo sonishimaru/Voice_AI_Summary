@@ -4,6 +4,10 @@
 [paths]
 # Root data directory. The macOS recorder writes into <data_dir>/inbox/.
 data_dir = "~/Library/Application Support/VoiceAISummary"
+# Optional second copy of each daily digest. ~/Library/Application Support is off limits
+# to sandboxed readers (Cowork's device tools, other agents), so point this at an ordinary
+# folder to let them read the day's digest without moving the audio and database there.
+# digest_mirror_dir = "~/voice-digests"
 
 [asr]
 # backend = "faster-whisper" runs on CPU (CTranslate2). On Apple Silicon, "mlx" runs on the
