@@ -91,7 +91,10 @@ class TestPlistRendering:
 
     def test_install_drops_deliver_when_no_channel_enabled(self, tmp_path: Path) -> None:
         cfg = Config()
-        assert not cfg.deliver.slack and not cfg.deliver.email
+        # `notify` defaults to True, so it must be turned off too for a genuine
+        # "nothing enabled" case.
+        cfg.deliver.notify = False
+        assert not any([cfg.deliver.slack, cfg.deliver.email, cfg.deliver.repo, cfg.deliver.notify])
 
         with patch("pathlib.Path.home", return_value=tmp_path):
             install(cfg, vas_bin="/usr/local/bin/vas", dry_run=False)
@@ -102,6 +105,26 @@ class TestPlistRendering:
         assert "--deliver" not in digest_plist["ProgramArguments"][2]
 
         cfg.deliver.slack = True
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            install(cfg, vas_bin="/usr/local/bin/vas", dry_run=False)
+
+        digest_plist = plistlib.loads(
+            (tmp_path / "Library" / "LaunchAgents" / f"{DIGEST_LABEL}.plist").read_bytes()
+        )
+        assert "--deliver" in digest_plist["ProgramArguments"][2]
+
+    def test_install_keeps_deliver_for_notify_only(self, tmp_path: Path) -> None:
+        """Regression: `notify` (a local macOS notification) defaults to True and is
+        often the only delivery channel configured. `install` used to compute
+        `deliver=cfg.deliver.slack or cfg.deliver.email`, which ignored `notify` (and
+        `repo`) entirely, so the nightly digest job was installed without `--deliver`
+        and the notification never fired."""
+        cfg = Config()
+        cfg.deliver.slack = False
+        cfg.deliver.email = False
+        cfg.deliver.repo = False
+        cfg.deliver.notify = True
+
         with patch("pathlib.Path.home", return_value=tmp_path):
             install(cfg, vas_bin="/usr/local/bin/vas", dry_run=False)
 

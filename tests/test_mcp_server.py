@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -220,3 +221,206 @@ class TestUpdateApp:
         result = mcp_server.update_app()
         assert "not a git work tree" in result
         assert str(not_a_repo) in result
+
+
+def _insert_pending_recording(conn: sqlite3.Connection, *, sha256: str) -> int:
+    """A recording row that is pending (no `processed_at`, no `error`)."""
+    cur = conn.execute(
+        """
+        INSERT INTO recordings(
+            source, device_id, started_at_utc, tz_offset, duration_ms,
+            sha256, storage_path, original_name, ingested_at, processed_at, error
+        ) VALUES ('mac_mic', 'dev1', '2026-09-15T00:00:00Z', '+00:00', 1000,
+                  ?, 'store/x.wav', 'x.wav', '2026-09-15T00:00:00Z', NULL, NULL)
+        """,
+        (sha256,),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def _insert_failed_recording(conn: sqlite3.Connection, *, sha256: str) -> int:
+    """A recording row that previously failed to transcribe."""
+    cur = conn.execute(
+        """
+        INSERT INTO recordings(
+            source, device_id, started_at_utc, tz_offset, duration_ms,
+            sha256, storage_path, original_name, ingested_at, processed_at, error
+        ) VALUES ('mac_mic', 'dev1', '2026-09-15T00:00:00Z', '+00:00', 1000,
+                  ?, 'store/x.wav', 'x.wav', '2026-09-15T00:00:00Z', NULL, 'boom')
+        """,
+        (sha256,),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+class TestRetryFailed:
+    def test_does_not_run_asr(
+        self, vas: tuple[Config, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: an earlier version of this tool ran unbounded ASR inline via
+        `pipeline.process_pending`, which could take minutes and blow past Claude
+        Desktop's ~60s tool-call timeout. It must now only re-queue."""
+        _cfg, conn = vas
+        _insert_failed_recording(conn, sha256="f" * 64)
+
+        def _fail_if_called(*args: object, **kwargs: object) -> int:
+            raise AssertionError("retry_failed must not run ASR via pipeline.process_pending")
+
+        monkeypatch.setattr("voice_ai_summary.pipeline.process_pending", _fail_if_called)
+
+        result = mcp_server.retry_failed()
+        assert "cleared the error flag on 1 recording(s)" in result
+        assert "1 recording(s) now pending" in result
+        assert "process_pending" in result
+
+    def test_no_failed_recordings(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        result = mcp_server.retry_failed()
+        assert result == "no failed recordings"
+
+
+class TestProcessPending:
+    def test_reports_processed_and_remaining_counts(
+        self, vas: tuple[Config, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _cfg, conn = vas
+        for i in range(3):
+            _insert_pending_recording(conn, sha256=f"{i}" * 64)
+
+        def fake_process_pending(
+            conn: sqlite3.Connection, cfg: Config, backend: object, limit: int | None = None
+        ) -> int:
+            sql = "SELECT id FROM recordings WHERE processed_at IS NULL ORDER BY id"
+            if limit is not None:
+                sql += f" LIMIT {int(limit)}"
+            ids = [r["id"] for r in conn.execute(sql).fetchall()]
+            for rec_id in ids:
+                conn.execute(
+                    "UPDATE recordings SET processed_at = '2026-09-15T00:00:00Z' WHERE id = ?",
+                    (rec_id,),
+                )
+            conn.commit()
+            return len(ids)
+
+        monkeypatch.setattr("voice_ai_summary.pipeline.process_pending", fake_process_pending)
+
+        result = mcp_server.process_pending(limit=2)
+        assert "processed 2 recording(s); 1 still pending." in result
+        assert "process_pending again" in result
+
+        result2 = mcp_server.process_pending(limit=2)
+        assert "processed 1 recording(s); 0 still pending." in result2
+        assert "process_pending again" not in result2
+
+
+class TestWorkerStatus:
+    def test_non_macos_says_so_plainly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(mcp_server.sys, "platform", "linux")
+        assert "macOS-only" in mcp_server.worker_status()
+
+    def test_missing_plist_reports_not_loaded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_server.sys, "platform", "darwin")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: object):
+            result = MagicMock()
+            result.returncode = 1
+            result.stdout = ""
+            result.stderr = "Could not find service"
+            return result
+
+        monkeypatch.setattr(mcp_server.subprocess, "run", fake_run)
+
+        result = mcp_server.worker_status()
+        assert "MISSING" in result
+        assert "not loaded" in result
+
+    def test_loaded_service_reports_state_and_pid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from voice_ai_summary import launchd
+
+        monkeypatch.setattr(mcp_server.sys, "platform", "darwin")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        agents_dir = tmp_path / "Library" / "LaunchAgents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / f"{launchd.WORKER_LABEL}.plist").write_text("<plist/>")
+
+        print_output = (
+            f"{launchd.WORKER_LABEL} = {{\n"
+            "\tactive count = 1\n"
+            "\tstate = running\n"
+            "\tpid = 4321\n"
+            "\tlast exit status = 0\n"
+            "}\n"
+        )
+
+        def fake_run(cmd: list[str], **kwargs: object):
+            result = MagicMock()
+            if cmd[:2] == ["launchctl", "print"] and launchd.WORKER_LABEL in cmd[2]:
+                result.returncode = 0
+                result.stdout = print_output
+                result.stderr = ""
+            else:
+                result.returncode = 1
+                result.stdout = ""
+                result.stderr = ""
+            return result
+
+        monkeypatch.setattr(mcp_server.subprocess, "run", fake_run)
+
+        result = mcp_server.worker_status()
+        assert "state = running" in result
+        assert "pid = 4321" in result
+        assert "MISSING" in result  # the digest plist was never written in this test
+
+
+class TestRestartWorker:
+    def test_non_macos_says_so_plainly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(mcp_server.sys, "platform", "linux")
+        assert "macOS-only" in mcp_server.restart_worker()
+
+    def test_refuses_without_plist(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(mcp_server.sys, "platform", "darwin")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+        def _fail_if_called(*args: object, **kwargs: object) -> None:
+            raise AssertionError("must not shell out to launchctl with no plist installed")
+
+        monkeypatch.setattr(mcp_server.subprocess, "run", _fail_if_called)
+
+        result = mcp_server.restart_worker()
+        assert "install_services" in result
+
+
+class TestServiceLogs:
+    def test_rejects_unknown_service_name(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        result = mcp_server.service_logs(service="bogus")
+        assert "unknown service" in result
+
+    def test_missing_log_files_say_so(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        result = mcp_server.service_logs(service="worker")
+        assert "does not exist" in result
+
+    def test_tails_existing_logs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from voice_ai_summary import launchd
+
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        directory = launchd.log_dir()
+        directory.mkdir(parents=True)
+        (directory / f"{launchd.WORKER_LABEL}.log").write_text(
+            "\n".join(f"line{i}" for i in range(50))
+        )
+        (directory / f"{launchd.WORKER_LABEL}.err").write_text("")
+
+        result = mcp_server.service_logs(service="worker", lines=5)
+        assert "line49" in result
+        assert "line45" in result
+        assert "line44" not in result
+        assert "(empty)" in result

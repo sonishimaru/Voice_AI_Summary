@@ -36,8 +36,12 @@ server = MCPServer(
         "`rebuild_day` to (re)run summarization for a day (this calls the Claude API and "
         "costs money), `status`/`api_usage` to check pipeline health and spend, "
         "`list_vocabulary`/`add_vocabulary` to manage the personal glossary, "
-        "`retry_failed` to recover recordings that failed to transcribe, and `update_app` "
-        "to pull and reinstall the latest `vas` code."
+        "`retry_failed` to re-queue recordings that failed to transcribe and "
+        "`process_pending` to actually transcribe pending recordings by hand (local, "
+        "free, one small batch per call), `worker_status` to see why the background "
+        "worker or nightly digest isn't running, `restart_worker`/`install_services` to "
+        "fix it, `service_logs` to see why it crashed, and `update_app` to pull and "
+        "reinstall the latest `vas` code."
     ),
 )
 
@@ -343,15 +347,17 @@ def add_vocabulary(term: str, aliases: list[str] | None = None, note: str = "") 
 
 @_tool_safe
 def retry_failed() -> str:
-    """Re-queue recordings that previously failed to transcribe, then process them again.
+    """Re-queue recordings that previously failed to transcribe. Does NOT transcribe them.
 
     Clears the error flag (recovering a `.part` file left by an in-progress recorder if
-    needed) and re-runs local ASR on them. Local-only - no network call, no cost.
+    needed) so they become pending again. Local-only, free, and fast - it never runs ASR
+    itself, unlike an earlier version of this tool, which ran unbounded local ASR inline
+    and could take minutes, well past Claude Desktop's ~60s tool-call timeout. After this,
+    call `process_pending` (possibly more than once) to actually transcribe the recordings
+    this re-queues.
     """
-    from .asr import get_backend
     from .config import load_config
     from .db import connect
-    from .pipeline import process_pending
     from .pipeline import retry_failed as run_retry_failed
 
     cfg = load_config()
@@ -362,9 +368,46 @@ def retry_failed() -> str:
     if not ids:
         return "no failed recordings"
 
+    pending = conn.execute(
+        "SELECT COUNT(*) AS n FROM recordings WHERE processed_at IS NULL AND error IS NULL"
+    ).fetchone()["n"]
+    return (
+        f"cleared the error flag on {len(ids)} recording(s): {ids}\n"
+        f"{pending} recording(s) now pending. Call process_pending to transcribe them."
+    )
+
+
+@_tool_safe
+def process_pending(limit: int = 3) -> str:
+    """Transcribe up to `limit` pending recordings with the local ASR backend.
+
+    Local-only, free - no Claude API call, no network. Each recording takes roughly
+    10-60 seconds of CPU/GPU time depending on length and backend, so `limit` defaults
+    to a small 3 to stay well inside Claude Desktop's ~60s tool-call timeout: call this
+    repeatedly (or pass a larger `limit`) until nothing is pending. This is the tool
+    that clears a backlog of pending recordings by hand, e.g. when the launchd worker
+    (see `worker_status`) is not running. The very first call may also need to download
+    the ASR model, which can be slow - if it seems to hang, that is likely why.
+    """
+    from .asr import get_backend
+    from .config import load_config
+    from .db import connect
+    from .pipeline import process_pending as run_process_pending
+
+    cfg = load_config()
+    cfg.ensure_dirs()
+    conn = connect(cfg.paths.db_path)
+
     backend = get_backend(cfg)
-    count = process_pending(conn, cfg, backend)
-    return f"re-queued {len(ids)} recording(s): {ids}\nprocessed {count} recording(s)"
+    processed = run_process_pending(conn, cfg, backend, limit=limit)
+    remaining = conn.execute(
+        "SELECT COUNT(*) AS n FROM recordings WHERE processed_at IS NULL AND error IS NULL"
+    ).fetchone()["n"]
+
+    result = f"processed {processed} recording(s); {remaining} still pending."
+    if remaining:
+        result += " Call process_pending again (or with a larger limit) to keep clearing it."
+    return result
 
 
 def _repo_dir() -> Path:
@@ -430,6 +473,227 @@ def update_app() -> str:
     return "\n\n".join(output)
 
 
+def _agents_dir() -> Path:
+    """Where launchd plist files for this app live, mirroring `launchd.install`."""
+    return Path.home() / "Library" / "LaunchAgents"
+
+
+_LAUNCHCTL_PRINT_INTERESTING_KEYS = frozenset(
+    {"state", "pid", "last exit status", "last exit reason"}
+)
+
+
+def _launchctl_print_summary(output: str) -> list[str]:
+    """Pull the lines worth reporting out of `launchctl print`'s (long, indented) output:
+    run state, pid, and the last exit status/reason - not the whole dump."""
+    lines = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        key = stripped.split("=", 1)[0].strip().lower()
+        if key in _LAUNCHCTL_PRINT_INTERESTING_KEYS:
+            lines.append(stripped)
+    return lines
+
+
+def _report_one_service(label: str) -> str:
+    """One label's worth of `worker_status` output: plist presence plus what launchd
+    itself reports, preferring `launchctl print` and falling back to `launchctl list`."""
+    import os
+
+    plist_path = _agents_dir() / f"{label}.plist"
+    lines = [
+        f"{label}:",
+        f"  plist: {'present' if plist_path.exists() else 'MISSING'} ({plist_path})",
+    ]
+
+    uid = os.getuid()
+    try:
+        printed = subprocess.run(
+            ["launchctl", "print", f"gui/{uid}/{label}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        lines.append(f"  launchctl print failed to run: {exc}")
+        printed = None
+
+    if printed is not None and printed.returncode == 0:
+        summary = _launchctl_print_summary(printed.stdout)
+        if summary:
+            lines.extend(f"  {line}" for line in summary)
+        else:
+            lines.append("  loaded, but no state/pid/exit lines found in launchctl print")
+        return "\n".join(lines)
+
+    # `launchctl print` fails (typically exit 113/1) when the service is not
+    # bootstrapped into this session's domain; fall back to `launchctl list`.
+    try:
+        listed = subprocess.run(
+            ["launchctl", "list", label],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        lines.append(f"  launchctl list failed to run too: {exc}")
+        return "\n".join(lines)
+
+    if listed.returncode == 0 and listed.stdout.strip():
+        lines.append(f"  not found via launchctl print; launchctl list: {listed.stdout.strip()}")
+    else:
+        lines.append("  not loaded (launchctl list has no entry for this label)")
+    return "\n".join(lines)
+
+
+@_tool_safe
+def worker_status() -> str:
+    """Report what launchd actually knows about the background worker and digest
+    services - this is the tool that answers "why isn't anything being transcribed".
+
+    For both the worker (transcribes recordings continuously) and the nightly digest
+    job, reports whether `~/Library/LaunchAgents/<label>.plist` exists and, via
+    `launchctl print` (falling back to `launchctl list`), whether the service is
+    currently loaded, its run state, pid, and last exit status/reason. Read-only,
+    local, and free - macOS only; on any other platform it says so plainly instead of
+    guessing. If the worker looks stopped or crash-looping, `restart_worker` fixes it,
+    `install_services` reinstalls it if the plist itself looks stale, and
+    `service_logs` shows why it has been failing.
+    """
+    if sys.platform != "darwin":
+        return "launchd is macOS-only; there is nothing to report on this platform."
+
+    from . import launchd
+
+    return "\n\n".join(
+        _report_one_service(label) for label in (launchd.WORKER_LABEL, launchd.DIGEST_LABEL)
+    )
+
+
+@_tool_safe
+def restart_worker() -> str:
+    """Restart the background transcription worker via launchd - use this when
+    `worker_status` shows it stopped, crashed, or otherwise not running.
+
+    Local-only, free, and fast (a few seconds). Tries `launchctl kickstart -k` first
+    (restarts an already-bootstrapped service in place); if that fails - typically
+    because the service was never bootstrapped into this login session - falls back to
+    `launchctl bootout` then `launchctl bootstrap` from the installed plist. Refuses
+    cleanly, naming `install_services`, if the worker's plist does not exist at all.
+    macOS only.
+    """
+    if sys.platform != "darwin":
+        return "launchd is macOS-only; there is nothing to restart on this platform."
+
+    import os
+
+    from . import launchd
+
+    plist_path = _agents_dir() / f"{launchd.WORKER_LABEL}.plist"
+    if not plist_path.exists():
+        return (
+            f"{plist_path} does not exist - the worker has never been installed. "
+            "Call install_services() first."
+        )
+
+    uid = os.getuid()
+    try:
+        kickstarted = subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{uid}/{launchd.WORKER_LABEL}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"launchctl kickstart failed to run: {exc}"
+
+    if kickstarted.returncode == 0:
+        detail = (kickstarted.stdout + kickstarted.stderr).strip()
+        return f"restarted {launchd.WORKER_LABEL} via launchctl kickstart.\n{detail}"
+
+    output = [
+        f"launchctl kickstart failed (exit {kickstarted.returncode}): "
+        f"{(kickstarted.stdout + kickstarted.stderr).strip()}",
+        "falling back to bootout + bootstrap ...",
+    ]
+    launchd.launchctl_bootout(uid, str(plist_path))
+    try:
+        launchd.launchctl_bootstrap(uid, str(plist_path))
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        output.append(f"bootstrap failed: {detail or exc}")
+        return "\n".join(output)
+    except subprocess.TimeoutExpired as exc:
+        output.append(f"bootstrap timed out: {exc}")
+        return "\n".join(output)
+
+    output.append(f"bootout + bootstrap succeeded for {launchd.WORKER_LABEL}.")
+    return "\n".join(output)
+
+
+@_tool_safe
+def install_services() -> str:
+    """(Re)install the launchd worker and digest services from current config.toml.
+
+    This is how to fix a stale or wrong LaunchAgent - e.g. after editing config.toml,
+    moving the `vas` binary, or if `worker_status` shows the plist is missing or the
+    service is misbehaving. Writes both plist files to ~/Library/LaunchAgents and, on
+    macOS, boots each service out and re-bootstraps it so launchd picks up the new
+    file. Safe to run repeatedly - it is the same install every `vas install-launchd`
+    in a terminal does. Local-only and free; not available on non-macOS beyond writing
+    the plist files.
+    """
+    from . import launchd
+    from .config import load_config
+
+    cfg = load_config()
+    paths = launchd.install(cfg)
+    listing = "\n".join(f"  {p}" for p in paths)
+
+    if sys.platform == "darwin":
+        note = (
+            "Booted each service out and re-bootstrapped it, so launchd is running the new plist."
+        )
+    else:
+        note = "launchd is macOS-only, so only the plist files were written (no launchctl call)."
+    return f"Wrote:\n{listing}\n{note}"
+
+
+@_tool_safe
+def service_logs(service: str = "worker", lines: int = 40) -> str:
+    """Tail the launchd stdout/stderr log files for the worker or digest service.
+
+    `service` is `"worker"` or `"digest"` (anything else is rejected); `lines` caps how
+    many trailing lines of each file are shown (default 40). Reads
+    `~/Library/Logs/VoiceAISummary/com.voiceaisummary.<service>.log` (stdout) and `.err`
+    (stderr), the same files `install_services` configures launchd to write to. Says
+    plainly when a file is missing (service never ran, or was installed before logging
+    existed) or empty. Read-only and free - this is usually the next step after
+    `worker_status` shows a service crashing or exiting with an error.
+    """
+    from . import launchd
+
+    labels = {"worker": launchd.WORKER_LABEL, "digest": launchd.DIGEST_LABEL}
+    if service not in labels:
+        return f"unknown service {service!r}; expected 'worker' or 'digest'."
+
+    label = labels[service]
+    directory = launchd.log_dir()
+    out: list[str] = []
+    for suffix, kind in ((".log", "stdout"), (".err", "stderr")):
+        path = directory / f"{label}{suffix}"
+        out.append(f"--- {kind}: {path} ---")
+        if not path.exists():
+            out.append("(file does not exist - the service may never have run)")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if not text.strip():
+            out.append("(empty)")
+            continue
+        out.extend(text.splitlines()[-lines:])
+    return "\n".join(out)
+
+
 for _fn in (
     daily_summary,
     list_days,
@@ -441,6 +705,11 @@ for _fn in (
     list_vocabulary,
     add_vocabulary,
     retry_failed,
+    process_pending,
+    worker_status,
+    restart_worker,
+    install_services,
+    service_logs,
     update_app,
 ):
     server.add_tool(_fn)
