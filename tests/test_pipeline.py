@@ -181,6 +181,43 @@ def test_retry_failed_renames_part_and_reprocesses(vas, monkeypatch) -> None:
     assert conn.execute("SELECT text FROM utterances").fetchone()["text"] == "再処理"
 
 
+def test_process_recording_is_idempotent(
+    vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-running `process_recording` on the same recording must replace its
+    segments/utterances, not append a second copy - and the FTS mirror must reflect
+    exactly the surviving rows, with no stale or doubled entries."""
+    cfg, conn = vas
+    src = cfg.paths.inbox / "mac_system_dev1_20260915T000000Z.wav"
+    _write_wav(src)
+    rec_id = ingest_file(conn, cfg, src)
+
+    monkeypatch.setattr(
+        vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, 0.9)]
+    )
+
+    assert process_recording(conn, cfg, rec_id, FakeBackend(["重複しないテスト"])) == 1
+    # Re-process the same recording, as would happen if a `.part` file were renamed to
+    # its final name and re-queued, or the worker ran on it twice.
+    assert process_recording(conn, cfg, rec_id, FakeBackend(["重複しないテスト"])) == 1
+
+    utterances = conn.execute(
+        "SELECT * FROM utterances WHERE recording_id = ?", (rec_id,)
+    ).fetchall()
+    assert len(utterances) == 1
+    segments = conn.execute("SELECT * FROM segments WHERE recording_id = ?", (rec_id,)).fetchall()
+    assert len(segments) == 1
+
+    results = search(conn, "重複しない")
+    assert len(results) == 1
+    assert results[0]["text"] == "重複しないテスト"
+
+    # The FTS content table must have exactly as many rows as `utterances` - no leftover
+    # rows from the first pass and no doubled row from the second.
+    fts_count = conn.execute("SELECT COUNT(*) AS n FROM utterances_fts").fetchone()["n"]
+    assert fts_count == 1
+
+
 def test_reset_recordings_clears_transcript_and_requeues(vas, monkeypatch) -> None:
     from voice_ai_summary.pipeline import process_pending, reset_recordings
 

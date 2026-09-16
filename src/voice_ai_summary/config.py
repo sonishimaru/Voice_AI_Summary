@@ -87,6 +87,18 @@ class VadConfig(BaseModel):
     merge_gap_ms: int = 2000
     max_speech_s: float = 30.0
     pad_ms: int = 200
+    # Whisper pads every chunk to its fixed max-window length regardless of how much of it
+    # is speech, so a 3 s region costs the same compute as a 30 s one. `merge_gap_ms` runs
+    # first and produces the (already-merged, still short) regions this packs; packing then
+    # greedily joins consecutive regions into contiguous spans up to `max_speech_s`,
+    # absorbing silence gaps up to this value between them so one ASR call amortizes the
+    # window padding across several regions instead of paying it once per region. Kept
+    # separate from `merge_gap_ms` (which decides what counts as "one utterance") because
+    # a much larger gap is fine to absorb here purely to fill the padded window, at the
+    # cost of feeding the decoder more silence (which risks repetition/hallucination on
+    # long silent stretches, hence the cap rather than absorbing unboundedly). 0 disables
+    # packing.
+    pack_max_gap_ms: int = 5000
 
     def for_source(self, source: str) -> VadConfig:
         """This config with `threshold` replaced by the override for `source`, if any."""

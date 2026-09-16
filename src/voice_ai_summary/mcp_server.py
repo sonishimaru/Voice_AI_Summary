@@ -38,7 +38,13 @@ server = MCPServer(
         "`list_vocabulary`/`add_vocabulary` to manage the personal glossary, "
         "`retry_failed` to re-queue recordings that failed to transcribe and "
         "`process_pending` to actually transcribe pending recordings by hand (local, "
-        "free, one small batch per call), `worker_status` to see why the background "
+        "free, one small batch per call), `list_recordings` to see the raw recording "
+        "rows for a day (source, time, duration, utterance count, state, sha256, "
+        "storage path) - this is how two recordings covering the same time span show "
+        "up, `find_duplicates` to find utterances whose text repeats within a day and "
+        "which recording ids that duplication comes from, `drop_recording` to "
+        "permanently delete one recording's database rows (never the audio file) once "
+        "a duplicate has been identified, `worker_status` to see why the background "
         "worker or nightly digest isn't running, `restart_worker`/`install_services` to "
         "fix it, `service_logs` to see why it crashed, and `update_app` to pull and "
         "reinstall the latest `vas` code."
@@ -410,6 +416,213 @@ def process_pending(limit: int = 3) -> str:
     return result
 
 
+@_tool_safe
+def list_recordings(day: str = "", limit: int = 50) -> str:
+    """List each recording ingested on a local day: id, source, local start time,
+    duration, utterance count, processing state (processed/pending/errored), the first
+    8 characters of its sha256, and its storage path.
+
+    `day` is a local date `YYYY-MM-DD` in the configured timezone; empty means today.
+    Sorted by local start time. This is the tool that surfaces two recordings covering
+    the same span of time - the shape a `.part`-file duplicate takes (same audio
+    ingested twice under different sha256, both transcribed). `find_duplicates` shows
+    the effect on transcript text; this shows the underlying recording rows. Read-only,
+    local, and free.
+    """
+    from .config import load_config
+    from .db import connect
+    from .timeutil import fmt_hm, local_day_bounds, today_local
+
+    cfg = load_config()
+    cfg.ensure_dirs()
+    conn = connect(cfg.paths.db_path)
+    tz = cfg.summarize.timezone
+    day = day or today_local(tz)
+    start, end = local_day_bounds(day, tz)
+
+    rows = conn.execute(
+        """
+        SELECT r.*, (SELECT COUNT(*) FROM utterances u WHERE u.recording_id = r.id) AS utt_count
+        FROM recordings r
+        WHERE r.started_at_utc >= ? AND r.started_at_utc < ?
+        ORDER BY r.started_at_utc
+        """,
+        (start, end),
+    ).fetchall()
+    if not rows:
+        return f"No recordings for {day}."
+
+    shown = rows[:limit]
+    lines = []
+    for row in shown:
+        if row["error"] is not None:
+            state = "errored"
+        elif row["processed_at"] is not None:
+            state = "processed"
+        else:
+            state = "pending"
+        duration = f"{row['duration_ms'] / 1000:.1f}s" if row["duration_ms"] is not None else "?"
+        lines.append(
+            f"id={row['id']} source={row['source']} start={fmt_hm(row['started_at_utc'], tz)} "
+            f"duration={duration} utterances={row['utt_count']} state={state} "
+            f"sha256={row['sha256'][:8]} path={row['storage_path']}"
+        )
+    if len(rows) > limit:
+        lines.append(f"... truncated: showing {limit} of {len(rows)} recordings")
+    return "\n".join(lines)
+
+
+@_tool_safe
+def find_duplicates(day: str = "", limit: int = 40) -> str:
+    """Find utterances on a local day whose text repeats, to spot ASR/recorder bugs
+    that transcribe the same speech more than once.
+
+    Utterances are grouped by normalized text (surrounding whitespace stripped), and
+    two utterances with the same text only count as duplicates of each other when they
+    also start within 120 seconds of each other - so a phrase that is genuinely spoken
+    twice hours apart is not flagged. For each duplicate group, reports the text once,
+    then one line per copy (utterance id, recording id, source, local time). Ends with a
+    summary: how many utterances fall in duplicate groups, and which recording-id PAIRS
+    co-occur most often across those groups - a pair that dominates means two different
+    recordings hold the same audio (e.g. a `.part` file ingested alongside its completed
+    re-ingest), while duplicates clustered on a single recording id instead mean that
+    one recording was processed more than once and its transcript was appended to
+    rather than replaced. `day` is a local date `YYYY-MM-DD`; empty means today. `limit`
+    caps how many duplicate groups are printed (default 40). Read-only, local, and
+    free.
+    """
+    from collections import Counter
+    from datetime import datetime
+    from itertools import combinations
+
+    from .config import load_config
+    from .db import connect
+    from .timeutil import fmt_hm, local_day_bounds, today_local
+
+    cfg = load_config()
+    cfg.ensure_dirs()
+    conn = connect(cfg.paths.db_path)
+    tz = cfg.summarize.timezone
+    day = day or today_local(tz)
+    start, end = local_day_bounds(day, tz)
+
+    rows = conn.execute(
+        """
+        SELECT u.id, u.recording_id, u.text, u.abs_start_utc, r.source
+        FROM utterances u JOIN recordings r ON r.id = u.recording_id
+        WHERE u.abs_start_utc >= ? AND u.abs_start_utc < ?
+        ORDER BY u.text, u.abs_start_utc
+        """,
+        (start, end),
+    ).fetchall()
+    if not rows:
+        return f"No utterances for {day}."
+
+    def _parse(ts: str) -> datetime:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+
+    clusters: list[list[sqlite3.Row]] = []
+    cluster: list[sqlite3.Row] = []
+    prev_text: str | None = None
+    prev_time: datetime | None = None
+    for row in rows:
+        text = row["text"].strip()
+        t = _parse(row["abs_start_utc"])
+        if (
+            text == prev_text
+            and prev_time is not None
+            and abs((t - prev_time).total_seconds()) <= 120
+        ):
+            cluster.append(row)
+        else:
+            if cluster:
+                clusters.append(cluster)
+            cluster = [row]
+        prev_text, prev_time = text, t
+    if cluster:
+        clusters.append(cluster)
+
+    dup_groups = [c for c in clusters if len(c) >= 2]
+    if not dup_groups:
+        return f"No duplicate utterances found for {day}."
+
+    pair_counter: Counter[tuple[int, int]] = Counter()
+    for group in dup_groups:
+        ids = sorted(row["recording_id"] for row in group)
+        for a, b in combinations(ids, 2):
+            pair_counter[(a, b)] += 1
+
+    lines: list[str] = []
+    for group in dup_groups[:limit]:
+        text = group[0]["text"].strip()
+        lines.append(f'"{text}" ({len(group)} copies)')
+        for row in group:
+            lines.append(
+                f"  utt={row['id']} recording={row['recording_id']} source={row['source']} "
+                f"time={fmt_hm(row['abs_start_utc'], tz)}"
+            )
+    if len(dup_groups) > limit:
+        lines.append(f"... truncated: showing {limit} of {len(dup_groups)} duplicate group(s)")
+
+    total_dup_utts = sum(len(g) for g in dup_groups)
+    lines.append("")
+    lines.append(f"summary: {total_dup_utts} utterance(s) in {len(dup_groups)} duplicate group(s)")
+    if pair_counter:
+        lines.append(
+            "most common recording-id pairs (a pair like (5, 5) means one recording's "
+            "own utterances duplicated each other, i.e. it was processed more than once):"
+        )
+        for (a, b), n in pair_counter.most_common(5):
+            lines.append(f"  ({a}, {b}): {n} time(s)")
+    return "\n".join(lines)
+
+
+@_tool_safe
+def drop_recording(recording_id: int, confirm: bool = False) -> str:
+    """Permanently delete one recording's database rows (the recording itself, its
+    `segments`, and its `utterances`) - use this to remove a duplicate recording once
+    `list_recordings`/`find_duplicates` has identified it.
+
+    Does NOT delete the audio file on disk; only the database rows go away, and the
+    output says so. DESTRUCTIVE and irreversible for those rows, so it refuses unless
+    `confirm=True` - without it, it prints what WOULD be deleted (source, local start
+    time, utterance count, storage path) so the caller can check before confirming.
+    Local-only and free.
+    """
+    from .config import load_config
+    from .db import connect
+    from .pipeline import delete_recording as run_delete_recording
+    from .timeutil import fmt_hm
+
+    cfg = load_config()
+    cfg.ensure_dirs()
+    conn = connect(cfg.paths.db_path)
+    tz = cfg.summarize.timezone
+
+    row = conn.execute("SELECT * FROM recordings WHERE id = ?", (recording_id,)).fetchone()
+    if row is None:
+        return f"no such recording: {recording_id}"
+
+    utt_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM utterances WHERE recording_id = ?", (recording_id,)
+    ).fetchone()["n"]
+    description = (
+        f"recording {recording_id}: source={row['source']} "
+        f"start={fmt_hm(row['started_at_utc'], tz)} utterances={utt_count} "
+        f"path={row['storage_path']}"
+    )
+
+    if not confirm:
+        return (
+            f"Would delete {description}\n"
+            "The audio file on disk is left untouched either way.\n"
+            "Call again with confirm=True to actually delete these database rows."
+        )
+
+    run_delete_recording(conn, recording_id)
+    return f"deleted {description} (database rows only; audio file left on disk)"
+
+
 def _repo_dir() -> Path:
     """The git work tree this package is installed from, derived from `__file__`
     (`<repo>/src/voice_ai_summary/mcp_server.py`) rather than the current directory,
@@ -706,6 +919,9 @@ for _fn in (
     add_vocabulary,
     retry_failed,
     process_pending,
+    list_recordings,
+    find_duplicates,
+    drop_recording,
     worker_status,
     restart_worker,
     install_services,

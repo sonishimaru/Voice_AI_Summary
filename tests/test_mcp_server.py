@@ -314,6 +314,177 @@ class TestProcessPending:
         assert "process_pending again" not in result2
 
 
+class TestListRecordings:
+    def test_lists_two_recordings_for_a_day_sorted_by_time(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        _cfg, conn = vas
+        rec_a = _insert_recording(
+            conn, source="mac_system", started_at_utc="2026-09-15T01:00:00Z", sha256="a" * 64
+        )
+        rec_b = _insert_recording(
+            conn, source="mac_system", started_at_utc="2026-09-15T01:00:05Z", sha256="b" * 64
+        )
+        _insert_utterance(
+            conn, recording_id=rec_a, abs_start_utc="2026-09-15T01:00:00Z", speaker="other"
+        )
+        _insert_utterance(
+            conn, recording_id=rec_b, abs_start_utc="2026-09-15T01:00:05Z", speaker="other"
+        )
+
+        result = mcp_server.list_recordings(day="2026-09-15")
+        assert f"id={rec_a}" in result
+        assert f"id={rec_b}" in result
+        assert result.index(f"id={rec_a}") < result.index(f"id={rec_b}")
+        assert "utterances=1" in result
+        assert "sha256=aaaaaaaa" in result
+        assert "sha256=bbbbbbbb" in result
+        assert "path=store/x.wav" in result
+        assert "state=processed" in result
+
+    def test_no_recordings_message(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        result = mcp_server.list_recordings(day="2026-01-01")
+        assert "No recordings" in result
+
+
+class TestFindDuplicates:
+    def test_groups_by_text_and_time_proximity_and_names_the_pair(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        _cfg, conn = vas
+        rec_a = _insert_recording(
+            conn, source="mac_system", started_at_utc="2026-09-15T01:00:00Z", sha256="a" * 64
+        )
+        rec_b = _insert_recording(
+            conn, source="mac_system", started_at_utc="2026-09-15T01:00:00Z", sha256="b" * 64
+        )
+
+        # Mechanism (a): the same audio, transcribed under two different recording ids,
+        # close together in time (a `.part` file and its completed re-ingest).
+        _insert_utterance(
+            conn,
+            recording_id=rec_a,
+            abs_start_utc="2026-09-15T01:00:00Z",
+            speaker="other",
+            text="こんにちは、テストです",
+        )
+        _insert_utterance(
+            conn,
+            recording_id=rec_b,
+            abs_start_utc="2026-09-15T01:00:30Z",
+            speaker="other",
+            text="こんにちは、テストです",
+        )
+
+        # Same text, hours apart on the same local day: a genuinely repeated phrase,
+        # not a duplicate - must NOT be grouped.
+        _insert_utterance(
+            conn,
+            recording_id=rec_a,
+            abs_start_utc="2026-09-15T02:00:00Z",
+            speaker="other",
+            text="よろしくお願いします",
+        )
+        _insert_utterance(
+            conn,
+            recording_id=rec_a,
+            abs_start_utc="2026-09-15T05:00:00Z",
+            speaker="other",
+            text="よろしくお願いします",
+        )
+
+        result = mcp_server.find_duplicates(day="2026-09-15")
+        assert "こんにちは、テストです" in result
+        assert "よろしくお願いします" not in result
+        assert "2 utterance(s) in 1 duplicate group(s)" in result
+        assert f"({rec_a}, {rec_b})" in result
+        assert f"recording={rec_a}" in result
+        assert f"recording={rec_b}" in result
+
+    def test_no_utterances_message(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        result = mcp_server.find_duplicates(day="2026-01-01")
+        assert "No utterances" in result
+
+    def test_no_duplicates_message(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        _cfg, conn = vas
+        rec = _insert_recording(
+            conn, source="mac_system", started_at_utc="2026-09-15T01:00:00Z", sha256="c" * 64
+        )
+        _insert_utterance(
+            conn, recording_id=rec, abs_start_utc="2026-09-15T01:00:00Z", text="固有の発話"
+        )
+
+        result = mcp_server.find_duplicates(day="2026-09-15")
+        assert "No duplicate utterances" in result
+
+
+class TestDropRecording:
+    def test_refuses_without_confirm_and_changes_nothing(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        _cfg, conn = vas
+        rec = _insert_recording(
+            conn, source="mac_system", started_at_utc="2026-09-15T01:00:00Z", sha256="e" * 64
+        )
+        _insert_utterance(conn, recording_id=rec, abs_start_utc="2026-09-15T01:00:00Z")
+
+        result = mcp_server.drop_recording(recording_id=rec)
+        assert "confirm=True" in result
+        assert "mac_system" in result
+        assert "utterances=1" in result
+        assert "store/x.wav" in result
+
+        assert (
+            conn.execute("SELECT COUNT(*) AS n FROM recordings WHERE id = ?", (rec,)).fetchone()[
+                "n"
+            ]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM utterances WHERE recording_id = ?", (rec,)
+            ).fetchone()["n"]
+            == 1
+        )
+
+    def test_confirm_deletes_rows_but_leaves_file_on_disk(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        cfg, conn = vas
+        rec = _insert_recording(
+            conn, source="mac_system", started_at_utc="2026-09-15T01:00:00Z", sha256="f" * 64
+        )
+        _insert_utterance(conn, recording_id=rec, abs_start_utc="2026-09-15T01:00:00Z")
+
+        # storage_path in the helper is the literal string "store/x.wav".
+        audio_path = cfg.paths.store / "store" / "x.wav"
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        audio_path.write_bytes(b"fake audio")
+
+        result = mcp_server.drop_recording(recording_id=rec, confirm=True)
+        assert "deleted" in result
+        assert "audio file left on disk" in result
+
+        assert (
+            conn.execute("SELECT COUNT(*) AS n FROM recordings WHERE id = ?", (rec,)).fetchone()[
+                "n"
+            ]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM utterances WHERE recording_id = ?", (rec,)
+            ).fetchone()["n"]
+            == 0
+        )
+        assert audio_path.exists()
+        assert audio_path.read_bytes() == b"fake audio"
+
+    def test_unknown_recording_id(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        result = mcp_server.drop_recording(recording_id=999999, confirm=True)
+        assert "no such recording" in result
+
+
 class TestWorkerStatus:
     def test_non_macos_says_so_plainly(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(mcp_server.sys, "platform", "linux")
