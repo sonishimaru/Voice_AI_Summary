@@ -108,6 +108,34 @@ digest には他の参加者の発言や取引先名も含まれるため、リ�
 サマリ本文は Mac の外に出ません。通知を見たら `vas show`、または Claude Desktop の
 ローカルチャットで `~/Library/Application Support/VoiceAISummary/digests/` を読ませてください。
 
+## Claude Desktop から使う（ターミナル不要）
+
+`vas` を MCP サーバーとして Claude Desktop に登録すると、以後はターミナルを開かず、Claude Desktop に話しかけるだけで使えます。
+
+**一回だけのセットアップ:**
+
+```bash
+cd ~/Voice_AI_Summary
+git merge origin/claude/clever-sagan-23tn2w
+uv pip install -e ".[dev]"
+.venv/bin/vas install-desktop
+```
+
+最後にターミナルの案内どおり、Claude Desktop を一度終了して開き直してください。
+
+**セットアップ後は、たとえばこんな風に話しかけられます:**
+
+- 「今日のサマリを見せて」
+- 「『予算』で検索して」
+- 「2026-09-15 を作り直して」
+- 「語彙に『◯◯』を追加して」
+- 「API 使用量は？」
+- 「アップデートして」
+
+Anthropic の API キーは Claude Desktop の設定ファイルには書き込まれません（Claude Desktop はサーバーをまっさらな環境で起動するため、そこにシークレットを置くのは避けています）。代わりに `vas install-desktop` がキーファイル（`config.toml` と同じディレクトリの `anthropic_api_key`、権限 600）を用意し、MCP サーバーはそこから読みます。登録を外すには `vas uninstall-desktop` を実行してください。
+
+これはあくまで追加の入り口で、これまでの `vas` コマンドはすべてそのまま使えます。
+
 ## 日次サマリをローカルで読む
 
 サマリは `<data_dir>/digests/YYYY-MM-DD.md` に保存されます（既定では外部に一切送信しません）。
