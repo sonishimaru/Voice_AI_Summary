@@ -28,6 +28,10 @@ min_silence_ms = 500      # gap that closes a speech region
 merge_gap_ms = 2000       # regions closer than this are transcribed together (context!)
 max_speech_s = 30         # split long chunks for the ASR window
 pad_ms = 200              # padding added around each region
+# Whisperは音声区間の長さに関わらず固定長(30秒)の窓にパディングして処理するため、短い区間を
+# 個別に文字起こしするとパディング分の計算が無駄になる。merge_gap_ms で作られた区間どうしを、
+# 間の無音がこの値以下ならさらに詰めて1つの区間にまとめ、max_speech_s まで詰め込む。0で無効化。
+pack_max_gap_ms = 5000
 
 [episodes]
 gap_minutes = 5           # silence longer than this starts a new episode
