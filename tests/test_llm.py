@@ -29,6 +29,26 @@ def test_make_client_prefers_dedicated_key(monkeypatch, tmp_path) -> None:
         llm.make_client(cfg)
 
 
+def test_api_key_falls_back_to_key_file(monkeypatch, tmp_path) -> None:
+    """Claude Desktop starts the MCP server with a bare environment, so the key file
+    next to config.toml (`llm.api_key_path()`) must work with no env vars set."""
+    monkeypatch.delenv("VAS_ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setenv("VAS_CONFIG", str(config_path))
+
+    assert llm.api_key_path() == config_path.parent / llm.API_KEY_FILENAME
+    assert llm.api_key() is None  # no file yet
+
+    key_path = llm.api_key_path()
+    key_path.write_text("  file-key  \n", encoding="utf-8")
+    assert llm.api_key() == "file-key"
+
+    # An env var still takes priority over the file.
+    monkeypatch.setenv("VAS_ANTHROPIC_API_KEY", "env-key")
+    assert llm.api_key() == "env-key"
+
+
 def test_track_and_summarize_usage(tmp_path) -> None:
     path = tmp_path / "usage.jsonl"
     llm.set_usage_path(path)

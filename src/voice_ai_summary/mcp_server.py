@@ -73,15 +73,15 @@ def _format_utterance_row(row: sqlite3.Row, tz: str) -> str:
     return f"{fmt_hm(row['abs_start_utc'], tz)} [{row['speaker']}] {row['text']}"
 
 
-def _digest_exists(conn: sqlite3.Connection, day: str) -> bool:
-    """Whether a day digest is stored (in `summaries`) or written to the digest file."""
+def _stored_digest(conn: sqlite3.Connection, day: str) -> str | None:
+    """The day digest held in `summaries`, or None when it has not been built."""
     from .summarize import PROMPT_VERSION
 
     row = conn.execute(
         "SELECT markdown FROM summaries WHERE scope='day' AND scope_key=? AND prompt_version=?",
         (day, PROMPT_VERSION),
     ).fetchone()
-    return row is not None and row["markdown"] is not None
+    return row["markdown"] if row is not None else None
 
 
 @_tool_safe
@@ -102,14 +102,9 @@ def daily_summary(day: str = "") -> str:
     conn = connect(cfg.paths.db_path)
     day = day or today_local(cfg.summarize.timezone)
 
-    if _digest_exists(conn, day):
-        from .summarize import PROMPT_VERSION
-
-        row = conn.execute(
-            "SELECT markdown FROM summaries WHERE scope='day' AND scope_key=? AND prompt_version=?",
-            (day, PROMPT_VERSION),
-        ).fetchone()
-        return row["markdown"]
+    stored = _stored_digest(conn, day)
+    if stored is not None:
+        return stored
 
     digest_path = cfg.paths.digests / f"{day}.md"
     if digest_path.is_file():
@@ -152,7 +147,7 @@ def list_days(limit: int = 30) -> str:
     days = sorted(counts, reverse=True)[:limit]
     lines = []
     for day in days:
-        digest = "yes" if _digest_exists(conn, day) else "no"
+        digest = "yes" if _stored_digest(conn, day) is not None else "no"
         lines.append(f"{day}: {counts[day]} utterance(s), digest: {digest}")
     return "\n".join(lines)
 
@@ -220,18 +215,17 @@ def transcript(day: str = "", limit: int = 800) -> str:
 
 
 @_tool_safe
-def rebuild_day(day: str = "", force: bool = False, correct: bool = True) -> str:
+def rebuild_day(day: str = "", force: bool = False) -> str:
     """Rebuild a local day's summary and return the resulting Markdown digest.
 
     THIS CALLS THE CLAUDE API AND COSTS MONEY (subject to `[llm] daily_budget_usd` in
     config.toml; check `api_usage` for recent spend). `day` is a local date
-    `YYYY-MM-DD`, default today. Unless `correct=False`, first runs the Claude
-    correction pass over the day's ASR text, then (re)builds episodes and the daily
-    digest. Summaries already cached for unchanged content are reused unless
-    `force=True`, which recomputes everything for the day regardless of caching.
+    `YYYY-MM-DD`, default today. The Claude correction pass over the day's ASR text
+    runs first whenever `[correct] enabled` is set in config.toml, then episodes and
+    the daily digest are rebuilt. Summaries already cached for unchanged content are
+    reused unless `force=True`, which recomputes the day regardless of caching.
     """
     from .config import load_config
-    from .correct import correct_day
     from .db import connect
     from .summarize import run_day
     from .timeutil import today_local
@@ -241,8 +235,6 @@ def rebuild_day(day: str = "", force: bool = False, correct: bool = True) -> str
     conn = connect(cfg.paths.db_path)
     day = day or today_local(cfg.summarize.timezone)
 
-    if correct:
-        correct_day(conn, cfg, day, force=force)
     return run_day(conn, cfg, day, force=force)
 
 
