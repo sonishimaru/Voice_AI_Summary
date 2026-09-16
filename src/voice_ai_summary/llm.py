@@ -61,8 +61,32 @@ def friendly_api_error(exc: anthropic.APIStatusError, model: str) -> RuntimeErro
     return None
 
 
+API_KEY_FILENAME = "anthropic_api_key"
+
+
+def api_key_path() -> Path:
+    """Where a key file may sit: next to config.toml, so it moves with `VAS_CONFIG`."""
+    from .config import DEFAULT_CONFIG_PATH
+
+    config = Path(os.environ.get("VAS_CONFIG", str(DEFAULT_CONFIG_PATH))).expanduser()
+    return config.parent / API_KEY_FILENAME
+
+
 def api_key() -> str | None:
-    return os.environ.get("VAS_ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    """The Anthropic key, from the environment or from a key file.
+
+    Claude Desktop starts an MCP server with a bare environment — no shell profile, so
+    none of the `export`s the README describes are visible. The key file is what makes
+    the server usable there without pasting a secret into Claude's own config file.
+    """
+    env = os.environ.get("VAS_ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if env:
+        return env
+    path = api_key_path()
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
 
 
 def make_client(cfg: Config) -> anthropic.Anthropic:
@@ -74,7 +98,8 @@ def make_client(cfg: Config) -> anthropic.Anthropic:
     key = api_key()
     if not key:
         raise RuntimeError(
-            "No API key: set VAS_ANTHROPIC_API_KEY (preferred) or ANTHROPIC_API_KEY."
+            "No API key: set VAS_ANTHROPIC_API_KEY (preferred) or ANTHROPIC_API_KEY, "
+            f"or write the key to {api_key_path()} (chmod 600)."
         )
     return anthropic.Anthropic(api_key=key)
 
