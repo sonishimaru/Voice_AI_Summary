@@ -103,10 +103,14 @@ private struct MenuBarContent: View {
 
     @ViewBuilder
     private var pauseResumeButton: some View {
-        if controller.state == .recording {
+        switch controller.state {
+        case .recording:
             Button("Pause") { controller.pause() }
-        } else {
+        case .paused:
             Button("Resume") { controller.resume() }
+        case .stopped:
+            // `resume()` only acts on a paused controller, so a stopped one needs `start()`.
+            Button("Start") { controller.start() }
         }
     }
 

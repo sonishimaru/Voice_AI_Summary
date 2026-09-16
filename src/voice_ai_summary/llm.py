@@ -75,8 +75,17 @@ def spent_today(path: Path) -> float:
         rec = json.loads(line)
         at = datetime.strptime(rec["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
         if at.astimezone().date() == today:
-            total += price_record(rec) or 0.0
+            total += price_record(rec)
     return total
+
+
+def check_budget() -> None:
+    """Raise `BudgetExceeded` when today's recorded spend is already over the cap.
+
+    Called before each request, so a response that has been paid for is always
+    returned and the run stops on the *next* call instead of discarding work.
+    """
+    _enforce_budget()
 
 
 def _enforce_budget() -> None:
@@ -107,16 +116,16 @@ def track_usage(purpose: str, model: str, response: Any) -> None:
     _usage_path.parent.mkdir(parents=True, exist_ok=True)
     with _usage_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    # Checked after every call so a runaway loop stops within one call of the cap.
-    _enforce_budget()
 
 
-def price_record(rec: dict) -> float | None:
-    """Estimated USD for one record, or None when the model is not in the price table."""
-    prices = PRICES.get(rec["model"])
-    if prices is None:
-        return None
-    inp, out = prices
+# Used for models missing from PRICES: over-estimating keeps `daily_budget_usd` a real
+# ceiling instead of silently disabling it on an unrecognised model name.
+_FALLBACK_PRICE = max(PRICES.values())
+
+
+def price_record(rec: dict) -> float:
+    """Estimated USD for one record; unknown models are priced at the top of the table."""
+    inp, out = PRICES.get(rec["model"], _FALLBACK_PRICE)
     return (
         rec["input"] * inp
         + rec["cache_write"] * inp * 1.25
@@ -143,7 +152,7 @@ def summarize_usage(path: Path, *, days: int = 30) -> list[dict]:
         t["calls"] += 1
         for k in ("input", "output", "cache_write", "cache_read"):
             t[k] += rec.get(k, 0)
-        t["usd"] += price_record(rec) or 0.0
+        t["usd"] += price_record(rec)
     return [
         {"purpose": p, "model": m, **v}
         for (p, m), v in sorted(totals.items(), key=lambda kv: -kv[1]["usd"])

@@ -24,7 +24,7 @@ import pydantic
 from pydantic import BaseModel, Field
 
 from .config import Config
-from .llm import track_usage
+from .llm import check_budget, track_usage
 
 log = logging.getLogger(__name__)
 
@@ -265,6 +265,7 @@ def _call_extract(
     """
     template = _EXTRACT_SYSTEM if own_messages else _EXTRACT_SYSTEM_CHANNELS
     system = template.replace("{existing}", existing_block or "(なし)")
+    check_budget()
     try:
         response = client.messages.parse(
             model=model,

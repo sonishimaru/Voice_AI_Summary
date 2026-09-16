@@ -27,6 +27,20 @@ def _root(
 
 
 # Subcommand modules register themselves on `app` at import time.
+def main() -> None:
+    """Console entry point: report the tool's own errors as messages, not tracebacks."""
+    from .llm import BudgetExceeded
+
+    try:
+        app()
+    except BudgetExceeded as exc:
+        typer.secho(f"stopped: {exc}", fg=typer.colors.RED, err=True)
+        raise SystemExit(1) from None
+    except RuntimeError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise SystemExit(1) from None
+
+
 from . import (  # noqa: E402
     commands,  # noqa: F401
     commands_deliver,  # noqa: F401

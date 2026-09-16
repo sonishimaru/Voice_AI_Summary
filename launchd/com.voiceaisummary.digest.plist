@@ -1,9 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
+<!-- Example only. `vas install-launchd` generates these with your real paths,
+     binary location and environment; launchd does NOT expand `~`. -->
 <dict>
 	<key>EnvironmentVariables</key>
-	<dict/>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin</string>
+		<key>VAS_ANTHROPIC_API_KEY</key>
+		<string>sk-ant-...</string>
+		<key>VAS_SLACK_WEBHOOK_URL</key>
+		<string>https://hooks.slack.com/services/...</string>
+	</dict>
 	<key>Label</key>
 	<string>com.voiceaisummary.digest</string>
 	<key>ProgramArguments</key>
@@ -15,9 +24,9 @@
 	<key>RunAtLoad</key>
 	<false/>
 	<key>StandardErrorPath</key>
-	<string>~/Library/Logs/VoiceAISummary/com.voiceaisummary.digest.err</string>
+	<string>/Users/YOUR_USERNAME/Library/Logs/VoiceAISummary/com.voiceaisummary.digest.err</string>
 	<key>StandardOutPath</key>
-	<string>~/Library/Logs/VoiceAISummary/com.voiceaisummary.digest.log</string>
+	<string>/Users/YOUR_USERNAME/Library/Logs/VoiceAISummary/com.voiceaisummary.digest.log</string>
 	<key>StartCalendarInterval</key>
 	<dict>
 		<key>Hour</key>

@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from .config import Config
 from .db import transaction, utcnow_iso
 from .glossary import OutputTruncated, load_glossary
-from .llm import make_client, track_usage
+from .llm import check_budget, make_client, track_usage
 from .timeutil import fmt_hm, local_day_bounds
 
 log = logging.getLogger(__name__)
@@ -69,6 +69,7 @@ def _call_correct(
     user_content = f"文字起こし:\n{block}"
     if glossary_block:
         user_content += f"\n\n{glossary_block}"
+    check_budget()
     try:
         response = client.messages.parse(
             model=model,

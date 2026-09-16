@@ -46,9 +46,9 @@ def _merged_hotwords(cfg: Config, extra_hotwords: list[str]) -> list[str]:
     for word in (*cfg.asr.hotwords, *extra_hotwords):
         if not word or word in seen:
             continue
+        if size + len(word) + 1 > MAX_HOTWORD_CHARS:
+            continue  # skip this one; a single long term must not drop the whole glossary
         size += len(word) + 1
-        if size > MAX_HOTWORD_CHARS:
-            break
         seen.add(word)
         merged.append(word)
     return merged
