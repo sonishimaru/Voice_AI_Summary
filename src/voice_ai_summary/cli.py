@@ -45,6 +45,7 @@ from . import (  # noqa: E402
     commands,  # noqa: F401
     commands_deliver,  # noqa: F401
     commands_desktop,  # noqa: F401
+    commands_eval,  # noqa: F401
     commands_pipeline,  # noqa: F401
     commands_summary,  # noqa: F401
     commands_vocab,  # noqa: F401

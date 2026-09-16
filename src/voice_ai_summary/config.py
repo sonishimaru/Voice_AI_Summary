@@ -47,8 +47,18 @@ class AsrConfig(BaseModel):
     language: str = "ja"
     beam_size: int = 5
     # Domain vocabulary (names, products, jargon) biases decoding toward these spellings.
+    # Measured on kotoba-whisper-v2.0: every term added suppresses output, and past ~15
+    # terms the model returns nothing at all. Keep this list very short, and see
+    # `use_glossary_hotwords` before feeding it the whole glossary.
     hotwords: list[str] = Field(default_factory=list)
+    # Feed the personal glossary to the decoder as hotwords. Off because it silences this
+    # model; proper nouns are fixed by the Claude correction pass instead, which reads the
+    # whole glossary with no length limit.
+    use_glossary_hotwords: bool = False
     initial_prompt: str = ""
+    # Level the chunk before decoding: "none" | "peak" | "rms". The mic track records far
+    # quieter than the system track, and Whisper transcribes quiet speech worse.
+    normalize: str = "none"
 
     @property
     def resolved_model(self) -> str:
@@ -67,6 +77,9 @@ class AsrConfig(BaseModel):
 
 class VadConfig(BaseModel):
     threshold: float = 0.5
+    # Per-source overrides, e.g. {"mac_mic": 0.6, "mac_system": 0.4}: the two tracks sit at
+    # very different levels, so one threshold over-triggers on the quiet one.
+    threshold_by_source: dict[str, float] = Field(default_factory=dict)
     min_speech_ms: int = 250
     min_silence_ms: int = 500
     # Neighbouring speech regions closer than this are transcribed as one chunk so the
@@ -74,6 +87,11 @@ class VadConfig(BaseModel):
     merge_gap_ms: int = 2000
     max_speech_s: float = 30.0
     pad_ms: int = 200
+
+    def for_source(self, source: str) -> VadConfig:
+        """This config with `threshold` replaced by the override for `source`, if any."""
+        override = self.threshold_by_source.get(source)
+        return self if override is None else self.model_copy(update={"threshold": override})
 
 
 class EpisodesConfig(BaseModel):
@@ -93,6 +111,9 @@ class CorrectConfig(BaseModel):
     model: str = "claude-haiku-4-5"
     # Characters per correction call; longer days are split into consecutive batches.
     batch_chars: int = 6000
+    # Utterances the decoder was this unsure of are flagged for the model to look at
+    # harder. Whisper's avg_logprob runs about -0.1 (confident) to -1.0 (guessing).
+    low_confidence_logprob: float = -0.6
 
 
 class DeliverConfig(BaseModel):

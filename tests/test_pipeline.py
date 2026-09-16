@@ -79,6 +79,38 @@ def test_process_recording_and_search(
     assert short_results[0]["text"] == "今日は会議があります"
 
 
+def test_a_second_process_can_write_while_transcription_runs(
+    vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decoding a recording takes minutes. Holding the write lock across it locks out the
+    worker running alongside, which then dies with "database is locked"."""
+    from voice_ai_summary.db import connect
+
+    cfg, conn = vas
+    src = cfg.paths.inbox / "mac_system_dev1_20260915T000000Z.wav"
+    _write_wav(src)
+    rec_id = ingest_file(conn, cfg, src)
+    monkeypatch.setattr(
+        vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, 0.9)]
+    )
+
+    writes_from_other_process: list[str] = []
+
+    class _WritingBackend(FakeBackend):
+        def transcribe(self, samples, *, language):
+            other = connect(cfg.paths.db_path)
+            try:
+                other.execute("UPDATE recordings SET device_id = 'other' WHERE id = ?", (rec_id,))
+                other.commit()
+                writes_from_other_process.append("ok")
+            finally:
+                other.close()
+            return super().transcribe(samples, language=language)
+
+    assert process_recording(conn, cfg, rec_id, _WritingBackend(["文字起こし"])) == 1
+    assert writes_from_other_process == ["ok"]
+
+
 def test_process_recording_skips_empty_utterances(
     vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -166,6 +198,18 @@ def test_reset_recordings_clears_transcript_and_requeues(vas, monkeypatch) -> No
     assert conn.execute("SELECT COUNT(*) AS n FROM segments").fetchone()["n"] == 0
     assert process_pending(conn, cfg, FakeBackend(["二回目"])) == 1
     assert conn.execute("SELECT text FROM utterances").fetchone()["text"] == "二回目"
+
+
+def test_vad_threshold_can_be_overridden_per_source() -> None:
+    """The mic track records far quieter than the system track; one threshold
+    over-triggers on the quiet one and under-triggers on the loud one."""
+    from voice_ai_summary.config import VadConfig
+
+    cfg = VadConfig(threshold=0.5, threshold_by_source={"mac_mic": 0.7})
+
+    assert cfg.for_source("mac_mic").threshold == 0.7
+    assert cfg.for_source("mac_system").threshold == 0.5
+    assert cfg.for_source("mac_system") is cfg
 
 
 def test_search_day_uses_local_dates_and_tolerates_fts_syntax(vas, monkeypatch) -> None:

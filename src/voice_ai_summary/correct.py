@@ -29,6 +29,8 @@ _CORRECT_SYSTEM = """あなたはユーザー本人の一日の音声ログの�
 入力はローカルの音声認識(ASR)で生成された、ある一日の発話を時系列に並べたものです。
 各行は "ID<タブ>HH:MM<タブ>[話者]<タブ>本文" の形式(タブ区切り)です。
 話者ラベルの意味: [me] はユーザー本人、[other] は相手、[unknown] は不明な話者です。
+話者ラベルの末尾に ? が付いた行([me?] など)は、音声認識自身が確信を持てなかった行です。
+誤りが含まれる可能性が高いので重点的に見てください(ただし確信が持てなければ直さないこと)。
 
 やること:
 - 前後の文脈と(付与されていれば)用語集を参考に、明らかなASRの誤り
@@ -96,12 +98,15 @@ def _call_correct(
     return response.parsed_output
 
 
-def _format_line(row: sqlite3.Row, tz: str) -> str:
-    return f"{row['id']}\t{fmt_hm(row['abs_start_utc'], tz)}\t[{row['speaker']}]\t{row['text']}"
+def _format_line(row: sqlite3.Row, tz: str, low_confidence_logprob: float) -> str:
+    logprob = row["avg_logprob"]
+    unsure = "?" if logprob is not None and logprob < low_confidence_logprob else ""
+    speaker = f"{row['speaker']}{unsure}"
+    return f"{row['id']}\t{fmt_hm(row['abs_start_utc'], tz)}\t[{speaker}]\t{row['text']}"
 
 
 def _batch_rows(
-    rows: list[sqlite3.Row], batch_chars: int, tz: str
+    rows: list[sqlite3.Row], batch_chars: int, tz: str, low_confidence_logprob: float = -0.6
 ) -> list[tuple[list[sqlite3.Row], str]]:
     """Group consecutive `rows` into batches whose rendered block is <= `batch_chars`."""
     batches: list[tuple[list[sqlite3.Row], str]] = []
@@ -109,7 +114,7 @@ def _batch_rows(
     current_lines: list[str] = []
     size = 0
     for row in rows:
-        line = _format_line(row, tz)
+        line = _format_line(row, tz, low_confidence_logprob)
         line_len = len(line) + 1
         if current_rows and size + line_len > batch_chars:
             batches.append((current_rows, "\n".join(current_lines)))
@@ -158,7 +163,7 @@ def correct_day(
     rows = conn.execute(
         f"""
         SELECT u.id AS id, u.abs_start_utc AS abs_start_utc, u.speaker AS speaker,
-               {text_expr} AS text, r.source AS source
+               {text_expr} AS text, u.avg_logprob AS avg_logprob, r.source AS source
         FROM utterances u
         JOIN recordings r ON r.id = u.recording_id
         WHERE u.abs_start_utc >= ? AND u.abs_start_utc < ?{corrected_clause}
@@ -171,7 +176,7 @@ def correct_day(
         return 0
 
     glossary_block = load_glossary(cfg).prompt_block()
-    batches = _batch_rows(rows, cfg.correct.batch_chars, tz)
+    batches = _batch_rows(rows, cfg.correct.batch_chars, tz, cfg.correct.low_confidence_logprob)
 
     if client is None:
         client = make_client(cfg)
@@ -201,7 +206,7 @@ def _correct_batch(
         mid = len(batch_rows) // 2
         total = 0
         for part in (batch_rows[:mid], batch_rows[mid:]):
-            [(rows, block)] = _batch_rows(part, 10**9, tz)
+            [(rows, block)] = _batch_rows(part, 10**9, tz, cfg.correct.low_confidence_logprob)
             total += _correct_batch(conn, cfg, client, rows, block, glossary_block, tz)
         return total
     fixes = {fix.id: fix.text for fix in result.fixes}

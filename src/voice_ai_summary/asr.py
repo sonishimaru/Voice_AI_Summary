@@ -6,9 +6,9 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-if TYPE_CHECKING:
-    import numpy as np
+import numpy as np
 
+if TYPE_CHECKING:
     from .config import Config
 
 
@@ -27,11 +27,16 @@ class ASRBackend(Protocol):
     def transcribe(self, samples16k: np.ndarray, *, language: str | None) -> list[Utterance]: ...
 
 
-# Whisper conditions on at most `max_length // 2 - 1` = 223 tokens of prompt and
-# faster-whisper silently truncates the rest, so a glossary of any size only reaches the
-# decoder as its first few dozen terms. Japanese encodes at a bit under one token per
-# character; cap the list by characters and keep it clear of that ceiling.
-MAX_HOTWORD_CHARS = 200
+# A vocabulary prompt costs transcription on kotoba-whisper-v2.0. Measured on three
+# 30-second chunks of real audio, utterances returned per chunk against prompt length:
+#
+#   0 terms (0 chars): 10 / 4 / 8      12 terms (60 chars): 8 / 1 / 1
+#   8 terms (35 chars): 7 / 2 / 8      16 terms (79 chars): 0 / 0 / 0
+#
+# It degrades from the first term and collapses to silence well before Whisper's own
+# 223-token prompt ceiling, through `hotwords` and `initial_prompt` alike. Cap hard at a
+# length the measurement showed to be survivable; `use_glossary_hotwords` stays off.
+MAX_HOTWORD_CHARS = 50
 
 
 def _merged_hotwords(cfg: Config, extra_hotwords: list[str]) -> list[str]:
@@ -52,6 +57,33 @@ def _merged_hotwords(cfg: Config, extra_hotwords: list[str]) -> list[str]:
         seen.add(word)
         merged.append(word)
     return merged
+
+
+# Speech sits around this RMS once levelled; the gain cap keeps a silent chunk from being
+# amplified into noise the decoder then hallucinates over.
+_TARGET_RMS = 0.05
+_TARGET_PEAK = 0.95
+_MAX_GAIN = 20.0
+
+
+def normalize_samples(samples: np.ndarray, mode: str) -> np.ndarray:
+    """Scale a chunk to a workable level. `mode` is "none", "peak" or "rms"."""
+    if mode == "none" or len(samples) == 0:
+        return samples
+    if mode == "peak":
+        current = float(np.abs(samples).max())
+        target = _TARGET_PEAK
+    elif mode == "rms":
+        current = float(np.sqrt((samples.astype("float64") ** 2).mean()))
+        target = _TARGET_RMS
+    else:
+        raise ValueError(f"unknown [asr] normalize mode: {mode}")
+    if current <= 0:
+        return samples
+    gain = min(target / current, _MAX_GAIN)
+    if gain <= 1.0:
+        return samples
+    return np.clip(samples * gain, -1.0, 1.0).astype("float32")
 
 
 def _prompt_for(cfg: Config, hotwords: list[str]) -> str | None:
@@ -87,7 +119,7 @@ class FasterWhisperBackend:
         asr = self._cfg.asr
         hotwords = _merged_hotwords(self._cfg, self._extra_hotwords)
         segments, _info = model.transcribe(
-            samples16k,
+            normalize_samples(samples16k, asr.normalize),
             language=language,
             beam_size=asr.beam_size,
             vad_filter=False,
@@ -121,7 +153,7 @@ class MlxWhisperBackend:
         asr = self._cfg.asr
         hotwords = _merged_hotwords(self._cfg, self._extra_hotwords)
         result = mlx_whisper.transcribe(
-            samples16k,
+            normalize_samples(samples16k, asr.normalize),
             path_or_hf_repo=asr.resolved_model,
             language=language,
             initial_prompt=_prompt_for(self._cfg, hotwords),
@@ -172,7 +204,7 @@ def get_backend(cfg: Config) -> ASRBackend:
 
     from .glossary import load_glossary
 
-    extra_hotwords = load_glossary(cfg).hotwords()
+    extra_hotwords = load_glossary(cfg).hotwords() if cfg.asr.use_glossary_hotwords else []
     if backend == "mlx":
         return MlxWhisperBackend(cfg, extra_hotwords=extra_hotwords)
     if backend == "faster-whisper":
