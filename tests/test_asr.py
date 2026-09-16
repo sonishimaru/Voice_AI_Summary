@@ -60,9 +60,9 @@ def test_mlx_backend_swaps_default_model(monkeypatch) -> None:
     assert get_backend(cfg).name == "mlx-whisper:mlx-community/whisper-large-v3"
 
 
-def test_get_backend_merges_glossary_hotwords(monkeypatch, tmp_path) -> None:
-    """`get_backend` loads the glossary once and passes its terms/aliases through as
-    `extra_hotwords`, which end up merged into the model's `hotwords`."""
+def test_get_backend_leaves_the_glossary_out_of_the_decoder(monkeypatch, tmp_path) -> None:
+    """A vocabulary prompt silences kotoba-whisper (see `MAX_HOTWORD_CHARS`), so the
+    glossary reaches the correction pass but not the decoder unless asked for."""
     monkeypatch.setenv("VAS_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("VAS_ASR_BACKEND", "faster-whisper")
 
@@ -78,8 +78,27 @@ def test_get_backend_merges_glossary_hotwords(monkeypatch, tmp_path) -> None:
     backend._model = model
     backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
 
-    assert model.kwargs["hotwords"] == "安田さん 西丸 にしまる"
+    assert model.kwargs["hotwords"] == "安田さん"
     assert model.kwargs["initial_prompt"] is None
+
+
+def test_get_backend_can_opt_into_glossary_hotwords(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("VAS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("VAS_ASR_BACKEND", "faster-whisper")
+
+    from voice_ai_summary.config import load_config
+    from voice_ai_summary.glossary import Glossary, Term, save_glossary
+
+    cfg = load_config()
+    cfg.asr.hotwords = ["安田さん"]
+    cfg.asr.use_glossary_hotwords = True
+    save_glossary(cfg, Glossary(terms=[Term(term="西丸", aliases=["にしまる"])]))
+
+    backend = get_backend(cfg)
+    backend._model = model = _FakeModel()
+    backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
+
+    assert model.kwargs["hotwords"] == "安田さん 西丸 にしまる"
 
 
 def test_hotwords_are_capped_to_what_the_decoder_will_read() -> None:

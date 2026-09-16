@@ -27,11 +27,16 @@ class ASRBackend(Protocol):
     def transcribe(self, samples16k: np.ndarray, *, language: str | None) -> list[Utterance]: ...
 
 
-# Whisper conditions on at most `max_length // 2 - 1` = 223 tokens of prompt and
-# faster-whisper silently truncates the rest, so a glossary of any size only reaches the
-# decoder as its first few dozen terms. Japanese encodes at a bit under one token per
-# character; cap the list by characters and keep it clear of that ceiling.
-MAX_HOTWORD_CHARS = 200
+# A vocabulary prompt costs transcription on kotoba-whisper-v2.0. Measured on three
+# 30-second chunks of real audio, utterances returned per chunk against prompt length:
+#
+#   0 terms (0 chars): 10 / 4 / 8      12 terms (60 chars): 8 / 1 / 1
+#   8 terms (35 chars): 7 / 2 / 8      16 terms (79 chars): 0 / 0 / 0
+#
+# It degrades from the first term and collapses to silence well before Whisper's own
+# 223-token prompt ceiling, through `hotwords` and `initial_prompt` alike. Cap hard at a
+# length the measurement showed to be survivable; `use_glossary_hotwords` stays off.
+MAX_HOTWORD_CHARS = 50
 
 
 def _merged_hotwords(cfg: Config, extra_hotwords: list[str]) -> list[str]:
@@ -172,7 +177,7 @@ def get_backend(cfg: Config) -> ASRBackend:
 
     from .glossary import load_glossary
 
-    extra_hotwords = load_glossary(cfg).hotwords()
+    extra_hotwords = load_glossary(cfg).hotwords() if cfg.asr.use_glossary_hotwords else []
     if backend == "mlx":
         return MlxWhisperBackend(cfg, extra_hotwords=extra_hotwords)
     if backend == "faster-whisper":

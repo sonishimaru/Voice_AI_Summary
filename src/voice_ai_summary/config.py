@@ -47,7 +47,14 @@ class AsrConfig(BaseModel):
     language: str = "ja"
     beam_size: int = 5
     # Domain vocabulary (names, products, jargon) biases decoding toward these spellings.
+    # Measured on kotoba-whisper-v2.0: every term added suppresses output, and past ~15
+    # terms the model returns nothing at all. Keep this list very short, and see
+    # `use_glossary_hotwords` before feeding it the whole glossary.
     hotwords: list[str] = Field(default_factory=list)
+    # Feed the personal glossary to the decoder as hotwords. Off because it silences this
+    # model; proper nouns are fixed by the Claude correction pass instead, which reads the
+    # whole glossary with no length limit.
+    use_glossary_hotwords: bool = False
     initial_prompt: str = ""
 
     @property
