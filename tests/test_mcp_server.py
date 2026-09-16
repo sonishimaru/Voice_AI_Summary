@@ -7,6 +7,8 @@ no MCP transport, no network, no Anthropic API calls.
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -793,3 +795,163 @@ class TestBackendCache:
 
         assert first is not second
         assert len(mcp_server._backend_cache) == 1, "the stale entry should not be kept"
+
+
+def _wait_for_job(job: mcp_server.Job, timeout: float = 2.0) -> None:
+    """Poll until `job` leaves the "running" state, asserting rather than hanging the
+    suite if a test's fake worker never finishes."""
+    deadline = time.monotonic() + timeout
+    while job.state == "running" and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert job.state != "running", f"job {job.id} did not finish within {timeout}s"
+
+
+class TestJobRegistry:
+    """Drives the background job registry (`_start_job`/`job_status`) directly with
+    fake worker functions - no real Claude API call, no sleep longer than a few
+    milliseconds, and every worker thread is joined via `_wait_for_job` with a timeout
+    so a bug here can never hang the suite."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_jobs(self):
+        mcp_server._jobs.clear()
+        yield
+        mcp_server._jobs.clear()
+
+    def test_job_runs_to_completion_and_status_reports_result(self) -> None:
+        def worker(job: mcp_server.Job) -> str:
+            return "# digest markdown\n"
+
+        job, started = mcp_server._start_job("test", "day-a", worker)
+        assert started is True
+        _wait_for_job(job)
+
+        result = mcp_server.job_status(job_id=job.id)
+        assert "done" in result
+        assert "digest markdown" in result
+
+    def test_failing_job_is_reported_as_failed_and_server_survives(self) -> None:
+        def worker(job: mcp_server.Job) -> str:
+            raise ValueError("boom")
+
+        job, _started = mcp_server._start_job("test", "day-b", worker)
+        _wait_for_job(job)
+
+        result = mcp_server.job_status(job_id=job.id)
+        assert "failed" in result
+        assert "boom" in result
+
+        # The exception must not have killed the thread silently or taken the
+        # registry down - it still answers normally afterwards.
+        assert mcp_server.job_status() is not None
+
+    def test_second_start_for_same_key_returns_first_job_without_starting_a_second(
+        self,
+    ) -> None:
+        release = threading.Event()
+        calls: list[int] = []
+
+        def worker(job: mcp_server.Job) -> str:
+            calls.append(1)
+            release.wait(timeout=5)
+            return "done"
+
+        job1, started1 = mcp_server._start_job("rebuild_day", "2026-09-16", worker)
+        job2, started2 = mcp_server._start_job("rebuild_day", "2026-09-16", worker)
+
+        assert started1 is True
+        assert started2 is False
+        assert job2 is job1
+
+        release.set()
+        _wait_for_job(job1)
+        assert len(calls) == 1, "starting the second job must not have run the worker"
+
+    def test_job_status_unknown_id_says_so(self) -> None:
+        result = mcp_server.job_status(job_id="does-not-exist")
+        assert "No job" in result
+
+    def test_job_status_with_no_id_lists_recent_jobs_newest_first(self) -> None:
+        def worker(job: mcp_server.Job) -> str:
+            return "ok"
+
+        job_old, _ = mcp_server._start_job("test", "old", worker)
+        _wait_for_job(job_old)
+        time.sleep(0.01)
+        job_new, _ = mcp_server._start_job("test", "new", worker)
+        _wait_for_job(job_new)
+
+        result = mcp_server.job_status()
+        assert result.index(job_new.id) < result.index(job_old.id)
+
+
+class TestRebuildDayAsync:
+    """`rebuild_day` itself, wired through the background job registry."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_jobs(self):
+        mcp_server._jobs.clear()
+        yield
+        mcp_server._jobs.clear()
+
+    def test_returns_promptly_before_the_worker_finishes(
+        self, vas: tuple[Config, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: this must not go back to running the rebuild inline - that is
+        exactly what let a Claude Desktop tool call blow through its ~60s timeout
+        while the paid Claude API work kept going invisibly."""
+        release = threading.Event()
+
+        def _blocked_run_day(conn, cfg, day, *, client=None, force=False):
+            release.wait(timeout=5)
+            return "# blocked digest\n"
+
+        monkeypatch.setattr("voice_ai_summary.summarize.run_day", _blocked_run_day)
+
+        start = time.monotonic()
+        result = mcp_server.rebuild_day(day="2026-09-16")
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 1.0, "rebuild_day must return immediately, not wait on the worker"
+        assert "2026-09-16" in result
+        assert "Started job" in result
+
+        job = next(
+            j
+            for j in mcp_server._jobs.values()
+            if j.kind == "rebuild_day" and j.key == "2026-09-16"
+        )
+        release.set()
+        _wait_for_job(job)
+
+        status = mcp_server.job_status(job_id=job.id)
+        assert "done" in status
+        assert "blocked digest" in status
+
+    def test_second_call_for_a_running_day_does_not_start_a_second_job(
+        self, vas: tuple[Config, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        release = threading.Event()
+        calls: list[int] = []
+
+        def _blocked_run_day(conn, cfg, day, *, client=None, force=False):
+            calls.append(1)
+            release.wait(timeout=5)
+            return "digest"
+
+        monkeypatch.setattr("voice_ai_summary.summarize.run_day", _blocked_run_day)
+
+        first = mcp_server.rebuild_day(day="2026-09-16")
+        second = mcp_server.rebuild_day(day="2026-09-16")
+
+        assert "already running" in second
+
+        release.set()
+        job = next(
+            j
+            for j in mcp_server._jobs.values()
+            if j.kind == "rebuild_day" and j.key == "2026-09-16"
+        )
+        _wait_for_job(job)
+        assert len(calls) == 1, "a second tool call must not start a second paid job"
+        assert "Started job" in first
