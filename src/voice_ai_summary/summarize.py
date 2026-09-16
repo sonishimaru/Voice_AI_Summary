@@ -329,6 +329,26 @@ def _no_data_markdown(day: str) -> str:
     return f"# {day} の記録\n\n記録なし\n"
 
 
+def is_no_data_digest(markdown: str) -> bool:
+    """True iff `markdown` is exactly the placeholder `_no_data_markdown` produces for
+    some day (heading, blank line, "記録なし", trailing newline) - not merely a digest
+    that happens to mention the phrase somewhere.
+
+    Shared between `run_day` (which must never let this placeholder clobber a real,
+    already-stored digest) and `deliver.deliver_digest` (which must never send this
+    placeholder anywhere, especially not to the repo channel, where it would overwrite
+    a good mirrored file) so the "no data" shape is defined in exactly one place.
+    """
+    lines = markdown.splitlines()
+    return (
+        len(lines) == 3
+        and lines[0].startswith("# ")
+        and lines[0].endswith(" の記録")
+        and lines[1] == ""
+        and lines[2] == "記録なし"
+    )
+
+
 def _content_key(text: str) -> str:
     """Stable cache key for summaries derived from `text`."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
@@ -353,6 +373,11 @@ def run_day(
 
     Episode/day summaries already stored under `PROMPT_VERSION` are reused unless
     `force` is set. A day with no utterances never touches the API.
+
+    The `summaries` table is the source of truth for a day's digest; `<digests>/{day}.md`
+    is only a mirror of it, written for other tools (repo delivery, `vas show`) to read
+    without opening the DB. When the two disagree - the row is there but the file is
+    missing or empty - the file is rewritten from the row, never the other way round.
     """
     tz = cfg.summarize.timezone
 
@@ -376,6 +401,48 @@ def run_day(
     digest_path = cfg.paths.digests / f"{day}.md"
 
     if not episode_ids:
+        # THE INVARIANT: having nothing to say must never destroy what was already said.
+        #
+        # `build_episodes` returning no episodes does not mean the day is empty - it can
+        # also mean a run landed at a bad moment (e.g. a launchd `bootstrap` replaying a
+        # missed run while the day's transcript was still mid-correction and had zero
+        # episodes yet). Writing the "記録なし" placeholder in that situation overwrote a
+        # real 1,778-byte digest in production, in both the `summaries` row and the
+        # mirrored file, and that placeholder then propagated onward as if it were the
+        # day's truth. So before writing the placeholder, check whether a real digest
+        # already exists for this day - in the DB (source of truth) or, failing that, on
+        # disk (its mirror) - and if so, keep it untouched: return it as-is, write
+        # nothing, upsert nothing.
+        #
+        # `force=True` means "recompute the summary", never "it's fine to demolish an
+        # existing digest with a placeholder" - so `force` is deliberately not consulted
+        # anywhere in this branch and cannot bypass the guard. A day that has genuinely
+        # gone empty and needs resetting is the `drop`/rebuild path's job, not this one's.
+        day_row = conn.execute(
+            "SELECT markdown FROM summaries WHERE scope='day' AND scope_key=? AND prompt_version=?",
+            (day, PROMPT_VERSION),
+        ).fetchone()
+        stored_markdown = day_row["markdown"] if day_row is not None else None
+
+        file_markdown = None
+        if digest_path.is_file():
+            text = digest_path.read_text(encoding="utf-8")
+            if text.strip():
+                file_markdown = text
+
+        if stored_markdown:
+            # The DB is the source of truth; restore the file mirror if it's missing,
+            # empty, or otherwise out of sync with it - never the other way round.
+            if file_markdown != stored_markdown:
+                digest_path.write_text(stored_markdown, encoding="utf-8")
+            return stored_markdown
+
+        if file_markdown:
+            # No DB row under this prompt version, but a real digest is sitting on disk
+            # (e.g. written under an older prompt version) - still never overwrite it.
+            return file_markdown
+
+        # Genuinely nothing stored anywhere: this really is a "no data" day.
         markdown = _no_data_markdown(day)
         _upsert_summary(
             conn, scope="day", scope_key=day, model="none", json_str="{}", markdown=markdown
