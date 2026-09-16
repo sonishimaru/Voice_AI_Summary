@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import wave
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from voice_ai_summary import vad as vad_module
 from voice_ai_summary.asr import FakeBackend
 from voice_ai_summary.config import Config
+from voice_ai_summary.db import utcnow_iso
 from voice_ai_summary.ingest import ingest_file
 from voice_ai_summary.pipeline import process_recording, speaker_for_source
 from voice_ai_summary.search import search
@@ -137,12 +139,20 @@ def test_process_recording_sets_error_on_failure(vas: tuple[Config, object]) -> 
     )
     conn.commit()
 
+    # Simulate a live claim on the row, as `process_pending` would leave one while this
+    # call is decoding it - a failure must clear it just like a success does.
+    conn.execute("UPDATE recordings SET claimed_at = ? WHERE id = ?", (utcnow_iso(), rec_id))
+    conn.commit()
+
     backend = FakeBackend(["x"])
     with pytest.raises(FileNotFoundError):
         process_recording(conn, cfg, rec_id, backend)
 
-    row = conn.execute("SELECT error FROM recordings WHERE id = ?", (rec_id,)).fetchone()
+    row = conn.execute(
+        "SELECT error, claimed_at FROM recordings WHERE id = ?", (rec_id,)
+    ).fetchone()
     assert row["error"]
+    assert row["claimed_at"] is None
 
 
 def test_retry_failed_renames_part_and_reprocesses(vas, monkeypatch) -> None:
@@ -162,17 +172,22 @@ def test_retry_failed_renames_part_and_reprocesses(vas, monkeypatch) -> None:
     part = stored.with_name(stored.name + ".part")
     stored.rename(part)
     conn.execute(
-        "UPDATE recordings SET error = 'boom', storage_path = ? WHERE id = ?",
-        (str(part.relative_to(cfg.paths.store)), rec_id),
+        # claimed_at set too: simulates a worker that had claimed the row and was killed
+        # (e.g. `launchctl kickstart -k`) before it got to record the failure.
+        "UPDATE recordings SET error = 'boom', claimed_at = ?, storage_path = ? WHERE id = ?",
+        (utcnow_iso(), str(part.relative_to(cfg.paths.store)), rec_id),
     )
     conn.commit()
 
     assert retry_failed(conn, cfg) == [rec_id]
     assert stored.exists() and not part.exists()
     row = conn.execute(
-        "SELECT error, processed_at FROM recordings WHERE id = ?", (rec_id,)
+        "SELECT error, processed_at, claimed_at FROM recordings WHERE id = ?", (rec_id,)
     ).fetchone()
     assert row["error"] is None and row["processed_at"] is None
+    # Otherwise the retried recording stays invisible to `process_pending` until the
+    # stale-claim timeout expires, even though it is pending again right now.
+    assert row["claimed_at"] is None
 
     monkeypatch.setattr(
         vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, None)]
@@ -229,10 +244,21 @@ def test_reset_recordings_clears_transcript_and_requeues(vas, monkeypatch) -> No
         vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, None)]
     )
     process_pending(conn, cfg, FakeBackend(["一回目"]))
+    # A stale claim left over from some earlier, unrelated run - reset_recordings must
+    # clear this too, or the recording stays invisible to process_pending below until
+    # the stale-claim timeout expires.
+    conn.execute("UPDATE recordings SET claimed_at = ? WHERE id = ?", (utcnow_iso(), rec_id))
+    conn.commit()
 
     assert reset_recordings(conn, [rec_id]) == 1
     assert conn.execute("SELECT COUNT(*) AS n FROM utterances").fetchone()["n"] == 0
     assert conn.execute("SELECT COUNT(*) AS n FROM segments").fetchone()["n"] == 0
+    assert (
+        conn.execute("SELECT claimed_at FROM recordings WHERE id = ?", (rec_id,)).fetchone()[
+            "claimed_at"
+        ]
+        is None
+    )
     assert process_pending(conn, cfg, FakeBackend(["二回目"])) == 1
     assert conn.execute("SELECT text FROM utterances").fetchone()["text"] == "二回目"
 
@@ -273,3 +299,101 @@ def test_search_day_uses_local_dates_and_tolerates_fts_syntax(vas, monkeypatch) 
     assert len(search(conn, "A-1", tz="Asia/Tokyo")) == 1  # would be a syntax error unquoted
     assert search(conn, '"foo', tz="Asia/Tokyo") == []
     assert fts_query('A-1 "b c"') == '"A-1" "b c"'
+
+
+def test_process_pending_claim_lets_only_one_caller_transcribe(
+    vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker and the `process_pending` MCP tool poll the same database and can call
+    `process_pending` at the same time. Without an atomic claim, both would `SELECT` the
+    same pending id and both spend the (multi-minute) decode on it. Assert on how many
+    times `transcribe` actually ran, not just on the resulting rows, so this proves the
+    duplicated work is gone rather than merely that the transcript looks right."""
+    from voice_ai_summary.db import connect
+    from voice_ai_summary.pipeline import process_pending
+
+    cfg, conn = vas
+    src = cfg.paths.inbox / "mac_system_dev1_20260915T000000Z.wav"
+    _write_wav(src)
+    ingest_file(conn, cfg, src)
+    monkeypatch.setattr(
+        vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, 0.9)]
+    )
+
+    calls: list[str] = []
+
+    class _CountingBackend(FakeBackend):
+        def __init__(self, tag: str) -> None:
+            super().__init__(["テスト"])
+            self._tag = tag
+
+        def transcribe(self, samples, *, language):
+            calls.append(self._tag)
+            return super().transcribe(samples, language=language)
+
+    other_conn = connect(cfg.paths.db_path)
+    try:
+
+        class _RacingBackend(_CountingBackend):
+            """Mid-decode, a second connection (the concurrent poller) tries to claim
+            and process the same still-pending recording - exactly the window the
+            atomic claim in `process_pending` is meant to close."""
+
+            def transcribe(self, samples, *, language):
+                second_caller_processed = process_pending(
+                    other_conn, cfg, _CountingBackend("second")
+                )
+                assert second_caller_processed == 0
+                return super().transcribe(samples, language=language)
+
+        processed = process_pending(conn, cfg, _RacingBackend("first"))
+    finally:
+        other_conn.close()
+
+    assert processed == 1
+    # "second" never appears: its claim lost the race, so it skipped the recording
+    # instead of decoding it a second time.
+    assert calls == ["first"]
+
+
+def test_process_pending_reclaims_a_stale_claim_but_not_a_fresh_one(
+    vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claim old enough to exceed `CLAIM_TIMEOUT_S` is treated as abandoned (e.g. a
+    worker killed mid-decode by `launchctl kickstart -k`) and reclaimed. A claim still
+    within the timeout is a live owner's, and `process_pending` must leave it alone."""
+    from voice_ai_summary.pipeline import CLAIM_TIMEOUT_S, process_pending
+
+    cfg, conn = vas
+    monkeypatch.setattr(
+        vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, None)]
+    )
+
+    stale_wav = cfg.paths.inbox / "mac_mic_dev1_20260915T010203Z.wav"
+    _write_wav(stale_wav, seconds=2)
+    stale_id = ingest_file(conn, cfg, stale_wav)
+    stale_claim = (datetime.now(UTC) - timedelta(seconds=CLAIM_TIMEOUT_S * 2)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    conn.execute("UPDATE recordings SET claimed_at = ? WHERE id = ?", (stale_claim, stale_id))
+
+    fresh_wav = cfg.paths.inbox / "mac_mic_dev1_20260915T020304Z.wav"
+    _write_wav(fresh_wav, seconds=3)  # different length -> different sha256, distinct row
+    fresh_id = ingest_file(conn, cfg, fresh_wav)
+    fresh_claim = utcnow_iso()
+    conn.execute("UPDATE recordings SET claimed_at = ? WHERE id = ?", (fresh_claim, fresh_id))
+    conn.commit()
+
+    assert process_pending(conn, cfg, FakeBackend(["再開"])) == 1
+
+    stale_row = conn.execute(
+        "SELECT processed_at, claimed_at FROM recordings WHERE id = ?", (stale_id,)
+    ).fetchone()
+    assert stale_row["processed_at"] is not None  # reclaimed and processed
+    assert stale_row["claimed_at"] is None  # cleared on success
+
+    fresh_row = conn.execute(
+        "SELECT processed_at, claimed_at FROM recordings WHERE id = ?", (fresh_id,)
+    ).fetchone()
+    assert fresh_row["processed_at"] is None  # left pending: someone else owns this claim
+    assert fresh_row["claimed_at"] == fresh_claim  # untouched
