@@ -7,6 +7,7 @@ import sqlite3
 from ..config import Config
 from ..db import utcnow_iso
 from .email import send_email
+from .repo import publish_to_repo
 from .slack import send_slack
 
 
@@ -42,6 +43,8 @@ def deliver_digest(
             to_deliver.append("slack")
         if cfg.deliver.email:
             to_deliver.append("email")
+        if cfg.deliver.repo:
+            to_deliver.append("repo")
 
     for channel in to_deliver:
         # Check if already delivered
@@ -57,10 +60,13 @@ def deliver_digest(
 
         # Attempt delivery
         try:
+            detail: str | None = None
             if channel == "slack":
                 _deliver_slack(cfg, markdown)
             elif channel == "email":
                 _deliver_email(cfg, markdown)
+            elif channel == "repo":
+                detail = _deliver_repo(cfg, day, markdown)
             else:
                 results[channel] = f"error: unknown channel {channel}"
                 continue
@@ -69,7 +75,7 @@ def deliver_digest(
             conn.execute(
                 "INSERT INTO deliveries (scope_key, channel, sent_at, status, detail) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (day, channel, utcnow_iso(), "ok", None),
+                (day, channel, utcnow_iso(), "ok", detail),
             )
             results[channel] = "ok"
         except Exception as e:
@@ -110,3 +116,8 @@ def _deliver_email(cfg: Config, markdown: str) -> None:
 
     subject = "Daily Summary"  # Subject line for emails
     send_email(cfg.deliver, password, subject, markdown)
+
+
+def _deliver_repo(cfg: Config, day: str, markdown: str) -> str:
+    """Commit and push to the digest repo. Returns the committed relative path."""
+    return publish_to_repo(cfg.deliver, day, markdown)

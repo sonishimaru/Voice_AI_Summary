@@ -21,7 +21,9 @@ def digest(
     ),
     force: bool = typer.Option(False, "--force", help="Resend even if already delivered"),  # noqa: B008
     channel: list[str] | None = typer.Option(  # noqa: B008
-        None, "--channel", help="Specific channel(s) to deliver to (can repeat)"
+        None,
+        "--channel",
+        help="Specific channel(s) to deliver to: slack, email, repo (can repeat)",
     ),
 ) -> None:
     """Generate or deliver a daily summary digest.
@@ -34,6 +36,7 @@ def digest(
         vas digest --deliver
         vas digest --day 2026-09-14
         vas digest --deliver --channel slack --channel email
+        vas digest --deliver --channel repo
     """
     cfg = load_config()
     cfg.ensure_dirs()
@@ -59,9 +62,9 @@ def digest(
 
         if not channel:
             # No specific channels requested; use enabled ones from config
-            if not cfg.deliver.slack and not cfg.deliver.email:
+            if not cfg.deliver.slack and not cfg.deliver.email and not cfg.deliver.repo:
                 typer.echo("No delivery channels enabled in config.")
-                typer.echo("Set [deliver] slack=true or email=true in config.toml,")
+                typer.echo("Set [deliver] slack=true, email=true, or repo=true in config.toml,")
                 typer.echo("and provide secrets: VAS_SLACK_WEBHOOK_URL, VAS_SMTP_PASSWORD")
                 raise typer.Exit(1)
 

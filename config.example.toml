@@ -67,6 +67,16 @@ email_to = ""
 smtp_host = "smtp.gmail.com"
 smtp_port = 587
 smtp_user = ""
+# Commits the daily digest to a local git checkout and pushes, so a Claude session
+# (which can read GitHub repos but not this Mac) can read it. No secret needed beyond
+# whatever git already uses to push (SSH key / credential helper) from repo_path.
+# The target repo MUST be private: the digest contains other people's speech and
+# client names, not just your own.
+repo = false
+repo_path = ""          # e.g. "~/voice-digests", a local clone of a private repo
+repo_subdir = "digests" # written as <repo_path>/<repo_subdir>/<day>.md
+repo_branch = ""        # empty: use whatever branch is currently checked out
+repo_remote = "origin"
 
 [schedule]
 digest_hour = 22          # local time for the daily digest (launchd)

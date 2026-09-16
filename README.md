@@ -86,6 +86,21 @@ vas ingest ~/Downloads/zoom_recording.m4a   # 手持ちの録音を取り込む�
 2. `vas worker --once` → `vas status` で `recordings` が増え、`vas search <喋った単語>` でヒットする。
 3. `vas digest --deliver` で Slack / メールに日本語サマリが届く。
 
+## Claude に読ませる（Git リポジトリ配信）
+
+Slack / メールに加えて、日次サマリを **プライベートな git リポジトリ**にコミット & push する配信方法があります。Claude はこの Mac に直接アクセスできませんが、GitHub リポジトリは読めるので、そこ経由で digest を Claude session に渡せます。
+
+1. GitHub などでプライベートリポジトリを作成し、この Mac にクローンする（例: `~/voice-digests`）。
+2. `~/.config/voice-ai-summary/config.toml` に設定:
+   ```toml
+   [deliver]
+   repo = true
+   repo_path = "~/voice-digests"
+   ```
+3. `vas digest --deliver`（または `--channel repo`）を実行すると、`digests/YYYY-MM-DD.md` として書き込み、コミットして push されます。同じ日を再実行しても内容が変わらなければ再コミットはされません。
+
+digest には他の参加者の発言や取引先名も含まれるため、リポジトリは必ず **プライベート**にしてください。
+
 ## API 費用の確認
 
 vas が行った Claude API 呼び出しはすべて `<data_dir>/usage.jsonl` に記録され、`vas usage` で用途・モデル別のトークン数と概算費用を確認できます。

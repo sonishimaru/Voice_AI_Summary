@@ -103,6 +103,12 @@ class DeliverConfig(BaseModel):
     smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 587
     smtp_user: str = ""
+    repo: bool = False
+    # Local clone of a *private* repo; digests contain other people's speech and client names.
+    repo_path: str = ""
+    repo_subdir: str = "digests"
+    repo_branch: str = ""  # empty: use whatever branch is currently checked out
+    repo_remote: str = "origin"
 
 
 class ScheduleConfig(BaseModel):
