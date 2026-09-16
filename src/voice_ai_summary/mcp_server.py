@@ -37,8 +37,14 @@ server = MCPServer(
         "locally transcribes Japanese speech and uses Claude to produce daily digests. "
         "Use `daily_summary`/`list_days` to read what has already been summarized, "
         "`search_transcript`/`transcript` to look at the raw local transcript, "
+        '`recent` to see the last few minutes of transcript ("what was just said") - '
+        "note this can lag the live conversation by several minutes because of file "
+        "rotation, and the tool's header says by how much, "
         "`rebuild_day` to (re)run summarization for a day (this calls the Claude API and "
         "costs money), `status`/`api_usage` to check pipeline health and spend, "
+        "`throughput` to check whether local transcription is running faster or slower "
+        "than realtime (e.g. after switching ASR backend) and see the pending backlog's "
+        "estimated time to clear, "
         "`list_vocabulary`/`add_vocabulary` to manage the personal glossary, "
         "`retry_failed` to re-queue recordings that failed to transcribe and "
         "`process_pending` to actually transcribe pending recordings by hand (local, "
@@ -229,6 +235,61 @@ def transcript(day: str = "", limit: int = 800) -> str:
 
 
 @_tool_safe
+def recent(minutes: int = 30, limit: int = 200) -> str:
+    """Return the transcript from the last `minutes` minutes, oldest first - this is
+    the tool that answers "what was I just talking about" for a live conversation.
+
+    Local, free, read-only - never calls the Claude API. Lines are formatted exactly
+    like `transcript`: `HH:MM [me|other|unknown] text` in local time. The header line
+    reports the window covered and, separately, how far behind *right now* the newest
+    utterance in the database is: with 15-minute file rotation and local ASR decode
+    time on top, the freshest transcript can lag the live conversation by several
+    minutes even when everything is healthy, and that lag must not be mistaken for
+    "nothing was said". `limit` caps the number of utterances returned (default 200).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from .config import load_config
+    from .db import connect
+
+    cfg = load_config()
+    cfg.ensure_dirs()
+    conn = connect(cfg.paths.db_path)
+    tz = cfg.summarize.timezone
+
+    now = datetime.now(UTC)
+    cutoff = (now - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    rows = conn.execute(
+        "SELECT abs_start_utc, speaker, text FROM utterances"
+        " WHERE abs_start_utc >= ?"
+        " ORDER BY abs_start_utc, t_start_ms",
+        (cutoff,),
+    ).fetchall()
+
+    latest = conn.execute("SELECT MAX(abs_start_utc) AS latest FROM utterances").fetchone()[
+        "latest"
+    ]
+    if latest is None:
+        lag_note = "no utterances recorded yet"
+    else:
+        latest_dt = datetime.strptime(latest, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        lag_min = (now - latest_dt).total_seconds() / 60
+        lag_note = f"newest utterance in the database is {lag_min:.1f} min old right now"
+
+    header = f"last {minutes} min ({len(rows)} utterance(s)); {lag_note}"
+    if not rows:
+        return f"{header}\nNo utterances in the last {minutes} minute(s)."
+
+    shown = rows[:limit]
+    lines = [header, ""]
+    lines.extend(_format_utterance_row(row, tz) for row in shown)
+    if len(rows) > limit:
+        lines.append(f"... truncated: showing {limit} of {len(rows)} utterances")
+    return "\n".join(lines)
+
+
+@_tool_safe
 def rebuild_day(day: str = "", force: bool = False) -> str:
     """Rebuild a local day's summary and return the resulting Markdown digest.
 
@@ -255,12 +316,15 @@ def rebuild_day(day: str = "", force: bool = False) -> str:
 @_tool_safe
 def status() -> str:
     """Show `vas` pipeline health: data directory, database path, ASR model, inbox
-    file count, recording counts (total, pending, and errored), and utterance count.
+    file count, recording counts (total, pending, and errored), utterance count, and
+    an estimate of how long the pending backlog will take to clear at recent decode
+    speed (see `throughput` for the full per-recording breakdown behind that estimate).
 
     Read-only and free - never touches the network.
     """
     from .config import load_config
     from .db import connect
+    from .pipeline import backlog_eta
 
     cfg = load_config()
     cfg.ensure_dirs()
@@ -286,6 +350,7 @@ def status() -> str:
             f"inbox files      : {inbox}",
             f"recordings       : {rec} (pending: {pending}, errored: {errored})",
             f"utterances       : {utt}",
+            backlog_eta(conn),
         ]
     )
 
@@ -317,6 +382,117 @@ def api_usage(days: int = 30) -> str:
         )
     lines.append(f"{'total':<10} {'':<20} {'':>5} {'':>9} {'':>8} {total:>8.3f}")
     lines.append("(estimate from list prices; only calls made by vas are counted)")
+    return "\n".join(lines)
+
+
+def _format_realtime_factor(factor: float) -> str:
+    """Render `audio_duration / processing_time` unambiguously.
+
+    A factor >= 1 is faster than realtime, rendered so it can never be misread as
+    "slower" (e.g. "2.50x faster than realtime", never a bare "2.50x"); below 1 is
+    slower than realtime, spelled out the same way.
+    """
+    if factor >= 1:
+        return f"{factor:.2f}x faster than realtime"
+    return f"{factor:.2f}x realtime, i.e. slower than realtime"
+
+
+def _throughput_verdict(factor: float) -> str:
+    """One-line plain-language verdict for an aggregate realtime factor."""
+    if factor >= 1:
+        return (
+            f"verdict: {_format_realtime_factor(factor)} - comfortably keeps up with "
+            "continuous recording, and can chew through a backlog while still recording."
+        )
+    return (
+        f"verdict: {_format_realtime_factor(factor)} - transcription cannot keep up with "
+        "continuous recording; any backlog will only grow until this improves."
+    )
+
+
+@_tool_safe
+def throughput(limit: int = 20) -> str:
+    """Report whether local ASR transcription is running faster or slower than
+    realtime, over the most recently processed recordings.
+
+    Local, free, read-only - reads only the `processing_ms`/`duration_ms` timing
+    already stored by `process_recording`; never runs ASR or touches the network. For
+    each of the last `limit` processed recordings (default 20) that have both timings
+    recorded, reports local start time, source, audio length, processing time, and the
+    realtime factor (audio duration / processing time - e.g. "2.50x faster than
+    realtime" means 2.5 times faster, never "2.5x slower"). Then reports an aggregate
+    realtime factor over the whole sample. When the sample spans more than one ASR
+    model (e.g. right after switching faster-whisper on CPU to mlx on the Apple GPU -
+    exactly the comparison this is for), the aggregate is broken out per model instead
+    of blended together, using the model name recorded on each recording's utterances.
+    Ends with a one-line verdict: faster than realtime (and by how much, meaning the
+    pipeline can also clear a backlog while it keeps recording) or slower (meaning any
+    backlog only grows). Says plainly when there is no timing data yet instead of
+    printing a number.
+    """
+    from .config import load_config
+    from .db import connect
+    from .timeutil import fmt_hm
+
+    cfg = load_config()
+    cfg.ensure_dirs()
+    conn = connect(cfg.paths.db_path)
+    tz = cfg.summarize.timezone
+
+    rows = conn.execute(
+        """
+        SELECT r.started_at_utc, r.source, r.duration_ms, r.processing_ms,
+               (SELECT u.asr_model FROM utterances u
+                WHERE u.recording_id = r.id AND u.asr_model IS NOT NULL LIMIT 1) AS asr_model
+        FROM recordings r
+        WHERE r.processing_ms IS NOT NULL AND r.duration_ms IS NOT NULL
+        ORDER BY r.processed_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    if not rows:
+        return (
+            "No timing data yet: no processed recording has both `processing_ms` and "
+            "`duration_ms` recorded. Call process_pending to transcribe at least one "
+            "recording, then check again."
+        )
+
+    lines: list[str] = []
+    by_model: dict[str, list[sqlite3.Row]] = {}
+    total_audio_ms = 0
+    total_proc_ms = 0
+    for row in rows:
+        audio_ms = row["duration_ms"]
+        proc_ms = row["processing_ms"]
+        total_audio_ms += audio_ms
+        total_proc_ms += proc_ms
+        model = row["asr_model"] or "unknown"
+        by_model.setdefault(model, []).append(row)
+        factor = audio_ms / proc_ms if proc_ms else 0.0
+        lines.append(
+            f"{fmt_hm(row['started_at_utc'], tz)} [{row['source']}] model={model} "
+            f"audio={audio_ms / 1000:.1f}s processing={proc_ms / 1000:.1f}s "
+            f"({_format_realtime_factor(factor)})"
+        )
+
+    lines.append("")
+    if len(by_model) > 1:
+        for model, model_rows in by_model.items():
+            m_audio_ms = sum(r["duration_ms"] for r in model_rows)
+            m_proc_ms = sum(r["processing_ms"] for r in model_rows)
+            m_factor = m_audio_ms / m_proc_ms if m_proc_ms else 0.0
+            lines.append(
+                f"{model}: {len(model_rows)} recording(s), "
+                f"{m_audio_ms / 1000:.1f}s of audio, {_format_realtime_factor(m_factor)}"
+            )
+
+    overall_factor = total_audio_ms / total_proc_ms if total_proc_ms else 0.0
+    lines.append(
+        f"overall ({len(rows)} recording(s), {total_audio_ms / 1000:.1f}s of audio): "
+        f"{_format_realtime_factor(overall_factor)}"
+    )
+    lines.append(_throughput_verdict(overall_factor))
     return "\n".join(lines)
 
 
@@ -424,6 +600,7 @@ def process_pending(limit: int = 3) -> str:
     """
     from .config import load_config
     from .db import connect
+    from .pipeline import backlog_eta
     from .pipeline import process_pending as run_process_pending
 
     cfg = load_config()
@@ -439,6 +616,7 @@ def process_pending(limit: int = 3) -> str:
     result = f"processed {processed} recording(s); {remaining} still pending."
     if remaining:
         result += " Call process_pending again (or with a larger limit) to keep clearing it."
+    result += "\n" + backlog_eta(conn)
     return result
 
 
@@ -938,9 +1116,11 @@ for _fn in (
     list_days,
     search_transcript,
     transcript,
+    recent,
     rebuild_day,
     status,
     api_usage,
+    throughput,
     list_vocabulary,
     add_vocabulary,
     retry_failed,

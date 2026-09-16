@@ -47,6 +47,9 @@ def status() -> None:
         f"speech, no text  : {silent}"
         + ("  <- ASR は無音でないのに何も返していません" if silent else "")
     )
+    from .pipeline import backlog_eta
+
+    typer.echo(backlog_eta(conn))
 
 
 @app.command()

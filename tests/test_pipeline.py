@@ -113,6 +113,51 @@ def test_a_second_process_can_write_while_transcription_runs(
     assert writes_from_other_process == ["ok"]
 
 
+def test_process_recording_records_processing_ms(
+    vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`processing_ms` is measured with `time.monotonic()` around VAD + the ASR decode
+    loop, and stored alongside `processed_at`."""
+    import numpy as np
+
+    import voice_ai_summary.pipeline as pipeline_module
+
+    cfg, conn = vas
+    src = cfg.paths.inbox / "mac_system_dev1_20260915T000000Z.wav"
+    _write_wav(src)
+    rec_id = ingest_file(conn, cfg, src)
+
+    # Avoid decoding real audio through the faster-whisper/PyAV stack here: that code
+    # path may itself call `time.monotonic()` internally, and this test's fake clock
+    # (below) is a global patch that must only see the two calls `process_recording`
+    # itself makes around VAD + the ASR loop.
+    monkeypatch.setattr(
+        pipeline_module, "load_audio_16k", lambda path: np.zeros(16000, dtype="float32")
+    )
+    monkeypatch.setattr(
+        vad_module, "detect_speech", lambda samples, cfg: [SpeechRegion(0, 1000, 0.9)]
+    )
+
+    # Fake clock: the first call pipeline.py makes (decode_start) returns 100.0, the
+    # second (right after the ASR loop) returns 107.5 -> elapsed 7.5s -> 7500ms,
+    # regardless of real wall time.
+    clock_values = [100.0, 107.5]
+
+    def _fake_monotonic() -> float:
+        return clock_values.pop(0) if clock_values else 107.5
+
+    monkeypatch.setattr(pipeline_module.time, "monotonic", _fake_monotonic)
+
+    backend = FakeBackend(["テスト"])
+    assert process_recording(conn, cfg, rec_id, backend) == 1
+
+    row = conn.execute(
+        "SELECT processing_ms, processed_at FROM recordings WHERE id = ?", (rec_id,)
+    ).fetchone()
+    assert row["processing_ms"] == 7500
+    assert row["processed_at"] is not None
+
+
 def test_process_recording_skips_empty_utterances(
     vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -397,3 +442,78 @@ def test_process_pending_reclaims_a_stale_claim_but_not_a_fresh_one(
     ).fetchone()
     assert fresh_row["processed_at"] is None  # left pending: someone else owns this claim
     assert fresh_row["claimed_at"] == fresh_claim  # untouched
+
+
+def _insert_recording_row(
+    conn,
+    *,
+    sha256: str,
+    duration_ms: int | None = None,
+    processing_ms: int | None = None,
+    processed_at: str | None = None,
+    error: str | None = None,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO recordings(source, started_at_utc, duration_ms, sha256, storage_path, "
+        "ingested_at, processed_at, error, processing_ms) VALUES "
+        "('mac_mic', '2026-09-15T00:00:00Z', ?, ?, 'x.wav', '2026-09-15T00:00:00Z', ?, ?, ?)",
+        (duration_ms, sha256, processed_at, error, processing_ms),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+class TestBacklogEta:
+    def test_no_pending_recordings(self, vas: tuple[Config, object]) -> None:
+        from voice_ai_summary.pipeline import backlog_eta
+
+        _cfg, conn = vas
+        assert backlog_eta(conn) == "backlog: none pending."
+
+    def test_no_timing_data_says_so_instead_of_a_number(self, vas: tuple[Config, object]) -> None:
+        from voice_ai_summary.pipeline import backlog_eta
+
+        _cfg, conn = vas
+        _insert_recording_row(conn, sha256="a" * 64)  # pending, no timing anywhere yet
+
+        result = backlog_eta(conn)
+        assert "1 recording(s) pending" in result
+        assert "no timing data yet" in result
+        # No factor or minute figure must be invented.
+        import re
+
+        assert not re.search(r"\d+\.\d+x", result)
+
+    def test_projects_from_recent_factor_and_average_duration(
+        self, vas: tuple[Config, object]
+    ) -> None:
+        from voice_ai_summary.pipeline import backlog_eta
+
+        _cfg, conn = vas
+        # Two already-processed recordings: 10 min of audio each, decoded in 5 min each
+        # -> average duration 600_000ms, realtime factor 2.0x.
+        _insert_recording_row(
+            conn,
+            sha256="a" * 64,
+            duration_ms=600_000,
+            processing_ms=300_000,
+            processed_at="2026-09-15T00:10:00Z",
+        )
+        _insert_recording_row(
+            conn,
+            sha256="b" * 64,
+            duration_ms=600_000,
+            processing_ms=300_000,
+            processed_at="2026-09-15T00:20:00Z",
+        )
+        # Three pending recordings, each ~10 min of audio once processed.
+        for i in range(3):
+            _insert_recording_row(conn, sha256=f"{i}pending".ljust(64, "0"))
+
+        result = backlog_eta(conn)
+        assert "3 recording(s) pending" in result
+        # Estimated audio: 3 * 10 min = 30 min.
+        assert "30.0 min" in result
+        # At 2.0x realtime, 30 min of audio takes ~15 min to decode.
+        assert "2.00x" in result
+        assert "15.0 min" in result

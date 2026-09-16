@@ -17,18 +17,31 @@ from voice_ai_summary.asr import FakeBackend
 from voice_ai_summary.config import Config
 from voice_ai_summary.summarize import PROMPT_VERSION
 
+_UNSET = object()
+
 
 def _insert_recording(
-    conn: sqlite3.Connection, *, source: str, started_at_utc: str, sha256: str
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    started_at_utc: str,
+    sha256: str,
+    duration_ms: int = 1000,
+    processing_ms: int | None = None,
+    processed_at: str | None = _UNSET,  # type: ignore[assignment]
 ) -> int:
+    """`processed_at` defaults to `started_at_utc` (an already-processed recording);
+    pass `processed_at=None` explicitly for a still-pending recording."""
+    if processed_at is _UNSET:
+        processed_at = started_at_utc
     cur = conn.execute(
         """
         INSERT INTO recordings(
             source, device_id, started_at_utc, tz_offset, duration_ms,
-            sha256, storage_path, original_name, ingested_at, processed_at
-        ) VALUES (?, 'dev1', ?, '+00:00', 1000, ?, 'store/x.wav', 'x.wav', ?, ?)
+            sha256, storage_path, original_name, ingested_at, processed_at, processing_ms
+        ) VALUES (?, 'dev1', ?, '+00:00', ?, ?, 'store/x.wav', 'x.wav', ?, ?, ?)
         """,
-        (source, started_at_utc, sha256, started_at_utc, started_at_utc),
+        (source, started_at_utc, duration_ms, sha256, started_at_utc, processed_at, processing_ms),
     )
     conn.commit()
     return cur.lastrowid
@@ -42,15 +55,16 @@ def _insert_utterance(
     t_start_ms: int = 0,
     speaker: str = "me",
     text: str = "テスト発話",
+    asr_model: str = "fake",
 ) -> int:
     cur = conn.execute(
         """
         INSERT INTO utterances(
             recording_id, t_start_ms, t_end_ms, abs_start_utc, text, lang,
             asr_model, avg_logprob, speaker
-        ) VALUES (?, ?, ?, ?, ?, 'ja', 'fake', -0.1, ?)
+        ) VALUES (?, ?, ?, ?, ?, 'ja', ?, -0.1, ?)
         """,
-        (recording_id, t_start_ms, t_start_ms + 500, abs_start_utc, text, speaker),
+        (recording_id, t_start_ms, t_start_ms + 500, abs_start_utc, text, asr_model, speaker),
     )
     conn.commit()
     return cur.lastrowid
@@ -313,6 +327,155 @@ class TestProcessPending:
         result2 = mcp_server.process_pending(limit=2)
         assert "processed 1 recording(s); 0 still pending." in result2
         assert "process_pending again" not in result2
+
+
+class TestThroughput:
+    def test_computes_realtime_factor(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        _cfg, conn = vas
+        rec = _insert_recording(
+            conn,
+            source="mac_system",
+            started_at_utc="2026-09-15T01:00:00Z",
+            sha256="a" * 64,
+            duration_ms=60_000,
+            processing_ms=30_000,  # 60s audio / 30s processing -> 2.0x faster than realtime
+        )
+        _insert_utterance(
+            conn, recording_id=rec, abs_start_utc="2026-09-15T01:00:00Z", asr_model="mlx"
+        )
+
+        result = mcp_server.throughput()
+        assert "audio=60.0s" in result
+        assert "processing=30.0s" in result
+        assert "2.00x faster than realtime" in result
+        assert "model=mlx" in result
+        assert "verdict" in result
+
+    def test_groups_by_model_when_sample_has_two(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        _cfg, conn = vas
+        cpu_rec = _insert_recording(
+            conn,
+            source="mac_system",
+            started_at_utc="2026-09-15T01:00:00Z",
+            sha256="a" * 64,
+            duration_ms=60_000,
+            processing_ms=75_000,  # slower than realtime
+        )
+        _insert_utterance(
+            conn,
+            recording_id=cpu_rec,
+            abs_start_utc="2026-09-15T01:00:00Z",
+            asr_model="faster-whisper",
+        )
+        mlx_rec = _insert_recording(
+            conn,
+            source="mac_system",
+            started_at_utc="2026-09-15T02:00:00Z",
+            sha256="b" * 64,
+            duration_ms=60_000,
+            processing_ms=20_000,  # faster than realtime
+        )
+        _insert_utterance(
+            conn, recording_id=mlx_rec, abs_start_utc="2026-09-15T02:00:00Z", asr_model="mlx"
+        )
+
+        result = mcp_server.throughput()
+        assert "faster-whisper: 1 recording(s)" in result
+        assert "mlx: 1 recording(s)" in result
+        assert "slower than realtime" in result  # faster-whisper line
+        assert "faster than realtime" in result  # mlx line and/or per-recording line
+        assert "overall (2 recording(s)" in result
+
+    def test_no_timing_data_says_so(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        result = mcp_server.throughput()
+        assert "No timing data yet" in result
+
+
+class TestStatusBacklog:
+    def test_reports_no_timing_data(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        _cfg, conn = vas
+        _insert_recording(
+            conn,
+            source="mac_mic",
+            started_at_utc="2026-09-15T01:00:00Z",
+            sha256="a" * 64,
+            processed_at=None,
+        )
+
+        result = mcp_server.status()
+        assert "no timing data yet" in result
+
+    def test_reports_projected_backlog_time(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        _cfg, conn = vas
+        _insert_recording(
+            conn,
+            source="mac_mic",
+            started_at_utc="2026-09-15T01:00:00Z",
+            sha256="a" * 64,
+            duration_ms=600_000,
+            processing_ms=300_000,
+            processed_at="2026-09-15T01:10:00Z",
+        )
+        _insert_recording(
+            conn,
+            source="mac_mic",
+            started_at_utc="2026-09-15T02:00:00Z",
+            sha256="b" * 64,
+            processed_at=None,
+        )
+
+        result = mcp_server.status()
+        assert "1 recording(s) pending" in result
+        assert "2.00x realtime factor" in result
+
+
+class TestRecent:
+    def test_returns_only_utterances_inside_window_in_order_and_reports_lag(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        _cfg, conn = vas
+        rec = _insert_recording(
+            conn, source="mac_mic", started_at_utc="2026-09-15T01:00:00Z", sha256="a" * 64
+        )
+        now = datetime.now(UTC)
+
+        def _iso(dt) -> str:
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        outside_old = now - timedelta(minutes=90)
+        inside_early = now - timedelta(minutes=20)
+        inside_late = now - timedelta(minutes=5)
+
+        _insert_utterance(conn, recording_id=rec, abs_start_utc=_iso(outside_old), text="古い発話")
+        _insert_utterance(
+            conn, recording_id=rec, abs_start_utc=_iso(inside_late), text="最新の発話"
+        )
+        _insert_utterance(
+            conn, recording_id=rec, abs_start_utc=_iso(inside_early), text="少し前の発話"
+        )
+
+        result = mcp_server.recent(minutes=30)
+        assert "古い発話" not in result
+        assert "少し前の発話" in result
+        assert "最新の発話" in result
+        # Oldest first.
+        assert result.index("少し前の発話") < result.index("最新の発話")
+        # The header reports how far behind the newest utterance in the DB is right
+        # now: the newest inserted utterance is ~5 min old.
+        import re
+
+        match = re.search(r"newest utterance in the database is (\d+\.\d+) min old", result)
+        assert match is not None
+        assert 4.9 <= float(match.group(1)) <= 5.1
+
+    def test_no_utterances_at_all(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        result = mcp_server.recent()
+        assert "no utterances recorded yet" in result
+        assert "No utterances in the last" in result
 
 
 class TestListRecordings:
