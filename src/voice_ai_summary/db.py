@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utcnow_iso() -> str:
@@ -43,6 +43,7 @@ def apply_schema(conn: sqlite3.Connection) -> None:
     sql = resources.files("voice_ai_summary").joinpath("schema.sql").read_text(encoding="utf-8")
     conn.executescript(sql)
     _migrate_utterances_columns(conn)
+    _migrate_recordings_columns(conn)
     row = conn.execute("SELECT version FROM schema_version").fetchone()
     if row is None:
         conn.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
@@ -60,6 +61,16 @@ def _migrate_utterances_columns(conn: sqlite3.Connection) -> None:
     for name in ("raw_text", "corrected_at", "correction_model"):
         if name not in cols:
             conn.execute(f"ALTER TABLE utterances ADD COLUMN {name} TEXT")
+
+
+def _migrate_recordings_columns(conn: sqlite3.Connection) -> None:
+    """v2 -> v3: add `claimed_at` to `recordings` for DBs created before the claim column.
+
+    Fresh databases already get this column from `schema.sql`, so this is a no-op there.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(recordings)")}
+    if "claimed_at" not in cols:
+        conn.execute("ALTER TABLE recordings ADD COLUMN claimed_at TEXT")
 
 
 @contextmanager

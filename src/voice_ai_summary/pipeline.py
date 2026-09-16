@@ -16,6 +16,16 @@ logger = logging.getLogger(__name__)
 
 _SOURCE_SPEAKERS = {"mac_mic": "me", "mac_system": "other"}
 
+# A claim older than this is treated as abandoned and can be picked up by another
+# caller. Must comfortably exceed the slowest realistic single-recording decode: the
+# user measures ~12 minutes to transcribe a 15-minute recording on CPU, and a
+# `launchctl kickstart -k` restart (routine here) can kill the worker mid-decode and
+# leave `claimed_at` set with nothing left to clear it. 45 minutes gives generous
+# headroom over that 12-minute measurement - for a slower machine or a longer
+# recording - while still being far short of "forever", so a genuinely abandoned claim
+# doesn't strand the row for days.
+CLAIM_TIMEOUT_S = 45 * 60
+
 
 def speaker_for_source(source: str) -> str:
     return _SOURCE_SPEAKERS.get(source, "unknown")
@@ -117,23 +127,53 @@ def process_recording(
                     )
                     utterance_count += 1
             conn.execute(
-                "UPDATE recordings SET processed_at = ? WHERE id = ?",
+                # Clear the claim alongside processed_at: this is the terminal state, so
+                # nothing needs to keep owning the row.
+                "UPDATE recordings SET processed_at = ?, claimed_at = NULL WHERE id = ?",
                 (utcnow_iso(), recording_id),
             )
         return utterance_count
     except Exception as exc:
         with transaction(conn):
             conn.execute(
-                "UPDATE recordings SET error = ? WHERE id = ?",
+                # Same here: an errored recording is terminal until `retry_failed` clears
+                # the error, so the claim must not outlive the failure.
+                "UPDATE recordings SET error = ?, claimed_at = NULL WHERE id = ?",
                 (str(exc)[:500], recording_id),
             )
         raise
 
 
+def _claim_recording(conn: sqlite3.Connection, recording_id: int) -> bool:
+    """Atomically take ownership of one pending recording before decoding it.
+
+    The worker and the `process_pending` MCP tool poll the same database, so between
+    the `SELECT` that finds a candidate and the (multi-minute) decode there is a window
+    for a second caller to pick up the same id and transcribe it a second time. This is
+    the single conditional `UPDATE` that closes that window: the WHERE clause re-checks
+    the very preconditions the caller's `SELECT` used, plus a claim check, so only one
+    of two racing callers can flip the row. `rowcount == 0` means another live claim (or
+    a state change) beat this one to it - the caller must skip the row, not decode it.
+    A claim older than `CLAIM_TIMEOUT_S` counts as abandoned and is reclaimable.
+    """
+    now_dt = datetime.now(UTC)
+    now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    stale_before = (now_dt - timedelta(seconds=CLAIM_TIMEOUT_S)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cur = conn.execute(
+        "UPDATE recordings SET claimed_at = ? WHERE id = ? AND processed_at IS NULL "
+        "AND error IS NULL AND (claimed_at IS NULL OR claimed_at < ?)",
+        (now, recording_id, stale_before),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def process_pending(
     conn: sqlite3.Connection, cfg: Config, backend: ASRBackend, limit: int | None = None
 ) -> int:
-    """Process all unprocessed, error-free recordings, oldest first. Returns count processed."""
+    """Process unprocessed, error-free recordings, oldest first. Returns count actually
+    processed by this call - a recording already claimed by another caller is skipped,
+    not counted as a failure."""
     sql = (
         "SELECT id FROM recordings WHERE processed_at IS NULL AND error IS NULL "
         "ORDER BY started_at_utc ASC"
@@ -144,6 +184,10 @@ def process_pending(
 
     processed = 0
     for rec_id in ids:
+        # Claim one recording right before processing it, not the whole batch upfront -
+        # a crash between claims must not strand ids this caller never got to.
+        if not _claim_recording(conn, rec_id):
+            continue
         try:
             process_recording(conn, cfg, rec_id, backend)
             processed += 1
@@ -171,8 +215,11 @@ def retry_failed(conn: sqlite3.Connection, cfg: Config) -> list[int]:
                 src.rename(dst)
             storage_path = storage_path[: -len(".part")]
         conn.execute(
-            "UPDATE recordings SET error = NULL, processed_at = NULL, storage_path = ?"
-            " WHERE id = ?",
+            # Clear claimed_at too: without this a retried recording stays invisible to
+            # `process_pending` until the stale-claim timeout expires, even though it is
+            # pending again right now.
+            "UPDATE recordings SET error = NULL, processed_at = NULL, claimed_at = NULL,"
+            " storage_path = ? WHERE id = ?",
             (storage_path, row["id"]),
         )
         ids.append(row["id"])
@@ -192,7 +239,11 @@ def reset_recordings(conn: sqlite3.Connection, recording_ids: list[int]) -> int:
     with transaction(conn):
         _clear_transcript(conn, recording_ids)
         conn.execute(
-            f"UPDATE recordings SET processed_at = NULL, error = NULL WHERE id IN ({placeholders})",
+            # claimed_at = NULL for the same reason as in retry_failed: a re-queued
+            # recording must be visible to process_pending immediately, not after the
+            # stale-claim timeout.
+            f"UPDATE recordings SET processed_at = NULL, error = NULL, claimed_at = NULL"
+            f" WHERE id IN ({placeholders})",
             recording_ids,
         )
     return len(recording_ids)
