@@ -285,3 +285,70 @@ def test_drop_consecutive_repeats_handles_empty_and_single_element_lists() -> No
     assert drop_consecutive_repeats([]) == []
     one = [_utt("x")]
     assert drop_consecutive_repeats(one) == one
+
+
+def _utt_at(t_start_ms: int, t_end_ms: int, text: str) -> Utterance:
+    return Utterance(
+        t_start_ms=t_start_ms, t_end_ms=t_end_ms, text=text, lang="ja", avg_logprob=None
+    )
+
+
+def test_drop_consecutive_repeats_keeps_repeats_separated_by_a_real_pause() -> None:
+    """Regression: `vad.pack_regions` now joins separate VAD speech regions - absorbing
+    real silence between them - into one `transcribe()` call, so two genuinely separate
+    utterances (e.g. two distinct "はい" spoken several seconds apart) can land adjacent
+    in the same call's output. Dropping the second one purely because it repeats the
+    first's text would silently delete real speech, which is worse than the decoder
+    repetition loop the filter exists to catch."""
+    utterances = [
+        _utt_at(0, 500, "はい"),
+        _utt_at(4500, 5000, "はい"),  # 4000ms after the first ends: a real, separate turn
+    ]
+
+    out = drop_consecutive_repeats(utterances, max_gap_ms=1000)
+
+    assert [u.text for u in out] == ["はい", "はい"]
+
+
+def test_drop_consecutive_repeats_still_collapses_back_to_back_repeats() -> None:
+    """A decoder repetition loop re-emits the same line with (near) zero elapsed time
+    between repeats - that must still be collapsed."""
+    utterances = [
+        _utt_at(0, 500, "はい"),
+        _utt_at(500, 1000, "はい"),  # 0ms gap: back-to-back, exactly what a loop looks like
+    ]
+
+    out = drop_consecutive_repeats(utterances, max_gap_ms=1000)
+
+    assert [u.text for u in out] == ["はい"]
+
+
+def test_drop_consecutive_repeats_default_gap_matches_config_default() -> None:
+    """The function's own default must match `AsrConfig.repeat_gap_max_ms`, so calling it
+    directly (as these unit tests do) exercises the same behaviour as through a backend."""
+    assert Config().asr.repeat_gap_max_ms == 1000
+
+
+def test_faster_whisper_repeat_filter_respects_configured_gap(monkeypatch) -> None:
+    """The gap bound must actually reach the decoder-level filter, not just the
+    standalone function - a real "はい" ... "はい" four seconds apart, produced by one
+    packed decode call, must survive at the backend level too."""
+    cfg = Config()
+    backend = FasterWhisperBackend(cfg)
+
+    class _GappedRepeatingModel:
+        def __init__(self) -> None:
+            self.kwargs: dict = {}
+
+        def transcribe(self, samples, **kwargs):
+            self.kwargs = kwargs
+            return (
+                iter([_Seg(0.0, 0.5, "はい"), _Seg(4.5, 5.0, "はい")]),
+                None,
+            )
+
+    backend._model = _GappedRepeatingModel()
+
+    out = backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
+
+    assert [u.text for u in out] == ["はい", "はい"]

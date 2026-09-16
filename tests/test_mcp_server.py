@@ -955,3 +955,43 @@ class TestRebuildDayAsync:
         _wait_for_job(job)
         assert len(calls) == 1, "a second tool call must not start a second paid job"
         assert "Started job" in first
+
+    def test_forced_call_while_a_non_forced_rebuild_is_running_does_not_start_or_claim_it(
+        self, vas: tuple[Config, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: `_start_job` deduplicates on `(kind, day)` alone, so a `force=True`
+        request while a non-force job for that day is already running used to just hand
+        back the running (non-forced) job's handle - the forced recomputation never ran,
+        and the message told the caller a rebuild was underway without saying it was not
+        the forced one they asked for."""
+        release = threading.Event()
+        calls: list[bool] = []  # each entry is the `force` value `run_day` was called with
+
+        def _blocked_run_day(conn, cfg, day, *, client=None, force=False):
+            calls.append(force)
+            release.wait(timeout=5)
+            return "digest"
+
+        monkeypatch.setattr("voice_ai_summary.summarize.run_day", _blocked_run_day)
+
+        non_forced = mcp_server.rebuild_day(day="2026-09-16")
+        assert "Started job" in non_forced
+
+        forced = mcp_server.rebuild_day(day="2026-09-16", force=True)
+
+        # Must NOT claim the forced rebuild is underway - it is not.
+        assert "NOT been started" in forced
+        assert "force=True" in forced
+
+        release.set()
+        jobs = [j for j in mcp_server._jobs.values() if j.key == "2026-09-16"]
+        for job in jobs:
+            _wait_for_job(job)
+
+        # Only the one, non-forced job ever ran - no second (paid) job for the same day.
+        assert len(jobs) == 1
+        assert calls == [False]
+
+        # job_status on that job must not claim it is doing forced work either.
+        status = mcp_server.job_status(job_id=jobs[0].id)
+        assert "force: False" in status

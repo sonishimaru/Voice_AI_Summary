@@ -158,6 +158,19 @@ def process_recording(
                 (str(exc)[:500], recording_id),
             )
         raise
+    except BaseException:
+        # Not an ordinary decode failure but a shutdown (`worker._Stop`, deliberately a
+        # `BaseException` so it lands here instead of the `except Exception` above -
+        # see its docstring) or another non-Exception interrupt. This recording was not
+        # given a fair chance to transcribe, so it must not be recorded as failed and
+        # must stay eligible for the next attempt: clear only the claim, leaving `error`
+        # and `processed_at` exactly as they were found (both still NULL - this row was
+        # pending). Otherwise a `launchctl kickstart -k` restart mid-decode - a routine,
+        # one-click path - would strand the row under its live claim until
+        # `CLAIM_TIMEOUT_S` (45 minutes) expires before anyone picks it up again.
+        with transaction(conn):
+            conn.execute("UPDATE recordings SET claimed_at = NULL WHERE id = ?", (recording_id,))
+        raise
 
 
 def _claim_recording(conn: sqlite3.Connection, recording_id: int) -> bool:

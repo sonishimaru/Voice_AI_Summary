@@ -88,27 +88,45 @@ def normalize_samples(samples: np.ndarray, mode: str) -> np.ndarray:
     return np.clip(samples * gain, -1.0, 1.0).astype("float32")
 
 
-def drop_consecutive_repeats(utterances: list[Utterance]) -> list[Utterance]:
-    """Drop an utterance whose stripped text equals the one immediately before it.
+def drop_consecutive_repeats(
+    utterances: list[Utterance], *, max_gap_ms: int = 1000
+) -> list[Utterance]:
+    """Drop an utterance whose stripped text equals the one immediately before it, but
+    only when it follows that predecessor within `max_gap_ms` (see
+    `AsrConfig.repeat_gap_max_ms`).
 
     Whisper's classic failure mode on a decode call is a repetition loop: the same short
-    line emitted several times in a row inside one window. This filter only ever compares
-    an utterance to its immediate predecessor *within the list from a single
-    `transcribe()` call* - it must never be applied across separate calls, because a
-    person genuinely repeating themselves minutes (or even one region) apart is real
-    speech, not a decoder artifact, and two recordings of the same audio producing
-    identical text is a different bug, already handled elsewhere (idempotent
-    reprocessing). Comparing only adjacent entries, never all-pairs, is what keeps a
-    legitimate "yes, yes, okay" collapsing no more than the loop itself did.
+    line emitted several times in a row, back-to-back, inside one window. This filter
+    only ever compares an utterance to its immediate predecessor *within the list from a
+    single `transcribe()` call* - it must never be applied across separate calls, because
+    a person genuinely repeating themselves minutes apart is real speech, not a decoder
+    artifact, and two recordings of the same audio producing identical text is a
+    different bug, already handled elsewhere (idempotent reprocessing).
+
+    The timestamp bound is required *now that `vad.pack_regions` exists*: packing joins
+    several originally-separate VAD speech regions, absorbing the real silence between
+    them, into one decode call - so two genuinely separate utterances (e.g. two distinct
+    "はい" several seconds apart) can now arrive adjacent in the same call's output. Only
+    a decoder repetition loop looks like back-to-back output with (near) zero elapsed
+    time between repeats; a real pause between separately-detected utterances is bounded
+    below by `vad.merge_regions`' `merge_gap_ms`, since two regions are only left distinct
+    (rather than merged into one) when they are at least that far apart. Comparing only
+    adjacent entries, never all-pairs, and bounding by real elapsed time, not just position
+    in the list, is what keeps a legitimate "yes, yes, okay" - whether back-to-back or
+    minutes apart - from ever being collapsed further than the loop itself, or dropped as
+    if it were one.
     """
     out: list[Utterance] = []
     prev_text: str | None = None
+    prev_end_ms: int | None = None
     for utt in utterances:
         text = utt.text.strip()
-        if out and text == prev_text:
+        gap_ms = None if prev_end_ms is None else utt.t_start_ms - prev_end_ms
+        if out and text == prev_text and gap_ms is not None and gap_ms <= max_gap_ms:
             continue
         out.append(utt)
         prev_text = text
+        prev_end_ms = utt.t_end_ms
     return out
 
 
@@ -169,7 +187,7 @@ class FasterWhisperBackend:
             for seg in segments
         ]
         if asr.drop_repeated_utterances:
-            utterances = drop_consecutive_repeats(utterances)
+            utterances = drop_consecutive_repeats(utterances, max_gap_ms=asr.repeat_gap_max_ms)
         return utterances
 
 
@@ -213,7 +231,7 @@ class MlxWhisperBackend:
             for seg in result["segments"]
         ]
         if asr.drop_repeated_utterances:
-            utterances = drop_consecutive_repeats(utterances)
+            utterances = drop_consecutive_repeats(utterances, max_gap_ms=asr.repeat_gap_max_ms)
         return utterances
 
 

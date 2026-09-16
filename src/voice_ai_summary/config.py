@@ -72,6 +72,19 @@ class AsrConfig(BaseModel):
     # not real speech; the switch exists in case it ever eats a genuine short repeated
     # phrase.
     drop_repeated_utterances: bool = True
+    # How close (ms) a repeat's timestamp must follow its predecessor's for
+    # `asr.drop_consecutive_repeats` to treat it as that decoder loop rather than real
+    # speech. `vad.pack_regions` now joins separate VAD speech regions into one decode
+    # call, absorbing up to `vad.pack_max_gap_ms` of real silence between them - so two
+    # genuinely separate utterances can land adjacent in the same call. `vad.merge_regions`
+    # only ever leaves two regions distinct (unmerged) when they are >= `vad.merge_gap_ms`
+    # (2000ms default) apart, so any two utterances from genuinely separate regions are
+    # guaranteed at least that much real silence between them once packed. A repetition
+    # loop, by contrast, re-emits the same line inside a single decode window with (near)
+    # zero elapsed time between repeats. Half of the default `merge_gap_ms` sits
+    # comfortably below what a real pause looks like and comfortably above what a
+    # same-window decoder repeat looks like.
+    repeat_gap_max_ms: int = 1000
     # Decoder failure thresholds, passed straight through to faster-whisper/mlx-whisper.
     # Defaulted to each library's own default (read from `WhisperModel.transcribe` /
     # `mlx_whisper.transcribe`'s signatures, not measured) so leaving these unset changes

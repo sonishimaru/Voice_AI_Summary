@@ -121,6 +121,13 @@ class Job:
     finished_at: float | None = None
     result: str | None = None
     error: str | None = None
+    # Whether this job was started with `force=True` (currently only meaningful for
+    # `rebuild_day`). Recorded on the job itself, not just passed to `fn`, so
+    # `job_status` can say plainly whether the job actually running under a given id is
+    # doing the forced recompute or not - a caller who asked for `force=True` and got
+    # back a *different* job's handle (see `_start_job`) must be able to tell that job
+    # is not forced, rather than assuming its own force request took effect.
+    force: bool = False
 
 
 _jobs: dict[str, Job] = {}
@@ -131,15 +138,25 @@ _jobs_lock = threading.Lock()
 _JOB_LIST_LIMIT = 20
 
 
-def _start_job(kind: str, key: str, fn: Callable[[Job], str]) -> tuple[Job, bool]:
+def _start_job(
+    kind: str, key: str, fn: Callable[[Job], str], *, force: bool = False
+) -> tuple[Job, bool]:
     """Start `fn(job)` on a background daemon thread and return `(job, started)`
     immediately, without waiting for it to finish.
 
     Guards one job per `(kind, key)` at a time: if a job with the same kind and key is
     already running, that job is returned with `started=False` and no new thread is
     started - this is what stops a Claude-Desktop-timeout-triggered retry of the same
-    tool call from doubling a paid Claude API workload. The check-and-create is one
-    atomic section under `_jobs_lock`, so two concurrent callers can never both "win".
+    tool call from doubling a paid Claude API workload, and also what stops a `force=True`
+    request from starting a second, concurrent, paid rebuild of a day that a non-forced
+    job is already rebuilding. The check-and-create is one atomic section under
+    `_jobs_lock`, so two concurrent callers can never both "win".
+
+    Note that the *existing* job's own `force` may not match the `force` this call was
+    asked for - `_start_job` never launches a second job to reconcile that, it only
+    reports what is actually running (via the returned `Job.force`) so the caller can
+    tell the difference and say so honestly instead of implying the requested work is
+    underway when it is not.
 
     `fn` receives the `Job` itself (so it can call `_set_progress` as it goes) and
     should return the job's result string. Any exception `fn` raises is caught and
@@ -151,7 +168,7 @@ def _start_job(kind: str, key: str, fn: Callable[[Job], str]) -> tuple[Job, bool
         for existing in _jobs.values():
             if existing.kind == kind and existing.key == key and existing.state == "running":
                 return existing, False
-        job = Job(id=uuid.uuid4().hex[:12], kind=kind, key=key, started_at=time.time())
+        job = Job(id=uuid.uuid4().hex[:12], kind=kind, key=key, started_at=time.time(), force=force)
         _jobs[job.id] = job
 
     def _worker() -> None:
@@ -188,12 +205,14 @@ def _elapsed(job: Job) -> str:
 
 
 def _format_job_summary(job: Job) -> str:
-    return f"{job.id}  {job.kind}({job.key})  {job.state}  elapsed={_elapsed(job)}"
+    force_note = "  force=True" if job.force else ""
+    return f"{job.id}  {job.kind}({job.key}){force_note}  {job.state}  elapsed={_elapsed(job)}"
 
 
 def _format_job_detail(job: Job) -> str:
     lines = [
         f"job {job.id}: {job.kind}({job.key})",
+        f"force: {job.force}",
         f"state: {job.state}",
         f"elapsed: {_elapsed(job)}",
         f"progress: {job.progress}",
@@ -464,7 +483,12 @@ def rebuild_day(day: str = "", force: bool = False) -> str:
     error, if it failed). Calling `rebuild_day` again for the same `day` while a job
     for it is still running does NOT start a second (paid) job - it returns the
     handle to the one already running instead, so a Claude-Desktop-timeout retry
-    cannot double the API spend. `day` is a local date `YYYY-MM-DD`, default today.
+    cannot double the API spend. If that already-running job is a non-forced rebuild
+    and this call asked for `force=True`, the forced recomputation is NOT started
+    either (for the same reason: no two concurrent paid rebuilds of one day) - the
+    returned message says so explicitly instead of implying the forced work is
+    underway, and names the non-forced job's id to wait on before retrying with
+    `force=True`. `day` is a local date `YYYY-MM-DD`, default today.
     The Claude correction pass over the day's ASR text runs first whenever
     `[correct] enabled` is set in config.toml, then episodes and the daily digest are
     rebuilt. Summaries already cached for unchanged content are reused unless
@@ -479,15 +503,33 @@ def rebuild_day(day: str = "", force: bool = False) -> str:
     def _work(job: Job) -> str:
         return _run_rebuild_day(job, day, force)
 
-    job, started = _start_job("rebuild_day", day, _work)
+    job, started = _start_job("rebuild_day", day, _work, force=force)
     if not started:
+        if force and not job.force:
+            # The job `_start_job` handed back is a *different*, non-forced rebuild
+            # already in flight for this day - not the forced recompute just asked for.
+            # Starting a second, concurrent job for the same day would risk two paid
+            # rebuilds running at once, so this call refuses instead - but it must say
+            # so plainly rather than reusing the generic "already running" message,
+            # which would wrongly imply the requested forced recompute is the one under
+            # way (it is not; that job may return a cached digest this call needed
+            # bypassed).
+            return (
+                f"A non-forced rebuild for {day} is already running as job {job.id} "
+                f"(elapsed {_elapsed(job)}). The forced recomputation you asked for "
+                "has NOT been started - starting a second, concurrent rebuild for the "
+                "same day would risk paying for two rebuilds at once. Wait for job "
+                f"{job.id} to finish (job_status(job_id={job.id!r})), then call "
+                f"rebuild_day(day={day!r}, force=True) again to force the recompute."
+            )
         return (
             f"A rebuild for {day} is already running as job {job.id} (elapsed "
             f"{_elapsed(job)}). Not starting a second one - that would double the "
             f"paid Claude API work. Call job_status(job_id={job.id!r}) to check on it."
         )
     return (
-        f"Started job {job.id}: rebuilding {day} in the background. This calls the "
+        f"Started job {job.id}: rebuilding {day} in the background"
+        f"{' with force=True' if force else ''}. This calls the "
         "Claude API and costs money, and keeps running even though this call has "
         f"already returned. Call job_status(job_id={job.id!r}) to check progress and "
         "get the resulting digest (or the error) once it's done."

@@ -10,6 +10,7 @@ import pytest
 from voice_ai_summary import vad as vad_module
 from voice_ai_summary import worker
 from voice_ai_summary.config import Config
+from voice_ai_summary.db import utcnow_iso
 from voice_ai_summary.ingest import ingest_file
 from voice_ai_summary.pipeline import process_recording
 from voice_ai_summary.vad import SpeechRegion
@@ -55,14 +56,25 @@ def test_stop_does_not_become_a_recording_error(
     mid-transcription is the common path. It must not blame the recording."""
     cfg, conn, rec_id = _one_recording(vas, monkeypatch)
 
+    # Simulate the live claim `process_pending` would hold on this row while it is being
+    # decoded - exactly the state a SIGTERM lands in mid-transcription.
+    conn.execute("UPDATE recordings SET claimed_at = ? WHERE id = ?", (utcnow_iso(), rec_id))
+    conn.commit()
+
     with pytest.raises(worker._Stop):
         process_recording(conn, cfg, rec_id, _RaisingBackend(worker._Stop()))
 
     row = conn.execute(
-        "SELECT error, processed_at FROM recordings WHERE id = ?", (rec_id,)
+        "SELECT error, processed_at, claimed_at FROM recordings WHERE id = ?", (rec_id,)
     ).fetchone()
     assert row["error"] is None
     assert row["processed_at"] is None
+    # Regression: `_Stop` is a `BaseException` (deliberately, so it isn't swallowed as a
+    # transcription failure), but that also means the old `except Exception` handler -
+    # the only thing that cleared `claimed_at` - never ran for it either. Without the
+    # fix this claim survives the interrupt and strands the row for `CLAIM_TIMEOUT_S`
+    # (45 minutes) before any worker will touch it again.
+    assert row["claimed_at"] is None
 
 
 def test_a_real_failure_is_still_recorded(
@@ -70,11 +82,18 @@ def test_a_real_failure_is_still_recorded(
 ) -> None:
     cfg, conn, rec_id = _one_recording(vas, monkeypatch)
 
+    conn.execute("UPDATE recordings SET claimed_at = ? WHERE id = ?", (utcnow_iso(), rec_id))
+    conn.commit()
+
     with pytest.raises(ValueError):
         process_recording(conn, cfg, rec_id, _RaisingBackend(ValueError("decode failed")))
 
-    row = conn.execute("SELECT error FROM recordings WHERE id = ?", (rec_id,)).fetchone()
+    row = conn.execute(
+        "SELECT error, claimed_at FROM recordings WHERE id = ?", (rec_id,)
+    ).fetchone()
     assert "decode failed" in row["error"]
+    # Ordinary failures must keep clearing the claim exactly as before.
+    assert row["claimed_at"] is None
 
 
 class TestBacklogWatch:
