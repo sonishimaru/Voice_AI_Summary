@@ -126,6 +126,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menuBarToggle.state = Settings.shared.showMenuBarIcon ? .on : .off
         menu.addItem(menuBarToggle)
 
+        let loginToggle = Self.item(title: "ログイン時に起動", action: #selector(dockToggleLaunchAtLogin(_:)), target: self)
+        loginToggle.state = controller.launchAtLoginEnabled ? .on : .off
+        menu.addItem(loginToggle)
+
         return menu
     }
 
@@ -190,6 +194,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor @objc private func dockToggleMenuBarIcon(_ sender: NSMenuItem) {
         Settings.shared.showMenuBarIcon.toggle()
+    }
+
+    @MainActor @objc private func dockToggleLaunchAtLogin(_ sender: NSMenuItem) {
+        guard let controller = Self.controllerForLaunch else { return }
+        controller.setLaunchAtLogin(!controller.launchAtLoginEnabled)
     }
 
     /// Covers logout/shutdown (and any other path that asks the app to
@@ -300,16 +309,14 @@ private struct MenuBarContent: View {
         )
     }
 
-    /// `Settings` isn't `ObservableObject`; a hand-rolled `Binding` reads
-    /// the live `SMAppService` status on `get` and pushes changes through
-    /// `Settings.setLaunchAtLogin` on `set`, reverting the toggle in the UI
-    /// if registration actually failed.
+    /// Reads the controller's cached registration state rather than asking
+    /// `SMAppService` here: that call is synchronous IPC, and this getter runs
+    /// every time the menu is built. The controller re-reads the real state
+    /// after a change, so a registration that failed puts the toggle back.
     private var launchAtLoginBinding: Binding<Bool> {
         Binding(
-            get: { Settings.shared.isLaunchAtLoginEnabled },
-            set: { newValue in
-                _ = Settings.shared.setLaunchAtLogin(newValue)
-            }
+            get: { controller.launchAtLoginEnabled },
+            set: { controller.setLaunchAtLogin($0) }
         )
     }
 

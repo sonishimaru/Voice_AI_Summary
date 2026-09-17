@@ -98,6 +98,15 @@ final class RecordingController: ObservableObject {
     private var hasPreparedForQuit = false
     private var notificationAuthorizationRequested = false
 
+    /// Cached `SMAppService` registration state.
+    ///
+    /// Read by the menus instead of `Settings.isLaunchAtLoginEnabled`, which
+    /// is a *synchronous* IPC call into `smd`. Calling that while building a
+    /// menu blocks the main thread for as long as `smd` takes to answer, and
+    /// a blocked main thread means the Dock menu -- which macOS builds by
+    /// asking this app -- never appears at all.
+    @Published private(set) var launchAtLoginEnabled = false
+
     // Core Audio default-device change listeners, kept as properties only
     // so they aren't deallocated; this controller lives for the process's
     // entire lifetime (owned by the App struct), so explicit teardown in
@@ -225,6 +234,7 @@ final class RecordingController: ObservableObject {
     /// means this is the very first launch ever, which is treated as
     /// `.recording` -- today's "always start" default.
     func restoreAtLaunch() {
+        refreshLaunchAtLogin()
         stateSince = Date()
         intent = settings.intent ?? .recording
         resumeAt = settings.resumeAt
@@ -534,6 +544,26 @@ final class RecordingController: ObservableObject {
         nowTicker = nil
     }
 
+    /// Re-reads the login-item registration off the main thread and
+    /// publishes the result. Cheap to call; the menus never wait on it.
+    func refreshLaunchAtLogin() {
+        Task.detached(priority: .utility) {
+            let enabled = Settings.shared.isLaunchAtLoginEnabled
+            await MainActor.run { self.launchAtLoginEnabled = enabled }
+        }
+    }
+
+    /// Registers/unregisters the login item off the main thread, then
+    /// re-reads the real state -- so a registration that silently failed
+    /// shows up as the toggle going back to where it was.
+    func setLaunchAtLogin(_ enabled: Bool) {
+        Task.detached(priority: .utility) {
+            _ = Settings.shared.setLaunchAtLogin(enabled)
+            let actual = Settings.shared.isLaunchAtLoginEnabled
+            await MainActor.run { self.launchAtLoginEnabled = actual }
+        }
+    }
+
     /// Requests `.alert` notification authorization the first time a
     /// *timed* pause is set (not an indefinite one, since there is then
     /// nothing to notify about), rather than at the moment the timer
@@ -545,7 +575,7 @@ final class RecordingController: ObservableObject {
     /// asking on every single timed pause in one session.
     ///
     /// NOTE: verify on a real Mac that a plain, code-signed (even ad-hoc)
-    /// `LSUIElement` app can call `UNUserNotificationCenter` at all
+    /// app can call `UNUserNotificationCenter` at all
     /// without further Info.plist/entitlement setup, and that a posted
     /// notification actually shows a banner without a
     /// `UNUserNotificationCenterDelegate` being set (none is set here).
@@ -562,7 +592,7 @@ final class RecordingController: ObservableObject {
     }
 
     /// Posts "録音を再開しました" so a paused user finds out an automatic
-    /// resume happened without having to notice the menu-bar icon
+    /// resume happened without having to notice the Dock icon
     /// changed. Falls back to `osascript` if `UNUserNotificationCenter`
     /// authorization was denied, or posting through it fails outright.
     ///
@@ -573,13 +603,15 @@ final class RecordingController: ObservableObject {
     /// only `Log` (thread-safe `os.Logger`s) and standalone system objects
     /// -- so there is nothing that actually needs the hop back to main.
     private func postAutoResumeNotification() {
-        let center = UNUserNotificationCenter.current()
-        center.getNotificationSettings { settings in
+        // `UNUserNotificationCenter.current()` is asked for again inside the
+        // closure rather than captured: the center is not `Sendable`, and
+        // `getNotificationSettings`'s handler is, so capturing it warns.
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
             switch settings.authorizationStatus {
             case .authorized, .provisional:
                 Self.deliverViaUserNotificationCenter()
             case .notDetermined:
-                center.requestAuthorization(options: [.alert]) { granted, _ in
+                UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { granted, _ in
                     if granted {
                         Self.deliverViaUserNotificationCenter()
                     } else {
