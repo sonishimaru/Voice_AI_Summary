@@ -91,17 +91,44 @@ final class SegmentWriter {
         }
     }
 
+    /// Synchronous variant of `close()`, for process-termination paths
+    /// (`RecordingController.prepareForQuit()`) where an `async`-dispatched
+    /// close might never get to run before the process actually exits --
+    /// which would abandon an open `.part` file un-renamed.
+    func closeSync() {
+        queue.sync { [weak self] in
+            self?.closeAndFinalizeLocked()
+        }
+    }
+
     // MARK: - Locked helpers (only ever run on `queue`)
 
     private func openLocked() {
-        let startedAt = Date()
-        let timestamp = Self.filenameTimestampFormatter.string(from: startedAt)
-        let stem = "\(source.rawValue)_\(deviceID)_\(timestamp)"
-        let finalURL = directory.appendingPathComponent("\(stem).m4a")
+        var startedAt = Date()
+        var timestamp = Self.filenameTimestampFormatter.string(from: startedAt)
+        var stem = "\(source.rawValue)_\(deviceID)_\(timestamp)"
+        var finalURL = directory.appendingPathComponent("\(stem).m4a")
         // Written under a `.part` name first; only renamed to the final
         // name once fully closed, so the Python worker never picks up a
         // half-written file (per spec).
-        let tempURL = directory.appendingPathComponent("\(stem).m4a.part")
+        var tempURL = directory.appendingPathComponent("\(stem).m4a.part")
+
+        // Filenames are timestamped to the second. A pause immediately
+        // followed by a resume (or two rapid device-change restarts) can
+        // land in the same second as a file that's still open or that was
+        // just finalized; bump the timestamp forward a second at a time
+        // until both candidate paths are free instead of silently
+        // colliding with (and truncating) that other file.
+        let fm = FileManager.default
+        var collisionAttempts = 0
+        while (fm.fileExists(atPath: tempURL.path) || fm.fileExists(atPath: finalURL.path)) && collisionAttempts < 5 {
+            startedAt = startedAt.addingTimeInterval(1)
+            timestamp = Self.filenameTimestampFormatter.string(from: startedAt)
+            stem = "\(source.rawValue)_\(deviceID)_\(timestamp)"
+            finalURL = directory.appendingPathComponent("\(stem).m4a")
+            tempURL = directory.appendingPathComponent("\(stem).m4a.part")
+            collisionAttempts += 1
+        }
 
         // AAC-LC, ~32 kbps, mono, 16 kHz per spec. `AVAudioFile` encodes
         // compressed output from the PCM buffers passed to `write(from:)`
@@ -123,6 +150,11 @@ final class SegmentWriter {
 
         do {
             let file = try AVAudioFile(forWriting: tempURL, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+            do {
+                try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tempURL.path)
+            } catch {
+                Log.writer.error("Failed to chmod segment for \(self.source.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
             currentFile = file
             currentTempURL = tempURL
             currentFinalURL = finalURL
@@ -177,7 +209,7 @@ final class SegmentWriter {
         let sidecar = Sidecar(
             source: source.rawValue,
             deviceID: deviceID,
-            startedAtUTC: Self.iso8601UTCFormatter.string(from: startedAt),
+            startedAtUTC: RecorderStateFile.iso8601UTCFormatter.string(from: startedAt),
             tzOffset: Self.currentTimeZoneOffsetString(),
             sampleRate: Int(sampleRate),
             channels: Int(channels),
@@ -187,6 +219,7 @@ final class SegmentWriter {
         do {
             let data = try JSONEncoder().encode(sidecar)
             try data.write(to: sidecarURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: sidecarURL.path)
         } catch {
             Log.writer.error("Failed to write sidecar for \(self.source.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }
@@ -194,8 +227,10 @@ final class SegmentWriter {
 
     // MARK: - Formatting helpers
 
-    /// `{YYYYMMDDTHHMMSSZ}` filename component, UTC.
-    private static let filenameTimestampFormatter: DateFormatter = {
+    /// `{YYYYMMDDTHHMMSSZ}` filename component, UTC. Not `private` --
+    /// `RecordingController.deleteRecentAudio` reuses it verbatim to parse
+    /// the timestamp back out of already-rotated filenames.
+    static let filenameTimestampFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
         formatter.timeZone = TimeZone(identifier: "UTC")
@@ -203,14 +238,9 @@ final class SegmentWriter {
         return formatter
     }()
 
-    /// `started_at_utc` sidecar field, e.g. "2026-09-15T01:02:03Z".
-    private static let iso8601UTCFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        return formatter
-    }()
+    // `started_at_utc`'s formatter is `RecorderStateFile.iso8601UTCFormatter`
+    // -- shared with the recorder-state/event files so every timestamp the
+    // app writes to disk is formatted identically.
 
     /// `tz_offset` sidecar field, e.g. "+09:00".
     private static func currentTimeZoneOffsetString() -> String {
