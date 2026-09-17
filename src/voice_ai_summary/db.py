@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def utcnow_iso() -> str:
@@ -64,8 +64,8 @@ def _migrate_utterances_columns(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_recordings_columns(conn: sqlite3.Connection) -> None:
-    """v2 -> v3 -> v4: add `claimed_at` and `processing_ms` to `recordings` for DBs
-    created before those columns existed.
+    """v2 -> v3 -> v4 -> v5: add `claimed_at`, `processing_ms` and `audio_deleted_at`
+    to `recordings` for DBs created before those columns existed.
 
     Fresh databases already get these columns from `schema.sql`, so this is a no-op there.
     """
@@ -74,6 +74,8 @@ def _migrate_recordings_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE recordings ADD COLUMN claimed_at TEXT")
     if "processing_ms" not in cols:
         conn.execute("ALTER TABLE recordings ADD COLUMN processing_ms INTEGER")
+    if "audio_deleted_at" not in cols:
+        conn.execute("ALTER TABLE recordings ADD COLUMN audio_deleted_at TEXT")
 
 
 def recent_realtime_factor(conn: sqlite3.Connection, limit: int = 20) -> float | None:
