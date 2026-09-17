@@ -17,6 +17,7 @@ from typing import Any
 import anthropic
 
 from .config import Config
+from .security import open_private
 
 USAGE_FILENAME = "usage.jsonl"
 
@@ -190,7 +191,7 @@ def track_usage(purpose: str, model: str, response: Any) -> None:
         "cache_read": getattr(usage, "cache_read_input_tokens", 0) or 0,
     }
     _usage_path.parent.mkdir(parents=True, exist_ok=True)
-    with _usage_path.open("a", encoding="utf-8") as f:
+    with open_private(_usage_path, "a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 

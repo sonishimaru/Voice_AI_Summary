@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from types import SimpleNamespace
 
 import anthropic
@@ -80,6 +82,25 @@ def test_track_and_summarize_usage(tmp_path) -> None:
     assert [(r["purpose"], r["calls"]) for r in rows] == [("reduce", 1), ("map", 1)]
     assert rows[0]["usd"] == pytest.approx(5.0 + 2.5)  # 1M in @ $5 + 100k out @ $25
     assert rows[1]["usd"] == pytest.approx(1.0 + 0.5)
+
+
+def test_track_usage_creates_usage_file_at_mode_600(tmp_path) -> None:
+    path = tmp_path / "usage.jsonl"
+    llm.set_usage_path(path)
+    try:
+        resp = SimpleNamespace(
+            usage=SimpleNamespace(
+                input_tokens=1,
+                output_tokens=1,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+            )
+        )
+        llm.track_usage("map", "claude-haiku-4-5", resp)
+    finally:
+        llm.set_usage_path(None)
+
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
 
 
 def test_track_usage_is_noop_without_path(tmp_path) -> None:
