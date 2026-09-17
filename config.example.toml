@@ -131,3 +131,25 @@ digest_catchup_budget_s = 900
 # 0 にすると無効)。バックログが backlog_alert_count 未満に戻ると再度アームされる。
 backlog_alert_count = 10
 backlog_alert_minutes = 30
+
+[retention]
+# 文字起こしが終わった録音の音声ファイルを、この日数後に削除する。DB の行と文字起こしは残る
+# （後からモデルを変えて文字起こしし直すことだけができなくなる）。0 で無効。
+audio_days = 7
+# 文字起こしできなかった（errored）録音の音声は、取り込みからこの日数で削除。
+errored_audio_days = 30
+usage_log_days = 365
+recorder_events_days = 90
+audit_log_days = 365
+# launchd のログ（.log / .err）がこのバイト数を超えたら末尾だけ残す。
+log_max_bytes = 5000000
+
+[recorder]
+# 録音アプリ側のローテーション間隔（分）と一致させる。未処理の録音の長さの見積もりと、
+# 「録音中のはずなのにファイルが届かない」監視の待ち時間に使う。
+rotation_minutes = 15
+
+[glossary]
+# Slack からの用語集取り込み。一度取り終えたら false のままにしておく（再取り込みは
+# 参加チャンネル全部のメッセージを Claude API に送る）。
+slack_import_enabled = false

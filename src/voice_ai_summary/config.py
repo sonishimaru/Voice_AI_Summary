@@ -209,6 +209,37 @@ class ScheduleConfig(BaseModel):
     backlog_alert_minutes: int = 30
 
 
+class RetentionConfig(BaseModel):
+    """How long recorded data stays on disk. Transcripts and digests are kept; only the
+    audio and the append-only logs are pruned. Set a value to 0 to disable that rule."""
+
+    # Delete a recording's audio file this many days after it was transcribed. The row,
+    # its transcript and its timings stay; only re-transcribing it becomes impossible.
+    audio_days: int = 7
+    # Audio of recordings that never transcribed (errored) is otherwise kept forever.
+    errored_audio_days: int = 30
+    usage_log_days: int = 365
+    recorder_events_days: int = 90
+    audit_log_days: int = 365
+    # Each launchd .log/.err is cut back to its tail once it grows past this many bytes.
+    log_max_bytes: int = 5_000_000
+
+
+class RecorderConfig(BaseModel):
+    """What Python assumes about the macOS recorder app."""
+
+    # Must match the app's own rotation setting: it is how long a not-yet-transcribed
+    # recording is assumed to last (delete_range) and how long the recorder-health watch
+    # waits before saying no audio is arriving.
+    rotation_minutes: int = 15
+
+
+class GlossaryConfig(BaseModel):
+    # Off by default: the glossary was built once from Slack and importing again means
+    # sending every channel's messages to the Claude API. Turn on only for a re-import.
+    slack_import_enabled: bool = False
+
+
 class LlmConfig(BaseModel):
     # Hard stop: once today's recorded API spend exceeds this, vas refuses further calls.
     daily_budget_usd: float = 2.0
@@ -224,6 +255,9 @@ class Config(BaseModel):
     correct: CorrectConfig = Field(default_factory=CorrectConfig)
     deliver: DeliverConfig = Field(default_factory=DeliverConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
+    retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    recorder: RecorderConfig = Field(default_factory=RecorderConfig)
+    glossary: GlossaryConfig = Field(default_factory=GlossaryConfig)
 
     # --- secrets: environment only ---
     @property
