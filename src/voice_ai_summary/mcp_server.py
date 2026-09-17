@@ -1246,6 +1246,12 @@ def drop_recording(recording_id: int, confirm: bool = False, delete_audio: bool 
     return f"deleted {description} ({audio_result})"
 
 
+# The branch `update_app` follows when `VAS_UPDATE_BRANCH` is unset. Anyone who can
+# push to it can run code on this Mac (see the tool's docstring and README), so it is
+# the released branch rather than whatever feature branch happened to be in flight.
+DEFAULT_UPDATE_BRANCH = "main"
+
+
 def _repo_dir() -> Path:
     """The git work tree this package is installed from, derived from `__file__`
     (`<repo>/src/voice_ai_summary/mcp_server.py`) rather than the current directory,
@@ -1266,7 +1272,7 @@ def update_app() -> str:
     fast-forward-only merge (refuses and stops cleanly if that is not possible, e.g.
     there are local changes), then `uv pip install -e .` (falling back to
     `python -m pip install -e .` if `uv` is unavailable). The branch is read from the
-    `VAS_UPDATE_BRANCH` environment variable, defaulting to `claude/clever-sagan-23tn2w`.
+    `VAS_UPDATE_BRANCH` environment variable, defaulting to `main`.
     Refuses if this package is not installed from a git work tree. Restart Claude
     Desktop after a successful update so it picks up the new code.
     """
@@ -1278,7 +1284,7 @@ def update_app() -> str:
     if not (repo_dir / ".git").exists():
         return f"{repo_dir} is not a git work tree; refusing to update."
 
-    branch = os.environ.get("VAS_UPDATE_BRANCH", "claude/clever-sagan-23tn2w")
+    branch = os.environ.get("VAS_UPDATE_BRANCH", DEFAULT_UPDATE_BRANCH)
     output: list[str] = []
 
     for cmd in (

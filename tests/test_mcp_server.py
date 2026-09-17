@@ -7,6 +7,7 @@ no MCP transport, no network, no Anthropic API calls.
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -238,6 +239,29 @@ class TestUpdateApp:
         result = mcp_server.update_app()
         assert "not a git work tree" in result
         assert str(not_a_repo) in result
+
+    def test_follows_main_when_no_branch_is_configured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The default branch is the released one. It used to be the feature branch
+        this was developed on, which silently stopped updating once that branch merged
+        - and whoever can push to it can run code on this Mac."""
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        monkeypatch.setattr(mcp_server, "_repo_dir", lambda: repo)
+        monkeypatch.delenv("VAS_UPDATE_BRANCH", raising=False)
+
+        commands: list[tuple[str, ...]] = []
+
+        def _fake_run(cmd: tuple[str, ...], cwd: Path, timeout: int):
+            commands.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+        monkeypatch.setattr(mcp_server, "_run", _fake_run)
+
+        mcp_server.update_app()
+        assert ("git", "fetch", "origin", "main") in commands
+        assert ("git", "merge", "--ff-only", "origin/main") in commands
 
 
 def _insert_pending_recording(conn: sqlite3.Connection, *, sha256: str) -> int:
