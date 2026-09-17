@@ -274,11 +274,19 @@ class Config(BaseModel):
         return os.environ.get("VAS_SLACK_USER_TOKEN")
 
     def ensure_dirs(self) -> None:
-        dirs = [self.paths.inbox, self.paths.store, self.paths.digests]
+        """Create the data directories, private to this user (0700).
+
+        Everything under them is recorded speech, so the directories themselves must not
+        be listable by other accounts on the Mac. The mirror directory is included but
+        not its parents: it lives wherever the user pointed it.
+        """
+        from .security import ensure_private_dir
+
+        dirs = [self.paths.root, self.paths.inbox, self.paths.store, self.paths.digests]
         if (mirror := self.paths.digest_mirror) is not None:
             dirs.append(mirror)
         for p in dirs:
-            p.mkdir(parents=True, exist_ok=True)
+            ensure_private_dir(p)
 
 
 def load_config(path: Path | None = None) -> Config:

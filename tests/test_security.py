@@ -180,3 +180,26 @@ class TestAudit:
         not_a_dir = tmp_path / "not-a-dir"
         not_a_dir.write_text("x", encoding="utf-8")
         security.audit(not_a_dir, "tool", {}, "ok")  # must not raise
+
+
+def test_ensure_dirs_creates_private_directories(tmp_path, monkeypatch) -> None:
+    """Every data directory is recorded speech; none may be listable by other accounts."""
+    import stat
+
+    from voice_ai_summary.config import Config
+
+    cfg = Config()
+    cfg.paths.data_dir = tmp_path / "data"
+    cfg.paths.digest_mirror_dir = tmp_path / "mirror"
+    monkeypatch.setattr("os.umask", lambda _m: 0o022)  # a permissive umask must not matter
+
+    cfg.ensure_dirs()
+
+    for d in (
+        cfg.paths.root,
+        cfg.paths.inbox,
+        cfg.paths.store,
+        cfg.paths.digests,
+        tmp_path / "mirror",
+    ):
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700, d
