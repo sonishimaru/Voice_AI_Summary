@@ -13,7 +13,22 @@ from voice_ai_summary.config import Config
 from voice_ai_summary.db import utcnow_iso
 from voice_ai_summary.ingest import ingest_file
 from voice_ai_summary.pipeline import process_recording
+from voice_ai_summary.recorder_state import RecorderState
 from voice_ai_summary.vad import SpeechRegion
+
+
+def _recorder_state(**overrides: object) -> RecorderState:
+    fields = {
+        "state": "recording",
+        "since": "2026-09-17T09:00:00Z",
+        "resume_at": None,
+        "reason": "user",
+        "pid": 4321,
+        "app_version": "0.2.0",
+        "updated_at": "2026-09-17T09:00:00Z",
+    }
+    fields.update(overrides)
+    return RecorderState(**fields)
 
 
 def _write_wav(path: Path, seconds: float = 2.0, sample_rate: int = 16000) -> None:
@@ -138,6 +153,139 @@ class TestBacklogWatch:
         for _ in range(5):
             watch.observe(100)
         assert fired == []
+
+
+class TestRecorderWatch:
+    """`_RecorderWatch`: fire once when the recorder claims `recording` (and looks
+    alive) but no inbox file has arrived for >= 3x the rotation interval; re-arm on
+    the next file arrival."""
+
+    def _watch(
+        self,
+        *,
+        clock_values: list[float],
+        state: RecorderState | None,
+        alive: bool = True,
+        fired: list[float] | None = None,
+        rotation_s: float = 60.0,
+    ) -> tuple[worker._RecorderWatch, list[float]]:
+        fired = fired if fired is not None else []
+        clock_iter = iter(clock_values)
+        watch = worker._RecorderWatch(
+            rotation_s=rotation_s,
+            clock=lambda: next(clock_iter),
+            notify=lambda elapsed: fired.append(elapsed),
+            read_state=lambda: state,
+            is_alive=lambda s: alive,
+        )
+        return watch, fired
+
+    def test_fires_once_after_three_missed_rotations_while_recording_and_alive(self) -> None:
+        # rotation_s=60 -> threshold is 180s. t=0 arms (first sighting), t=100 below
+        # threshold, t=181 crosses it -> fires, t=181 (same instant/next poll) already
+        # fired -> stays quiet.
+        watch, fired = self._watch(
+            clock_values=[0, 100, 181, 181],
+            state=_recorder_state(),
+        )
+        watch.observe(False)  # t=0: first sighting, starts the clock
+        watch.observe(False)  # t=100: below the 180s threshold
+        assert fired == []
+        watch.observe(False)  # t=181: past threshold -> fires
+        assert fired == [181]
+        watch.observe(False)  # already fired -> stays quiet
+        assert fired == [181]
+
+    def test_file_arrival_rearms(self) -> None:
+        watch, fired = self._watch(
+            clock_values=[0, 181, 181, 400],
+            state=_recorder_state(),
+        )
+        watch.observe(False)  # t=0: arms
+        watch.observe(False)  # t=181: 181s since arrival -> fires
+        assert fired == [181]
+        watch.observe(True)  # t=181: a file arrives -> resets `_last_arrival` to 181
+        watch.observe(False)  # t=400: 219s since the reset (>=180s) -> fires again,
+        # proving the watch re-armed rather than staying permanently silent.
+        assert fired == [181, 219]
+
+    def test_silent_when_paused(self) -> None:
+        watch, fired = self._watch(
+            clock_values=[0, 1, 2, 3],
+            state=_recorder_state(state="paused"),
+        )
+        for _ in range(4):
+            watch.observe(False)
+        assert fired == []
+
+    def test_silent_when_stopped(self) -> None:
+        watch, fired = self._watch(
+            clock_values=[0, 1, 2, 3],
+            state=_recorder_state(state="stopped"),
+        )
+        for _ in range(4):
+            watch.observe(False)
+        assert fired == []
+
+    def test_silent_when_no_state_file(self) -> None:
+        watch, fired = self._watch(clock_values=[0, 1, 2, 3], state=None)
+        for _ in range(4):
+            watch.observe(False)
+        assert fired == []
+
+    def test_silent_when_recording_but_process_dead(self) -> None:
+        watch, fired = self._watch(
+            clock_values=[0, 181, 181],
+            state=_recorder_state(),
+            alive=False,
+        )
+        for _ in range(3):
+            watch.observe(False)
+        assert fired == []
+
+    def test_notify_raising_does_not_propagate(self) -> None:
+        def failing_notify(elapsed: float) -> None:
+            raise RuntimeError("osascript boom")
+
+        clock_iter = iter([0, 181])
+        watch = worker._RecorderWatch(
+            rotation_s=60.0,
+            clock=lambda: next(clock_iter),
+            notify=failing_notify,
+            read_state=lambda: _recorder_state(),
+            is_alive=lambda s: True,
+        )
+        watch.observe(False)  # arms
+        watch.observe(False)  # would fire, notify raises - must not propagate
+
+
+def test_worker_survives_broken_recorder_state(
+    vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recorder-state read that raises must not stop the worker loop."""
+    cfg, _conn = vas
+
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(worker, "process_pending", lambda conn, cfg, backend: 0)
+
+    def raising_read_state(root: object) -> None:
+        raise RuntimeError("torn state file")
+
+    monkeypatch.setattr(worker, "read_state", raising_read_state)
+
+    calls = {"n": 0}
+
+    def bounded_ingest(conn: object, cfg: object) -> list:
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise worker._Stop
+        return []
+
+    monkeypatch.setattr(worker, "ingest_inbox", bounded_ingest)
+
+    clock_values = iter([0.0, 10.0])
+    worker.run_worker(cfg, clock=lambda: next(clock_values))
+    assert calls["n"] == 3
 
 
 def test_worker_survives_notification_failure(

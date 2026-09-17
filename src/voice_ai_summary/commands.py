@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -9,6 +10,7 @@ import typer
 from .cli import app
 from .config import load_config
 from .db import connect
+from .recorder_state import describe, read_state
 
 
 @app.command()
@@ -21,6 +23,9 @@ def status() -> None:
     pending = conn.execute(
         "SELECT COUNT(*) AS n FROM recordings WHERE processed_at IS NULL AND error IS NULL"
     ).fetchone()["n"]
+    audio_pruned = conn.execute(
+        "SELECT COUNT(*) AS n FROM recordings WHERE audio_deleted_at IS NOT NULL"
+    ).fetchone()["n"]
     utt = conn.execute("SELECT COUNT(*) AS n FROM utterances").fetchone()["n"]
     inbox = 0
     if cfg.paths.inbox.exists():
@@ -29,6 +34,10 @@ def status() -> None:
     typer.echo(f"db       : {cfg.paths.db_path}")
     typer.echo(f"asr backend: {cfg.asr.backend}")
     typer.echo(f"asr model: {cfg.asr.resolved_model}")
+    recorder_state = read_state(cfg.paths.root)
+    typer.echo(
+        f"recorder : {describe(recorder_state, cfg.summarize.timezone, now=datetime.now(UTC))}"
+    )
     typer.echo(f"inbox files      : {inbox}")
     # Silent transcription failures look exactly like a quiet day in the counts above, so
     # surface the shape that means "we heard speech and wrote nothing down": a settings
@@ -42,6 +51,7 @@ def status() -> None:
         """
     ).fetchone()["n"]
     typer.echo(f"recordings       : {rec} (pending: {pending})")
+    typer.echo(f"audio-pruned recordings: {audio_pruned}")
     typer.echo(f"utterances       : {utt}")
     typer.echo(
         f"speech, no text  : {silent}"

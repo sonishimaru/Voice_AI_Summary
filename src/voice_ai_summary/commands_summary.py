@@ -12,10 +12,13 @@ def episodes(
     day: str = typer.Option(None, "--day", help="Local date YYYY-MM-DD (default: today)."),
 ) -> None:
     """List episodes for a local day: time range, kind, and utterance count."""
+    from datetime import UTC, datetime
+
     from .config import load_config
     from .db import connect
     from .episodes import build_episodes
-    from .timeutil import fmt_hm, today_local
+    from .recorder_state import format_intervals, pause_intervals
+    from .timeutil import fmt_hm, local_time_to_utc, today_local
 
     cfg = load_config()
     cfg.ensure_dirs()
@@ -24,8 +27,17 @@ def episodes(
     day = day or today_local(tz)
 
     episode_ids = build_episodes(conn, cfg, day)
+
+    day_start_utc = local_time_to_utc(day, "00:00", tz)
+    day_end_utc = local_time_to_utc(day, "24:00", tz)
+    intervals = pause_intervals(cfg.paths.root, day_start_utc, day_end_utc, now=datetime.now(UTC))
+
     if not episode_ids:
         typer.echo(f"{day}: no episodes")
+        for interval_start, interval_end in intervals:
+            typer.echo(
+                f"--- recorder paused {format_intervals([(interval_start, interval_end)], tz)} ---"
+            )
         return
 
     placeholders = ",".join("?" for _ in episode_ids)
@@ -41,13 +53,24 @@ def episodes(
         """,
         episode_ids,
     ).fetchall()
+
+    remaining = list(intervals)
     for row in rows:
+        while remaining and remaining[0][1] <= row["started_at_utc"]:
+            interval_start, interval_end = remaining.pop(0)
+            typer.echo(
+                f"--- recorder paused {format_intervals([(interval_start, interval_end)], tz)} ---"
+            )
         start = fmt_hm(row["started_at_utc"], tz)
         end = fmt_hm(row["ended_at_utc"], tz)
         title = row["title"] or "(untitled)"
         typer.echo(
             f"#{row['id']} {start}-{end} [{row['kind']}] {title} "
             f"({row['n_utterances']} utterances, {row['source_mix']})"
+        )
+    for interval_start, interval_end in remaining:
+        typer.echo(
+            f"--- recorder paused {format_intervals([(interval_start, interval_end)], tz)} ---"
         )
 
 
