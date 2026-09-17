@@ -41,8 +41,12 @@ targets:
       properties:
         CFBundleShortVersionString: "0.2.0"
         CFBundleVersion: "1"
-        # No Dock icon / app menu bar -- purely a MenuBarExtra app.
-        LSUIElement: true
+        # LSUIElement is deliberately NOT set: this app keeps a Dock icon.
+        # The Dock tile is the primary control surface (right-click for the
+        # full menu, see `AppDelegate.applicationDockMenu`) because a menu
+        # bar item is a small target that a crowded bar -- or a notch --
+        # can hide entirely. The menu bar item is still available, opt-out
+        # via the "メニューバーに表示" toggle.
         # Shown by macOS the first time AVAudioEngine actually opens the
         # microphone input.
         NSMicrophoneUsageDescription: "会議や通話などの音声を録音し、後で自動要約するためにマイクを使用します。"

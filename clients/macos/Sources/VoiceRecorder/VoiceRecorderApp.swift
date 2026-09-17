@@ -14,12 +14,20 @@ struct VoiceRecorderApp: App {
     // a reference here is safe.
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
+    /// Mirrors `Settings.showMenuBarIcon`. `@AppStorage` rather than a read
+    /// through `Settings` because SwiftUI has to re-evaluate this scene when
+    /// it changes, which is what actually inserts/removes the menu bar item.
+    @AppStorage("showMenuBarIcon") private var showMenuBarIcon = true
+
     init() {
         AppDelegate.controllerForLaunch = controller
     }
 
     var body: some Scene {
-        MenuBarExtra {
+        // The Dock icon is the always-present surface (see `DockIcon`); the
+        // menu bar item is opt-out, for menu bars too crowded -- or notches
+        // too wide -- to leave room for it.
+        MenuBarExtra(isInserted: $showMenuBarIcon) {
             MenuBarContent(controller: controller)
         } label: {
             // NOTE: the icon *shape* (`iconName`) is the real signal for
@@ -56,7 +64,127 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static var controllerForLaunch: RecordingController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // `state`'s `didSet` keeps the Dock tile current from here on, but it
+        // does not fire for the property's initial value, so paint it once.
+        DockIcon.update(for: Self.controllerForLaunch?.state ?? .stopped)
         Self.controllerForLaunch?.restoreAtLaunch()
+    }
+
+    /// The Dock icon's right-click (or click-and-hold) menu.
+    ///
+    /// Carries every action the menu bar item does, because the menu bar
+    /// item is optional: on a crowded bar -- or a notched display, where
+    /// items disappear entirely -- the Dock tile is a far larger target that
+    /// cannot be hidden. Rebuilt on each invocation so it reflects the state
+    /// at the moment of the click. macOS appends its own items (Options,
+    /// Quit) below these; Quit goes through `applicationShouldTerminate`,
+    /// which finalizes the current segment.
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        guard let controller = Self.controllerForLaunch else { return nil }
+        let menu = NSMenu()
+
+        let status = NSMenuItem(title: Self.statusTitle(for: controller), action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(status)
+        if let message = controller.lastActionMessage {
+            let note = NSMenuItem(title: message, action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            menu.addItem(note)
+        }
+        menu.addItem(.separator())
+
+        switch controller.state {
+        case .recording:
+            let pause = NSMenuItem(title: "一時停止", action: nil, keyEquivalent: "")
+            let submenu = NSMenu()
+            for option in PauseOption.allCases {
+                let item = NSMenuItem(title: option.title, action: #selector(dockPause(_:)), keyEquivalent: "")
+                item.target = self
+                item.tag = option.rawValue
+                submenu.addItem(item)
+            }
+            pause.submenu = submenu
+            menu.addItem(pause)
+        case .paused:
+            menu.addItem(Self.item(title: "再開", action: #selector(dockResume(_:)), target: self))
+        case .stopped:
+            menu.addItem(Self.item(title: "開始", action: #selector(dockStart(_:)), target: self))
+        }
+
+        let stop = Self.item(title: "停止", action: #selector(dockStop(_:)), target: self)
+        // An already-stopped recorder has nothing to stop; `isEnabled` has to
+        // be set explicitly because a menu built outside the responder chain
+        // does not get automatic enabling.
+        stop.isEnabled = controller.intent != .stopped
+        menu.addItem(stop)
+
+        menu.addItem(.separator())
+        menu.addItem(Self.item(title: "直近 15 分の録音を削除…", action: #selector(dockDeleteRecent(_:)), target: self))
+        menu.addItem(Self.item(title: "inbox フォルダを開く", action: #selector(dockOpenInbox(_:)), target: self))
+
+        let menuBarToggle = Self.item(title: "メニューバーに表示", action: #selector(dockToggleMenuBarIcon(_:)), target: self)
+        menuBarToggle.state = Settings.shared.showMenuBarIcon ? .on : .off
+        menu.addItem(menuBarToggle)
+
+        return menu
+    }
+
+    private static func item(title: String, action: Selector, target: AnyObject) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = target
+        return item
+    }
+
+    private static func statusTitle(for controller: RecordingController) -> String {
+        switch controller.state {
+        case .recording:
+            guard let startedAt = controller.recordingStartedAt else { return "録音中" }
+            return "録音中 \(timeFormatter.string(from: startedAt))〜"
+        case .paused:
+            guard let resumeAt = controller.resumeAt else { return "一時停止中 — 手動で再開するまで" }
+            let remaining = max(0, Int(resumeAt.timeIntervalSinceNow / 60))
+            return "一時停止中 — \(timeFormatter.string(from: resumeAt)) に再開（残り \(remaining) 分）"
+        case .stopped:
+            return controller.intent == .recording ? "録音を開始できません — 5 秒ごとに再試行中" : "停止中"
+        }
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+
+    // MARK: - Dock menu actions
+
+    @objc private func dockPause(_ sender: NSMenuItem) {
+        guard let option = PauseOption(rawValue: sender.tag) else { return }
+        Self.controllerForLaunch?.pause(until: option.resumeDate())
+    }
+
+    @objc private func dockResume(_ sender: NSMenuItem) {
+        Self.controllerForLaunch?.resume(reason: "user")
+    }
+
+    @objc private func dockStart(_ sender: NSMenuItem) {
+        Self.controllerForLaunch?.start()
+    }
+
+    @objc private func dockStop(_ sender: NSMenuItem) {
+        Self.controllerForLaunch?.stop()
+    }
+
+    @objc private func dockDeleteRecent(_ sender: NSMenuItem) {
+        Self.controllerForLaunch?.deleteRecentAudio()
+    }
+
+    @objc private func dockOpenInbox(_ sender: NSMenuItem) {
+        try? Settings.shared.ensureInboxDirectoryExists()
+        NSWorkspace.shared.open(Settings.shared.inboxURL)
+    }
+
+    @objc private func dockToggleMenuBarIcon(_ sender: NSMenuItem) {
+        Settings.shared.showMenuBarIcon.toggle()
     }
 
     /// Covers logout/shutdown (and any other path that asks the app to
@@ -90,10 +218,9 @@ private struct MenuBarContent: View {
         switch controller.state {
         case .recording:
             Menu("一時停止") {
-                Button("30 分") { controller.pause(until: Date().addingTimeInterval(30 * 60)) }
-                Button("1 時間") { controller.pause(until: Date().addingTimeInterval(60 * 60)) }
-                Button("今日中") { controller.pause(until: Self.endOfToday()) }
-                Button("再開するまで") { controller.pause(until: nil) }
+                ForEach(PauseOption.allCases, id: \.rawValue) { option in
+                    Button(option.title) { controller.pause(until: option.resumeDate()) }
+                }
             }
         case .paused:
             Button("再開") { controller.resume(reason: "user") }
@@ -112,6 +239,7 @@ private struct MenuBarContent: View {
 
         Divider()
 
+        Toggle("メニューバーに表示", isOn: menuBarIconBinding)
         Toggle("ログイン時に起動", isOn: launchAtLoginBinding)
         Button("inbox フォルダを開く") {
             openInboxFolder()
@@ -158,6 +286,15 @@ private struct MenuBarContent: View {
         return "一時停止中 — \(Self.timeFormatter.string(from: resumeAt)) に再開（残り \(remainingMinutes) 分）"
     }
 
+    /// Turning this off leaves the Dock icon as the only way in -- which is
+    /// the point, and why the Dock menu carries every action this one does.
+    private var menuBarIconBinding: Binding<Bool> {
+        Binding(
+            get: { Settings.shared.showMenuBarIcon },
+            set: { Settings.shared.showMenuBarIcon = $0 }
+        )
+    }
+
     /// `Settings` isn't `ObservableObject`; a hand-rolled `Binding` reads
     /// the live `SMAppService` status on `get` and pushes changes through
     /// `Settings.setLaunchAtLogin` on `set`, reverting the toggle in the UI
@@ -174,12 +311,6 @@ private struct MenuBarContent: View {
     private func openInboxFolder() {
         try? Settings.shared.ensureInboxDirectoryExists()
         NSWorkspace.shared.open(Settings.shared.inboxURL)
-    }
-
-    /// Next local midnight, for the "今日中" (until end of today) pause option.
-    private static func endOfToday() -> Date {
-        Calendar.current.nextDate(after: Date(), matching: DateComponents(hour: 0, minute: 0), matchingPolicy: .nextTime)
-            ?? Date().addingTimeInterval(24 * 60 * 60)
     }
 
     private static let timeFormatter: DateFormatter = {

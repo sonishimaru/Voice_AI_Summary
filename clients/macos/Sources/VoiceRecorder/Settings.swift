@@ -26,6 +26,7 @@ final class Settings {
         static let recorderIntent = "recorderIntent"
         static let resumeAt = "resumeAt"
         static let stateDirPath = "stateDirPath"
+        static let showMenuBarIcon = "showMenuBarIcon"
     }
 
     private init() {}
@@ -58,6 +59,21 @@ final class Settings {
             return stored > 0 ? stored : 15
         }
         set { defaults.set(newValue, forKey: Keys.rotationMinutes) }
+    }
+
+    /// Whether to also show the menu bar icon. The Dock icon is always
+    /// there (the app is not `LSUIElement`), so this one is optional: on a
+    /// crowded menu bar -- especially on a notched display, where items
+    /// silently disappear under the notch -- it is a small, hard-to-hit
+    /// target. Defaults to `true` so nothing vanishes on an existing
+    /// install; turn it off from the Dock menu once the Dock icon is
+    /// doing the job.
+    var showMenuBarIcon: Bool {
+        get {
+            if defaults.object(forKey: Keys.showMenuBarIcon) == nil { return true }
+            return defaults.bool(forKey: Keys.showMenuBarIcon)
+        }
+        set { defaults.set(newValue, forKey: Keys.showMenuBarIcon) }
     }
 
     /// Directory `recorder_state.json` / `recorder_events.jsonl` are

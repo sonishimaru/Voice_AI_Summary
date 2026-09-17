@@ -33,7 +33,12 @@ final class RecordingController: ObservableObject {
         case stopped
     }
 
-    @Published private(set) var state: State = .stopped
+    @Published private(set) var state: State = .stopped {
+        // The Dock tile is this app's only always-visible surface (the menu
+        // bar icon is optional, and can be hidden under the notch), so it
+        // follows `state` from the one place every transition goes through.
+        didSet { DockIcon.update(for: state) }
+    }
     @Published private(set) var recordingStartedAt: Date?
     @Published var resumeAt: Date? {
         didSet { settings.resumeAt = resumeAt }
