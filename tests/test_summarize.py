@@ -456,3 +456,32 @@ def test_digest_path_prints_the_local_file(vas) -> None:
 
     assert found.exit_code == 0
     assert found.output.strip() == str(cfg.paths.digests / "2026-09-15.md")
+
+
+def test_run_day_no_episodes_restores_the_mirror_too(vas, fake_calls, tmp_path) -> None:
+    """The mirror is what actually got clobbered, and what outside readers open.
+
+    `digest_mirror_dir` exists because readers cannot reach Application Support, so a
+    restore that rebuilt only the copy under `data_dir` would leave every such reader
+    still looking at the placeholder that overwrote the real digest.
+    """
+    cfg, conn = vas
+    day = "2026-09-15"
+    original_markdown = "# 2026-09-15 の記録\n\n## ハイライト\n\n- 本物のダイジェスト\n"
+    mirror = tmp_path / "mirror"
+    cfg.paths.digest_mirror_dir = mirror
+    cfg.ensure_dirs()
+    (mirror / f"{day}.md").write_text("# 2026-09-15 の記録\n\n記録なし\n", encoding="utf-8")
+
+    conn.execute(
+        "INSERT INTO summaries(scope, scope_key, model, prompt_version, json, markdown, created_at)"
+        " VALUES ('day', ?, 'claude-opus-5', ?, '{}', ?, '2026-09-15T00:00:00Z')",
+        (day, summarize_mod.PROMPT_VERSION, original_markdown),
+    )
+    conn.commit()
+
+    markdown = run_day(conn, cfg, day)
+
+    assert markdown == original_markdown
+    assert fake_calls["map"] == 0
+    assert (mirror / f"{day}.md").read_text(encoding="utf-8") == original_markdown

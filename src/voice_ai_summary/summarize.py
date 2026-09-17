@@ -460,6 +460,7 @@ def run_day(
         ).fetchone()
         stored_markdown = day_row["markdown"] if day_row is not None else None
 
+        digest_path = cfg.paths.digests / f"{day}.md"
         file_markdown = None
         if digest_path.is_file():
             text = digest_path.read_text(encoding="utf-8")
@@ -467,10 +468,12 @@ def run_day(
                 file_markdown = text
 
         if stored_markdown:
-            # The DB is the source of truth; restore the file mirror if it's missing,
-            # empty, or otherwise out of sync with it - never the other way round.
+            # The DB is the source of truth; rewrite the copies on disk whenever they
+            # disagree with it - never the other way round. Through `_write_digest`, so
+            # `digest_mirror_dir` is restored too: the mirror is what the clobbering
+            # destroyed, and it is what outside readers actually open.
             if file_markdown != stored_markdown:
-                digest_path.write_text(stored_markdown, encoding="utf-8")
+                _write_digest(cfg, day, stored_markdown)
             return stored_markdown
 
         if file_markdown:
