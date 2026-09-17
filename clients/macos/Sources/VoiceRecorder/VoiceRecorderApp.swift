@@ -79,9 +79,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// at the moment of the click. macOS appends its own items (Options,
     /// Quit) below these; Quit goes through `applicationShouldTerminate`,
     /// which finalizes the current segment.
+    ///
+    /// KNOWN macOS LIMITATION: this is not called for an app running under
+    /// Xcode's debugger, so a build started with Cmd-R shows only macOS's
+    /// own Dock items. Launch the built `.app` from Finder to see these.
+    /// See `README.md`.
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         guard let controller = Self.controllerForLaunch else { return nil }
         let menu = NSMenu()
+        // Without this, AppKit decides each item's enabled state by asking
+        // whether the target responds to its action -- which it always does,
+        // so the disabled "停止" below would come back enabled.
+        menu.autoenablesItems = false
 
         let status = NSMenuItem(title: Self.statusTitle(for: controller), action: nil, keyEquivalent: "")
         status.isEnabled = false

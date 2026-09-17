@@ -85,6 +85,14 @@ Dockアイコンが主な操作場所です。メニューバーは項目が増�
 
 Dockメニューには「ログイン時に起動」も含まれるので、メニューバーアイコンを消しても設定一式に手が届きます。
 
+> **Xcodeから `⌘R` で起動したアプリでは、Dockメニューにこれらの項目は出ません。** macOS側の既知の問題で、デバッガに接続されたアプリには `applicationDockMenu` が呼ばれないためです（[Apple Developer Forums](https://developer.apple.com/forums/thread/783906)）。macOSが自動で付ける「オプション」「終了」などだけが表示されます。確認するには、ビルドされた `.app` をFinderから直接起動してください:
+>
+> ```sh
+> open "$(ls -dt ~/Library/Developer/Xcode/DerivedData/VoiceRecorder-*/Build/Products/Debug/VoiceRecorder.app | head -1)"
+> ```
+>
+> 常用するなら、その `.app` を `/Applications` にコピーして使ってください（DerivedData内のものはリビルドのたびに置き換わります）。
+
 なおDockメニューの下半分（「オプション」「終了」など）はmacOSが自動的に付けるものです。そこから終了しても、現在のセグメントファイルは確定されてから終了します。
 
 ## メニュー項目
