@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from voice_ai_summary import ingest as ingest_mod
 from voice_ai_summary.config import Config
 from voice_ai_summary.ingest import ingest_file, ingest_inbox, parse_inbox_name
 
@@ -189,3 +190,62 @@ def test_ingest_inbox_skips_a_file_that_vanishes_mid_pass(
     assert len(ids) == 1
     count = conn.execute("SELECT COUNT(*) AS n FROM recordings").fetchone()["n"]
     assert count == 1
+
+
+class TestRecoverStaleParts:
+    """`.part` files the recorder abandoned (crash, force-quit, a finalize that
+    never ran) hold real audio that ingestion skips by design, so nothing ever
+    mentions it again. Recovery turns that silent loss into a delay."""
+
+    def _write(self, cfg, name: str, *, age_s: float) -> Path:
+        path = cfg.paths.inbox / name
+        path.write_bytes(b"audio")
+        stamp = time.time() - age_s
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_renames_a_part_nobody_is_writing_to(self, vas) -> None:
+        cfg, _ = vas
+        stale = self._write(cfg, "mac_mic_dev_20260917T100000Z.m4a.part", age_s=60 * 60)
+
+        recovered = ingest_mod.recover_stale_parts(cfg)
+
+        assert recovered == [cfg.paths.inbox / "mac_mic_dev_20260917T100000Z.m4a"]
+        assert not stale.exists()
+        assert recovered[0].read_bytes() == b"audio"
+
+    def test_leaves_a_file_the_recorder_still_has_open(self, vas) -> None:
+        cfg, _ = vas
+        fresh = self._write(cfg, "mac_mic_dev_20260917T100000Z.m4a.part", age_s=30)
+
+        assert ingest_mod.recover_stale_parts(cfg) == []
+        assert fresh.exists()
+
+    def test_cutoff_follows_the_configured_rotation(self, vas) -> None:
+        cfg, _ = vas
+        cfg.recorder.rotation_minutes = 1
+        # Older than 3 x 1 min, but well inside the 3 x 15 min default.
+        self._write(cfg, "mac_mic_dev_20260917T100000Z.m4a.part", age_s=5 * 60)
+
+        assert len(ingest_mod.recover_stale_parts(cfg)) == 1
+
+    def test_does_not_overwrite_an_existing_final_file(self, vas) -> None:
+        cfg, _ = vas
+        stale = self._write(cfg, "mac_mic_dev_20260917T100000Z.m4a.part", age_s=60 * 60)
+        final = cfg.paths.inbox / "mac_mic_dev_20260917T100000Z.m4a"
+        final.write_bytes(b"the good copy")
+
+        assert ingest_mod.recover_stale_parts(cfg) == []
+        assert stale.exists()
+        assert final.read_bytes() == b"the good copy"
+
+    def test_ingest_inbox_picks_up_what_it_recovered(self, vas) -> None:
+        cfg, conn = vas
+        self._write(cfg, "mac_mic_dev_20260917T100000Z.m4a.part", age_s=60 * 60)
+
+        ids = ingest_inbox(conn, cfg)
+
+        assert len(ids) == 1
+        row = conn.execute("SELECT source, started_at_utc FROM recordings").fetchone()
+        assert row["source"] == "mac_mic"
+        assert row["started_at_utc"] == "2026-09-17T10:00:00Z"

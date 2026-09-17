@@ -122,10 +122,53 @@ def ingest_file(
     return cur.lastrowid
 
 
+# A `.part` is only in progress while the recorder still has it open. The recorder
+# rotates every `rotation_minutes` and its encoder flushes every few seconds, so an
+# actually-open file's mtime is always seconds old; this many rotation periods of
+# silence means nobody is writing to it any more.
+STALE_PART_ROTATIONS = 3
+
+
+def recover_stale_parts(cfg: Config, *, now: float | None = None) -> list[Path]:
+    """Rename abandoned `.part` files so they can be ingested, and return them.
+
+    `.part` marks a file the recorder is still writing. If the app crashes, is
+    force-quit, or fails to finalize, the file is left behind under that name --
+    and since ingestion skips `.part`, the audio sits on disk indefinitely, never
+    transcribed and never mentioned anywhere. Recovering it here means that class
+    of loss is at worst a delay, rather than something that has to be noticed by
+    someone reading a directory listing.
+
+    Only files older than `STALE_PART_ROTATIONS` rotation periods are touched, so a
+    file the recorder genuinely has open is never renamed out from under it.
+    """
+    now = now if now is not None else datetime.now(UTC).timestamp()
+    cutoff = cfg.recorder.rotation_minutes * 60 * STALE_PART_ROTATIONS
+    recovered: list[Path] = []
+    for path in sorted(cfg.paths.inbox.glob("*.part")):
+        try:
+            if (now - path.stat().st_mtime) < cutoff:
+                continue
+            target = path.with_suffix("")
+            if target.exists():
+                # Something already holds the final name; leave the `.part` alone
+                # rather than overwrite a file that may be the good copy.
+                logger.warning("not recovering %s: %s already exists", path.name, target.name)
+                continue
+            path.rename(target)
+        except OSError as exc:
+            logger.warning("could not recover %s: %s", path.name, exc)
+            continue
+        logger.info("recovered abandoned recording %s", target.name)
+        recovered.append(target)
+    return recovered
+
+
 def ingest_inbox(conn: sqlite3.Connection, cfg: Config) -> list[int]:
     """Ingest every non-sidecar file in the inbox, oldest first, skipping in-progress writes."""
     if not cfg.paths.inbox.is_dir():
         return []
+    recover_stale_parts(cfg)
     now = datetime.now(UTC).timestamp()
     # `.part` is the recorder's "still open" marker; mtime alone is not enough because
     # the encoder flushes to disk only every few seconds.

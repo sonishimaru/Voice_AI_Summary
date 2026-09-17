@@ -65,10 +65,12 @@ final class SegmentWriter {
     /// Closes the current file, finalizes it (rename off `.part` + writes
     /// the JSON sidecar), and immediately opens a fresh one. Called by the
     /// rotation timer every `rotationMinutes`.
+    ///
     func rotate() {
-        queue.async { [weak self] in
-            self?.closeAndFinalizeLocked()
-            self?.openLocked()
+        // Strong capture, deliberately -- see `close()`.
+        queue.async {
+            self.closeAndFinalizeLocked()
+            self.openLocked()
         }
     }
 
@@ -77,17 +79,28 @@ final class SegmentWriter {
     /// finalizing it, then immediately starts a new segment. Because files
     /// roll every `rotationMinutes`, this deletes at most that much audio.
     func deleteCurrentAndRestart() {
-        queue.async { [weak self] in
-            self?.discardLocked()
-            self?.openLocked()
+        // Strong capture, deliberately -- see `close()`. A discard that does
+        // not run would leave the audio the user asked to delete on disk.
+        queue.async {
+            self.discardLocked()
+            self.openLocked()
         }
     }
 
     /// Closes and finalizes the current file without opening a new one.
     /// Call when stopping recording entirely.
+    ///
+    /// The capture is strong, and must stay that way. Callers drop their
+    /// reference to the writer immediately after calling this
+    /// (`RecordingController.tearDown` sets `micWriter = nil` on the very
+    /// next line), so a `[weak self]` capture is nil by the time the queue
+    /// gets to the block: the rename never runs and the `.part` file is
+    /// abandoned on disk, un-ingested, forever. Holding `self` until the
+    /// block has run is the whole point -- the writer's last act is to
+    /// finalize its file, and only then may it be deallocated.
     func close() {
-        queue.async { [weak self] in
-            self?.closeAndFinalizeLocked()
+        queue.async {
+            self.closeAndFinalizeLocked()
         }
     }
 
@@ -96,8 +109,8 @@ final class SegmentWriter {
     /// close might never get to run before the process actually exits --
     /// which would abandon an open `.part` file un-renamed.
     func closeSync() {
-        queue.sync { [weak self] in
-            self?.closeAndFinalizeLocked()
+        queue.sync {
+            self.closeAndFinalizeLocked()
         }
     }
 
