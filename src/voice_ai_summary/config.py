@@ -13,6 +13,12 @@ DEFAULT_CONFIG_PATH = Path("~/.config/voice-ai-summary/config.toml")
 
 class PathsConfig(BaseModel):
     data_dir: Path = Path("~/Library/Application Support/VoiceAISummary")
+    # Extra directory each daily digest is copied into. `data_dir` sits under
+    # ~/Library/Application Support, which sandboxed readers (Cowork's device tools and
+    # other agents) are refused access to; mirroring just the digests into an ordinary
+    # folder gives them the day's summary without moving the recordings and the database
+    # out of Application Support. Unset means no mirror.
+    digest_mirror_dir: Path | None = None
 
     @property
     def root(self) -> Path:
@@ -33,6 +39,10 @@ class PathsConfig(BaseModel):
     @property
     def digests(self) -> Path:
         return self.root / "digests"
+
+    @property
+    def digest_mirror(self) -> Path | None:
+        return self.digest_mirror_dir.expanduser() if self.digest_mirror_dir else None
 
 
 DEFAULT_FASTER_WHISPER_MODEL = "kotoba-tech/kotoba-whisper-v2.0-faster"
@@ -230,7 +240,10 @@ class Config(BaseModel):
         return os.environ.get("VAS_SLACK_USER_TOKEN")
 
     def ensure_dirs(self) -> None:
-        for p in (self.paths.inbox, self.paths.store, self.paths.digests):
+        dirs = [self.paths.inbox, self.paths.store, self.paths.digests]
+        if (mirror := self.paths.digest_mirror) is not None:
+            dirs.append(mirror)
+        for p in dirs:
             p.mkdir(parents=True, exist_ok=True)
 
 

@@ -374,6 +374,25 @@ def _content_key(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
 
 
+def _write_digest(cfg: Config, day: str, markdown: str) -> None:
+    """Write `<digests>/{day}.md`, and a copy in `paths.digest_mirror_dir` if set.
+
+    The mirror is a convenience for readers that cannot reach Application Support, so a
+    failure there is logged and swallowed rather than losing the digest itself.
+    """
+    cfg.paths.digests.mkdir(parents=True, exist_ok=True)
+    (cfg.paths.digests / f"{day}.md").write_text(markdown, encoding="utf-8")
+
+    mirror = cfg.paths.digest_mirror
+    if mirror is None:
+        return
+    try:
+        mirror.mkdir(parents=True, exist_ok=True)
+        (mirror / f"{day}.md").write_text(markdown, encoding="utf-8")
+    except OSError as exc:
+        log.warning("digest mirror write to %s failed: %s", mirror, exc)
+
+
 def run_day(
     conn: sqlite3.Connection,
     cfg: Config,
@@ -416,9 +435,6 @@ def run_day(
             correct.correct_day(conn, cfg, day, client=client)
 
     episode_ids = build_episodes(conn, cfg, day)
-
-    cfg.paths.digests.mkdir(parents=True, exist_ok=True)
-    digest_path = cfg.paths.digests / f"{day}.md"
 
     if not episode_ids:
         # THE INVARIANT: having nothing to say must never destroy what was already said.
@@ -467,7 +483,7 @@ def run_day(
         _upsert_summary(
             conn, scope="day", scope_key=day, model="none", json_str="{}", markdown=markdown
         )
-        digest_path.write_text(markdown, encoding="utf-8")
+        _write_digest(cfg, day, markdown)
         return markdown
 
     if client is None:
@@ -556,5 +572,5 @@ def run_day(
     else:
         markdown = day_row["markdown"]
 
-    digest_path.write_text(markdown, encoding="utf-8")
+    _write_digest(cfg, day, markdown)
     return markdown

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -134,6 +135,55 @@ def test_run_day_stores_summaries_and_writes_digest(vas, fake_calls) -> None:
     digest_path = cfg.paths.digests / "2026-09-15.md"
     assert digest_path.is_file()
     assert digest_path.read_text(encoding="utf-8") == _CANNED_DAY_MARKDOWN
+
+
+def test_run_day_mirrors_digest_when_configured(vas, fake_calls, tmp_path) -> None:
+    """`paths.digest_mirror_dir` gets its own copy of the digest, created if missing."""
+    cfg, conn = vas
+    _seed_one_episode(conn)
+    mirror = tmp_path / "mirror" / "voice-digests"
+    cfg.paths.digest_mirror_dir = mirror
+
+    run_day(conn, cfg, "2026-09-15", client=object())
+
+    assert (cfg.paths.digests / "2026-09-15.md").read_text(encoding="utf-8") == (
+        _CANNED_DAY_MARKDOWN
+    )
+    assert (mirror / "2026-09-15.md").read_text(encoding="utf-8") == _CANNED_DAY_MARKDOWN
+
+
+def test_run_day_mirrors_empty_day_digest(vas, fake_calls, tmp_path) -> None:
+    """A day with no episodes still reaches the mirror, so a reader can tell 'nothing
+    recorded today' apart from 'the digest has not run yet'."""
+    cfg, conn = vas
+    mirror = tmp_path / "mirror"
+    cfg.paths.digest_mirror_dir = mirror
+
+    markdown = run_day(conn, cfg, "2026-09-16")
+
+    assert (mirror / "2026-09-16.md").read_text(encoding="utf-8") == markdown
+
+
+def test_run_day_survives_unwritable_mirror(vas, fake_calls, tmp_path, monkeypatch) -> None:
+    """An unwritable mirror must not cost us the digest itself."""
+    cfg, conn = vas
+    _seed_one_episode(conn)
+    cfg.paths.digest_mirror_dir = tmp_path / "mirror"
+
+    real_mkdir = Path.mkdir
+
+    def failing_mkdir(self, *args, **kwargs):
+        if self == (tmp_path / "mirror"):
+            raise PermissionError("read-only")
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", failing_mkdir)
+
+    markdown = run_day(conn, cfg, "2026-09-15", client=object())
+
+    assert markdown == _CANNED_DAY_MARKDOWN
+    assert (cfg.paths.digests / "2026-09-15.md").is_file()
+    assert not (tmp_path / "mirror").exists()
 
 
 def test_run_day_second_call_makes_zero_api_calls(vas, fake_calls) -> None:
