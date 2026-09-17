@@ -102,7 +102,7 @@ private struct MenuBarContent: View {
         }
 
         Button("停止") { controller.stop() }
-            .disabled(controller.state == .stopped)
+            .disabled(controller.intent == .stopped)
 
         Divider()
 
@@ -137,7 +137,11 @@ private struct MenuBarContent: View {
         case .paused:
             Text(pausedStatusText)
         case .stopped:
-            Text("停止中")
+            if controller.intent == .recording {
+                Text("録音を開始できません — 5 秒ごとに再試行中")
+            } else {
+                Text("停止中")
+            }
         }
     }
 

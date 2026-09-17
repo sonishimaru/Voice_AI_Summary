@@ -49,7 +49,10 @@ final class RecordingController: ObservableObject {
     /// The user's persisted intent -- the only thing that decides whether
     /// an automatic restart path is allowed to actually start capturing.
     /// Mirrored to `Settings` on every change so it survives a relaunch.
-    private(set) var intent: Intent = .stopped {
+    /// `@Published` so the menu can key "停止" on it: while capture is
+    /// failing and retrying, `state` is `.stopped` but `intent` is still
+    /// `.recording`, and the user must still be able to stop the retries.
+    @Published private(set) var intent: Intent = .stopped {
         didSet { settings.intent = intent }
     }
 
@@ -119,7 +122,12 @@ final class RecordingController: ObservableObject {
     /// `until` and schedules an automatic resume there (surviving a
     /// relaunch in the meantime, via `restoreAtLaunch`).
     func pause(until: Date?) {
-        guard state == .recording else { return }
+        // Keyed on `intent`, not `state`: while capture is failing and the
+        // 5 s retry loop is running, `state` is `.stopped` but `intent` is
+        // `.recording` -- and that is exactly when the user needs Pause to
+        // work, or the retries keep firing. `tearDown` is safe with no
+        // writers open.
+        guard intent == .recording else { return }
         intent = .paused
         lastActionMessage = nil
 
@@ -158,7 +166,7 @@ final class RecordingController: ObservableObject {
     /// the user presses "開始" again (or relaunches while `intent ==
     /// .recording`).
     func stop() {
-        guard state != .stopped else { return }
+        guard intent != .stopped else { return }  // same reasoning as in `pause`
         intent = .stopped
         resumeTimer?.invalidate()
         resumeTimer = nil
@@ -435,7 +443,10 @@ final class RecordingController: ObservableObject {
         heartbeatTimer?.invalidate()
         let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.writeStateFile(reason: "heartbeat")
+                // State file only: a heartbeat is not a transition and must
+                // not land in `recorder_events.jsonl`.
+                guard let self else { return }
+                self.stateFile.writeStateOnly(self.makeSnapshot(reason: "heartbeat"))
             }
         }
         RunLoop.main.add(timer, forMode: .common)

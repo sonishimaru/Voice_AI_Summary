@@ -34,6 +34,24 @@ struct RecorderStateSnapshot: Encodable {
         case minutes
         case files
     }
+
+    /// Hand-written so `resume_at` is always present (`null` when nil):
+    /// the synthesized encoder would omit a nil Optional entirely, and the
+    /// Python reader (`recorder_state.read_state`) treats the key as part
+    /// of the schema. `minutes`/`files` stay omit-when-nil, as documented.
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(schema, forKey: .schema)
+        try c.encode(state, forKey: .state)
+        try c.encode(since, forKey: .since)
+        try c.encode(resumeAt, forKey: .resumeAt)
+        try c.encode(reason, forKey: .reason)
+        try c.encode(pid, forKey: .pid)
+        try c.encode(appVersion, forKey: .appVersion)
+        try c.encode(updatedAt, forKey: .updatedAt)
+        try c.encodeIfPresent(minutes, forKey: .minutes)
+        try c.encodeIfPresent(files, forKey: .files)
+    }
 }
 
 /// Owns `<stateDir>/recorder_state.json` and `<stateDir>/recorder_events.jsonl`.
@@ -88,6 +106,17 @@ final class RecorderStateFile {
         queue.sync {
             Self.writeStateLocked(snapshot)
             Self.appendEventLocked(snapshot)
+        }
+    }
+
+    /// Overwrites `recorder_state.json` only, without appending to the
+    /// event log -- used for the 60 s heartbeat while recording, which
+    /// refreshes `updated_at` but is not a state transition and would
+    /// otherwise add ~1,440 lines a day to a log that readers replay in
+    /// full on every call.
+    func writeStateOnly(_ snapshot: RecorderStateSnapshot) {
+        queue.async {
+            Self.writeStateLocked(snapshot)
         }
     }
 
