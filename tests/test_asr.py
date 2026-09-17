@@ -8,7 +8,9 @@ import pytest
 from voice_ai_summary.asr import (
     MAX_HOTWORD_CHARS,
     FasterWhisperBackend,
+    Utterance,
     _merged_hotwords,
+    drop_consecutive_repeats,
     get_backend,
     normalize_samples,
 )
@@ -141,3 +143,212 @@ def test_normalize_samples_caps_the_gain_on_near_silence() -> None:
     so the gain is capped instead of reaching the target."""
     room_tone = np.full(1000, 0.002, dtype=np.float32)
     assert float(np.abs(normalize_samples(room_tone, "peak")).max()) == pytest.approx(0.04)
+
+
+def test_asr_normalize_can_be_overridden_per_source() -> None:
+    """Same shape as `VadConfig.threshold_by_source`/`for_source`: one global `normalize`
+    can't serve both the quiet mic track and the already-loud system track."""
+    cfg = Config()
+    cfg.asr.normalize = "none"
+    cfg.asr.normalize_by_source = {"mac_mic": "rms"}
+
+    assert cfg.asr.for_source("mac_mic").normalize == "rms"
+    assert cfg.asr.for_source("mac_system").normalize == "none"
+    assert cfg.asr.for_source("mac_system") is cfg.asr
+    assert cfg.asr.for_source(None) is cfg.asr
+
+
+def test_faster_whisper_transcribe_uses_the_per_source_normalize_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The override must actually reach the backend's normalization call, not just sit
+    on the config object."""
+    modes_seen: list[str] = []
+
+    def fake_normalize(samples, mode):
+        modes_seen.append(mode)
+        return samples
+
+    monkeypatch.setattr("voice_ai_summary.asr.normalize_samples", fake_normalize)
+
+    cfg = Config()
+    cfg.asr.normalize = "none"
+    cfg.asr.normalize_by_source = {"mac_mic": "rms"}
+    backend = FasterWhisperBackend(cfg)
+    backend._model = _FakeModel()
+
+    backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja", source="mac_mic")
+    backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja", source="mac_system")
+    backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
+
+    assert modes_seen == ["rms", "none", "none"]
+
+
+def test_faster_whisper_passes_decoder_thresholds_at_library_defaults() -> None:
+    """Defaults must equal faster-whisper's own, read from its `transcribe` signature, so
+    leaving these unset changes nothing."""
+    import inspect
+
+    from faster_whisper import WhisperModel
+
+    cfg = Config()
+    backend = FasterWhisperBackend(cfg)
+    model = _FakeModel()
+    backend._model = model
+
+    backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
+
+    sig = inspect.signature(WhisperModel.transcribe)
+    assert model.kwargs["no_speech_threshold"] == sig.parameters["no_speech_threshold"].default
+    assert model.kwargs["log_prob_threshold"] == sig.parameters["log_prob_threshold"].default
+    assert (
+        model.kwargs["compression_ratio_threshold"]
+        == sig.parameters["compression_ratio_threshold"].default
+    )
+    assert cfg.asr.no_speech_threshold == sig.parameters["no_speech_threshold"].default
+    assert cfg.asr.log_prob_threshold == sig.parameters["log_prob_threshold"].default
+    assert (
+        cfg.asr.compression_ratio_threshold == sig.parameters["compression_ratio_threshold"].default
+    )
+
+
+def test_faster_whisper_passes_configured_decoder_thresholds() -> None:
+    cfg = Config()
+    cfg.asr.no_speech_threshold = 0.3
+    cfg.asr.log_prob_threshold = -0.5
+    cfg.asr.compression_ratio_threshold = 2.0
+    backend = FasterWhisperBackend(cfg)
+    model = _FakeModel()
+    backend._model = model
+
+    backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
+
+    assert model.kwargs["no_speech_threshold"] == 0.3
+    assert model.kwargs["log_prob_threshold"] == -0.5
+    assert model.kwargs["compression_ratio_threshold"] == 2.0
+
+
+class _RepeatingModel:
+    """Simulates a repetition-loop decode: the same line comes back several times."""
+
+    def __init__(self, texts: list[str]) -> None:
+        self._texts = texts
+        self.kwargs: dict = {}
+
+    def transcribe(self, samples, **kwargs):
+        self.kwargs = kwargs
+        segs = [_Seg(float(i), float(i + 1), text) for i, text in enumerate(self._texts)]
+        return iter(segs), None
+
+
+def test_faster_whisper_drops_consecutive_repeats_by_default() -> None:
+    cfg = Config()
+    backend = FasterWhisperBackend(cfg)
+    backend._model = _RepeatingModel(["同じ文", "同じ文", "同じ文", "別の文"])
+
+    out = backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
+
+    assert [u.text for u in out] == ["同じ文", "別の文"]
+
+
+def test_faster_whisper_repeat_filter_can_be_disabled() -> None:
+    cfg = Config()
+    cfg.asr.drop_repeated_utterances = False
+    backend = FasterWhisperBackend(cfg)
+    backend._model = _RepeatingModel(["同じ文", "同じ文"])
+
+    out = backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
+
+    assert [u.text for u in out] == ["同じ文", "同じ文"]
+
+
+def _utt(text: str) -> Utterance:
+    return Utterance(t_start_ms=0, t_end_ms=1000, text=text, lang="ja", avg_logprob=None)
+
+
+def test_drop_consecutive_repeats_collapses_only_adjacent_duplicates() -> None:
+    utterances = [_utt("こんにちは"), _utt("こんにちは"), _utt("さようなら"), _utt("こんにちは")]
+
+    out = drop_consecutive_repeats(utterances)
+
+    # The final "こんにちは" is not adjacent to the first two, so it survives - a person
+    # genuinely repeating themselves later must not be treated as a decoder loop.
+    assert [u.text for u in out] == ["こんにちは", "さようなら", "こんにちは"]
+
+
+def test_drop_consecutive_repeats_strips_before_comparing() -> None:
+    out = drop_consecutive_repeats([_utt("こんにちは"), _utt(" こんにちは ")])
+    assert len(out) == 1
+
+
+def test_drop_consecutive_repeats_handles_empty_and_single_element_lists() -> None:
+    assert drop_consecutive_repeats([]) == []
+    one = [_utt("x")]
+    assert drop_consecutive_repeats(one) == one
+
+
+def _utt_at(t_start_ms: int, t_end_ms: int, text: str) -> Utterance:
+    return Utterance(
+        t_start_ms=t_start_ms, t_end_ms=t_end_ms, text=text, lang="ja", avg_logprob=None
+    )
+
+
+def test_drop_consecutive_repeats_keeps_repeats_separated_by_a_real_pause() -> None:
+    """Regression: `vad.pack_regions` now joins separate VAD speech regions - absorbing
+    real silence between them - into one `transcribe()` call, so two genuinely separate
+    utterances (e.g. two distinct "はい" spoken several seconds apart) can land adjacent
+    in the same call's output. Dropping the second one purely because it repeats the
+    first's text would silently delete real speech, which is worse than the decoder
+    repetition loop the filter exists to catch."""
+    utterances = [
+        _utt_at(0, 500, "はい"),
+        _utt_at(4500, 5000, "はい"),  # 4000ms after the first ends: a real, separate turn
+    ]
+
+    out = drop_consecutive_repeats(utterances, max_gap_ms=1000)
+
+    assert [u.text for u in out] == ["はい", "はい"]
+
+
+def test_drop_consecutive_repeats_still_collapses_back_to_back_repeats() -> None:
+    """A decoder repetition loop re-emits the same line with (near) zero elapsed time
+    between repeats - that must still be collapsed."""
+    utterances = [
+        _utt_at(0, 500, "はい"),
+        _utt_at(500, 1000, "はい"),  # 0ms gap: back-to-back, exactly what a loop looks like
+    ]
+
+    out = drop_consecutive_repeats(utterances, max_gap_ms=1000)
+
+    assert [u.text for u in out] == ["はい"]
+
+
+def test_drop_consecutive_repeats_default_gap_matches_config_default() -> None:
+    """The function's own default must match `AsrConfig.repeat_gap_max_ms`, so calling it
+    directly (as these unit tests do) exercises the same behaviour as through a backend."""
+    assert Config().asr.repeat_gap_max_ms == 1000
+
+
+def test_faster_whisper_repeat_filter_respects_configured_gap(monkeypatch) -> None:
+    """The gap bound must actually reach the decoder-level filter, not just the
+    standalone function - a real "はい" ... "はい" four seconds apart, produced by one
+    packed decode call, must survive at the backend level too."""
+    cfg = Config()
+    backend = FasterWhisperBackend(cfg)
+
+    class _GappedRepeatingModel:
+        def __init__(self) -> None:
+            self.kwargs: dict = {}
+
+        def transcribe(self, samples, **kwargs):
+            self.kwargs = kwargs
+            return (
+                iter([_Seg(0.0, 0.5, "はい"), _Seg(4.5, 5.0, "はい")]),
+                None,
+            )
+
+    backend._model = _GappedRepeatingModel()
+
+    out = backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
+
+    assert [u.text for u in out] == ["はい", "はい"]

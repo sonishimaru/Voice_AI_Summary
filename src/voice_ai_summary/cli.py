@@ -30,6 +30,9 @@ def _root(
 def main() -> None:
     """Console entry point: report the tool's own errors as messages, not tracebacks."""
     from .llm import BudgetExceeded
+    from .security import apply_process_umask
+
+    apply_process_umask()
 
     try:
         app()
@@ -44,8 +47,10 @@ def main() -> None:
 from . import (  # noqa: E402
     commands,  # noqa: F401
     commands_deliver,  # noqa: F401
+    commands_desktop,  # noqa: F401
     commands_eval,  # noqa: F401
     commands_pipeline,  # noqa: F401
+    commands_security,  # noqa: F401
     commands_summary,  # noqa: F401
     commands_vocab,  # noqa: F401
 )

@@ -12,10 +12,13 @@ def episodes(
     day: str = typer.Option(None, "--day", help="Local date YYYY-MM-DD (default: today)."),
 ) -> None:
     """List episodes for a local day: time range, kind, and utterance count."""
+    from datetime import UTC, datetime
+
     from .config import load_config
     from .db import connect
     from .episodes import build_episodes
-    from .timeutil import fmt_hm, today_local
+    from .recorder_state import pause_intervals, with_pause_markers
+    from .timeutil import fmt_hm, local_time_to_utc, today_local
 
     cfg = load_config()
     cfg.ensure_dirs()
@@ -24,8 +27,17 @@ def episodes(
     day = day or today_local(tz)
 
     episode_ids = build_episodes(conn, cfg, day)
+
+    day_start_utc = local_time_to_utc(day, "00:00", tz)
+    day_end_utc = local_time_to_utc(day, "24:00", tz)
+    intervals = pause_intervals(cfg.paths.root, day_start_utc, day_end_utc, now=datetime.now(UTC))
+
     if not episode_ids:
         typer.echo(f"{day}: no episodes")
+        for line in with_pause_markers(
+            [], intervals, tz, start_of=lambda row: row["started_at_utc"], render=lambda row: ""
+        ):
+            typer.echo(line)
         return
 
     placeholders = ",".join("?" for _ in episode_ids)
@@ -41,14 +53,20 @@ def episodes(
         """,
         episode_ids,
     ).fetchall()
-    for row in rows:
+
+    def _render(row: object) -> str:
         start = fmt_hm(row["started_at_utc"], tz)
         end = fmt_hm(row["ended_at_utc"], tz)
         title = row["title"] or "(untitled)"
-        typer.echo(
+        return (
             f"#{row['id']} {start}-{end} [{row['kind']}] {title} "
             f"({row['n_utterances']} utterances, {row['source_mix']})"
         )
+
+    for line in with_pause_markers(
+        rows, intervals, tz, start_of=lambda row: row["started_at_utc"], render=_render
+    ):
+        typer.echo(line)
 
 
 @app.command()
@@ -103,6 +121,24 @@ def correct(
         ).fetchall()
         for row in rows:
             typer.echo(f"{row['raw_text']} → {row['text']}")
+
+
+@app.command()
+def digest_path(
+    day: str = typer.Option(None, "--day", help="Local date YYYY-MM-DD (default: today)."),
+) -> None:
+    """Print the file path of a stored digest, for opening or reading it locally."""
+    from .config import load_config
+    from .timeutil import today_local
+
+    cfg = load_config()
+    cfg.ensure_dirs()
+    day = day or today_local(cfg.summarize.timezone)
+    path = cfg.paths.digests / f"{day}.md"
+    if not path.is_file():
+        typer.echo(f"No digest file for {day}. Run `vas digest --day {day}` first.", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(str(path))
 
 
 @app.command()

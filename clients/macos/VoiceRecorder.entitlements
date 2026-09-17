@@ -2,13 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!--
-	App Sandbox is intentionally OFF (see README.md "既知の制限"): the
-	Core Audio process-tap / aggregate-device APIs used for system-audio
-	capture are simplest to get working without navigating sandbox
-	exceptions for a still-new API surface, and this is a personal,
-	locally-run tool rather than something distributed via the App Store.
-	-->
 	<key>com.apple.security.app-sandbox</key>
 	<false/>
 	<key>com.apple.security.device.audio-input</key>

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import shutil
 import sqlite3
@@ -12,6 +14,9 @@ from pathlib import Path
 from .audio import sha256_file
 from .config import Config
 from .db import transaction, utcnow_iso
+from .security import ensure_private_dir
+
+logger = logging.getLogger(__name__)
 
 _NAME_RE = re.compile(
     r"^(mac_mic|mac_system|file)_(?P<device>.+)_(?P<ts>\d{8}T\d{6}Z)$",
@@ -82,13 +87,18 @@ def ingest_file(
     started_dt = datetime.strptime(resolved_started, "%Y-%m-%dT%H:%M:%SZ")
     dest_rel = Path(started_dt.strftime("%Y/%m/%d")) / f"{sha[:16]}{path.suffix}"
     dest_abs = cfg.paths.store / dest_rel
-    dest_abs.parent.mkdir(parents=True, exist_ok=True)
+    # Recorded speech lives under here, so the dated directory must not be
+    # group/other-readable even if it predates `security.ensure_private_dir`.
+    ensure_private_dir(dest_abs.parent)
 
     if move:
         shutil.move(str(path), str(dest_abs))
         _delete_sidecar(path)
     else:
         shutil.copy2(path, dest_abs)
+    # `shutil.move`/`copy2` preserve the source file's mode, which may predate this
+    # process's private umask (e.g. a file the recorder wrote before it applied one).
+    os.chmod(dest_abs, 0o600)
 
     with transaction(conn):
         cur = conn.execute(
@@ -112,10 +122,53 @@ def ingest_file(
     return cur.lastrowid
 
 
+# A `.part` is only in progress while the recorder still has it open. The recorder
+# rotates every `rotation_minutes` and its encoder flushes every few seconds, so an
+# actually-open file's mtime is always seconds old; this many rotation periods of
+# silence means nobody is writing to it any more.
+STALE_PART_ROTATIONS = 3
+
+
+def recover_stale_parts(cfg: Config, *, now: float | None = None) -> list[Path]:
+    """Rename abandoned `.part` files so they can be ingested, and return them.
+
+    `.part` marks a file the recorder is still writing. If the app crashes, is
+    force-quit, or fails to finalize, the file is left behind under that name --
+    and since ingestion skips `.part`, the audio sits on disk indefinitely, never
+    transcribed and never mentioned anywhere. Recovering it here means that class
+    of loss is at worst a delay, rather than something that has to be noticed by
+    someone reading a directory listing.
+
+    Only files older than `STALE_PART_ROTATIONS` rotation periods are touched, so a
+    file the recorder genuinely has open is never renamed out from under it.
+    """
+    now = now if now is not None else datetime.now(UTC).timestamp()
+    cutoff = cfg.recorder.rotation_minutes * 60 * STALE_PART_ROTATIONS
+    recovered: list[Path] = []
+    for path in sorted(cfg.paths.inbox.glob("*.part")):
+        try:
+            if (now - path.stat().st_mtime) < cutoff:
+                continue
+            target = path.with_suffix("")
+            if target.exists():
+                # Something already holds the final name; leave the `.part` alone
+                # rather than overwrite a file that may be the good copy.
+                logger.warning("not recovering %s: %s already exists", path.name, target.name)
+                continue
+            path.rename(target)
+        except OSError as exc:
+            logger.warning("could not recover %s: %s", path.name, exc)
+            continue
+        logger.info("recovered abandoned recording %s", target.name)
+        recovered.append(target)
+    return recovered
+
+
 def ingest_inbox(conn: sqlite3.Connection, cfg: Config) -> list[int]:
     """Ingest every non-sidecar file in the inbox, oldest first, skipping in-progress writes."""
     if not cfg.paths.inbox.is_dir():
         return []
+    recover_stale_parts(cfg)
     now = datetime.now(UTC).timestamp()
     # `.part` is the recorder's "still open" marker; mtime alone is not enough because
     # the encoder flushes to disk only every few seconds.
@@ -131,7 +184,14 @@ def ingest_inbox(conn: sqlite3.Connection, cfg: Config) -> list[int]:
 
     ids: list[int] = []
     for path in candidates:
-        rec_id = ingest_file(conn, cfg, path, move=True)
+        try:
+            rec_id = ingest_file(conn, cfg, path, move=True)
+        except FileNotFoundError:
+            # The recorder can delete/rotate a file between the `iterdir()` listing
+            # above and this move (e.g. it also cleans up its own old files) - the
+            # worker must not crash-loop over a race like that.
+            logger.warning("skipping %s: vanished before it could be ingested", path)
+            continue
         if rec_id is not None:
             ids.append(rec_id)
     return ids

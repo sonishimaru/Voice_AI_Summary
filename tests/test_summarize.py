@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -136,6 +137,55 @@ def test_run_day_stores_summaries_and_writes_digest(vas, fake_calls) -> None:
     assert digest_path.read_text(encoding="utf-8") == _CANNED_DAY_MARKDOWN
 
 
+def test_run_day_mirrors_digest_when_configured(vas, fake_calls, tmp_path) -> None:
+    """`paths.digest_mirror_dir` gets its own copy of the digest, created if missing."""
+    cfg, conn = vas
+    _seed_one_episode(conn)
+    mirror = tmp_path / "mirror" / "voice-digests"
+    cfg.paths.digest_mirror_dir = mirror
+
+    run_day(conn, cfg, "2026-09-15", client=object())
+
+    assert (cfg.paths.digests / "2026-09-15.md").read_text(encoding="utf-8") == (
+        _CANNED_DAY_MARKDOWN
+    )
+    assert (mirror / "2026-09-15.md").read_text(encoding="utf-8") == _CANNED_DAY_MARKDOWN
+
+
+def test_run_day_mirrors_empty_day_digest(vas, fake_calls, tmp_path) -> None:
+    """A day with no episodes still reaches the mirror, so a reader can tell 'nothing
+    recorded today' apart from 'the digest has not run yet'."""
+    cfg, conn = vas
+    mirror = tmp_path / "mirror"
+    cfg.paths.digest_mirror_dir = mirror
+
+    markdown = run_day(conn, cfg, "2026-09-16")
+
+    assert (mirror / "2026-09-16.md").read_text(encoding="utf-8") == markdown
+
+
+def test_run_day_survives_unwritable_mirror(vas, fake_calls, tmp_path, monkeypatch) -> None:
+    """An unwritable mirror must not cost us the digest itself."""
+    cfg, conn = vas
+    _seed_one_episode(conn)
+    cfg.paths.digest_mirror_dir = tmp_path / "mirror"
+
+    real_mkdir = Path.mkdir
+
+    def failing_mkdir(self, *args, **kwargs):
+        if self == (tmp_path / "mirror"):
+            raise PermissionError("read-only")
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", failing_mkdir)
+
+    markdown = run_day(conn, cfg, "2026-09-15", client=object())
+
+    assert markdown == _CANNED_DAY_MARKDOWN
+    assert (cfg.paths.digests / "2026-09-15.md").is_file()
+    assert not (tmp_path / "mirror").exists()
+
+
 def test_run_day_second_call_makes_zero_api_calls(vas, fake_calls) -> None:
     cfg, conn = vas
     _seed_one_episode(conn)
@@ -182,6 +232,115 @@ def test_run_day_empty_day_skips_api_and_writes_no_data_markdown(vas, fake_calls
     ).fetchone()
     assert day_row is not None
     assert day_row["markdown"] == markdown
+
+
+def test_run_day_no_episodes_keeps_existing_stored_digest(vas, fake_calls) -> None:
+    """A day that currently has no episodes but already has a stored digest (e.g. a
+    replayed run racing a still-in-progress correction pass) must not have that digest
+    flattened to the "記録なし" placeholder - in the DB or on disk."""
+    cfg, conn = vas
+    day = "2026-09-16"
+    original_markdown = "# 2026-09-16 の記録\n\n## ハイライト\n\n- 本物のダイジェスト\n"
+    cfg.paths.digests.mkdir(parents=True, exist_ok=True)
+    digest_path = cfg.paths.digests / f"{day}.md"
+    digest_path.write_text(original_markdown, encoding="utf-8")
+    conn.execute(
+        "INSERT INTO summaries(scope, scope_key, model, prompt_version, json, markdown, created_at)"
+        " VALUES ('day', ?, 'claude-opus-5', ?, '{}', ?, '2026-09-16T00:00:00Z')",
+        (day, summarize_mod.PROMPT_VERSION, original_markdown),
+    )
+    conn.commit()
+
+    markdown = run_day(conn, cfg, day)
+
+    assert markdown == original_markdown
+    assert fake_calls["map"] == 0
+    assert fake_calls["reduce"] == 0
+
+    row = conn.execute(
+        "SELECT * FROM summaries WHERE scope='day' AND scope_key=?", (day,)
+    ).fetchone()
+    assert row["markdown"] == original_markdown
+    assert row["json"] == "{}"  # untouched - not re-upserted
+
+    assert digest_path.read_bytes() == original_markdown.encode("utf-8")
+
+
+def test_run_day_no_episodes_force_still_keeps_existing_digest(vas, fake_calls) -> None:
+    """`force=True` recomputes summaries; it must not license clobbering an existing
+    digest with the no-data placeholder when there are no episodes to recompute from."""
+    cfg, conn = vas
+    day = "2026-09-16"
+    original_markdown = "# 2026-09-16 の記録\n\n## ハイライト\n\n- 本物のダイジェスト\n"
+    cfg.paths.digests.mkdir(parents=True, exist_ok=True)
+    digest_path = cfg.paths.digests / f"{day}.md"
+    digest_path.write_text(original_markdown, encoding="utf-8")
+    conn.execute(
+        "INSERT INTO summaries(scope, scope_key, model, prompt_version, json, markdown, created_at)"
+        " VALUES ('day', ?, 'claude-opus-5', ?, '{}', ?, '2026-09-16T00:00:00Z')",
+        (day, summarize_mod.PROMPT_VERSION, original_markdown),
+    )
+    conn.commit()
+
+    markdown = run_day(conn, cfg, day, force=True)
+
+    assert markdown == original_markdown
+    assert fake_calls["map"] == 0
+    assert fake_calls["reduce"] == 0
+    assert digest_path.read_bytes() == original_markdown.encode("utf-8")
+
+
+def test_run_day_no_episodes_nothing_stored_writes_placeholder(vas, fake_calls) -> None:
+    """No episodes and no pre-existing digest anywhere: the placeholder is written, as
+    it was before this guard existed."""
+    cfg, conn = vas
+    day = "2026-09-16"
+
+    markdown = run_day(conn, cfg, day)
+
+    assert "記録なし" in markdown
+    assert fake_calls["map"] == 0
+    assert fake_calls["reduce"] == 0
+
+    digest_path = cfg.paths.digests / f"{day}.md"
+    assert digest_path.read_text(encoding="utf-8") == markdown
+
+    row = conn.execute(
+        "SELECT * FROM summaries WHERE scope='day' AND scope_key=?", (day,)
+    ).fetchone()
+    assert row is not None
+    assert row["markdown"] == markdown
+
+
+def test_run_day_no_episodes_restores_missing_file_from_db(vas, fake_calls) -> None:
+    """The DB has a good digest but the mirrored file is missing (e.g. deleted by hand) -
+    the file should be restored from the DB rather than left inconsistent, and the DB
+    row must stay untouched."""
+    cfg, conn = vas
+    day = "2026-09-16"
+    original_markdown = "# 2026-09-16 の記録\n\n## ハイライト\n\n- 本物のダイジェスト\n"
+    conn.execute(
+        "INSERT INTO summaries(scope, scope_key, model, prompt_version, json, markdown, created_at)"
+        " VALUES ('day', ?, 'claude-opus-5', ?, '{}', ?, '2026-09-16T00:00:00Z')",
+        (day, summarize_mod.PROMPT_VERSION, original_markdown),
+    )
+    conn.commit()
+    digest_path = cfg.paths.digests / f"{day}.md"
+    assert not digest_path.exists()
+
+    markdown = run_day(conn, cfg, day)
+
+    assert markdown == original_markdown
+    assert fake_calls["map"] == 0
+    assert fake_calls["reduce"] == 0
+    assert digest_path.is_file()
+    assert digest_path.read_bytes() == original_markdown.encode("utf-8")
+
+    row = conn.execute(
+        "SELECT * FROM summaries WHERE scope='day' AND scope_key=?", (day,)
+    ).fetchone()
+    assert row["markdown"] == original_markdown
+    assert row["json"] == "{}"
 
 
 def test_run_day_recomputes_when_new_utterances_arrive(vas, fake_calls, monkeypatch) -> None:
@@ -278,3 +437,120 @@ def test_run_day_includes_glossary_block_in_map_and_reduce(vas, monkeypatch) -> 
 
     assert "西丸" in captured["map"]
     assert "西丸" in captured["reduce"]
+
+
+def test_map_user_content_wraps_transcript_and_glossary() -> None:
+    from voice_ai_summary.summarize import _map_user_content
+
+    meta = {"start": "10:00", "end": "10:30", "kind": "call", "source_mix": "mic"}
+    content = _map_user_content("トランスクリプト本文", meta, "## 用語集\n- 西丸")
+
+    assert "<transcript>\nトランスクリプト本文\n</transcript>" in content
+    assert "<glossary>\n## 用語集\n- 西丸\n</glossary>" in content
+
+
+def test_map_user_content_omits_glossary_tag_when_empty() -> None:
+    from voice_ai_summary.summarize import _map_user_content
+
+    meta = {"start": "a", "end": "b", "kind": "c", "source_mix": "d"}
+    content = _map_user_content("t", meta, "")
+
+    assert "<glossary>" not in content
+
+
+def test_reduce_user_content_wraps_episodes_and_glossary() -> None:
+    from voice_ai_summary.summarize import _reduce_user_content
+
+    content = _reduce_user_content("2026-09-15", "[]", "## 表記ルール\n- foo")
+
+    assert "<episode_summaries>\n[]\n</episode_summaries>" in content
+    assert "<glossary>\n## 表記ルール\n- foo\n</glossary>" in content
+
+
+def test_reduce_user_content_omits_glossary_tag_when_empty() -> None:
+    from voice_ai_summary.summarize import _reduce_user_content
+
+    content = _reduce_user_content("2026-09-15", "[]", "")
+
+    assert "<glossary>" not in content
+
+
+def test_map_and_reduce_system_prompts_carry_data_framing_sentence() -> None:
+    from voice_ai_summary.summarize import _MAP_SYSTEM, _REDUCE_SYSTEM
+
+    assert "<transcript>" in _MAP_SYSTEM
+    assert "<glossary>" in _MAP_SYSTEM
+    assert "<episode_summaries>" in _REDUCE_SYSTEM
+    assert "<glossary>" in _REDUCE_SYSTEM
+
+
+def test_prompt_version_unchanged() -> None:
+    """`PROMPT_VERSION` must stay exactly as it was: bumping it would invalidate every
+    cached summary and make `_stored_digest` lookups miss existing digests."""
+    assert PROMPT_VERSION == "v1"
+
+
+def test_write_digest_creates_0600_files(vas, tmp_path) -> None:
+    import stat
+
+    from voice_ai_summary.summarize import _write_digest
+
+    cfg, _conn = vas
+    cfg.paths.digest_mirror_dir = tmp_path / "mirror"
+
+    _write_digest(cfg, "2026-09-15", "# hello\n")
+
+    digest_path = cfg.paths.digests / "2026-09-15.md"
+    mirror_path = cfg.paths.digest_mirror_dir / "2026-09-15.md"
+    assert digest_path.read_text(encoding="utf-8") == "# hello\n"
+    assert mirror_path.read_text(encoding="utf-8") == "# hello\n"
+    assert stat.S_IMODE(digest_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(mirror_path.stat().st_mode) == 0o600
+
+
+def test_digest_path_prints_the_local_file(vas) -> None:
+    from typer.testing import CliRunner
+
+    from voice_ai_summary.cli import app
+
+    cfg, _conn = vas
+    runner = CliRunner()
+
+    missing = runner.invoke(app, ["digest-path", "--day", "2026-09-15"])
+    assert missing.exit_code == 1
+
+    cfg.paths.digests.mkdir(parents=True, exist_ok=True)
+    (cfg.paths.digests / "2026-09-15.md").write_text("# test", encoding="utf-8")
+    found = runner.invoke(app, ["digest-path", "--day", "2026-09-15"])
+
+    assert found.exit_code == 0
+    assert found.output.strip() == str(cfg.paths.digests / "2026-09-15.md")
+
+
+def test_run_day_no_episodes_restores_the_mirror_too(vas, fake_calls, tmp_path) -> None:
+    """The mirror is what actually got clobbered, and what outside readers open.
+
+    `digest_mirror_dir` exists because readers cannot reach Application Support, so a
+    restore that rebuilt only the copy under `data_dir` would leave every such reader
+    still looking at the placeholder that overwrote the real digest.
+    """
+    cfg, conn = vas
+    day = "2026-09-15"
+    original_markdown = "# 2026-09-15 の記録\n\n## ハイライト\n\n- 本物のダイジェスト\n"
+    mirror = tmp_path / "mirror"
+    cfg.paths.digest_mirror_dir = mirror
+    cfg.ensure_dirs()
+    (mirror / f"{day}.md").write_text("# 2026-09-15 の記録\n\n記録なし\n", encoding="utf-8")
+
+    conn.execute(
+        "INSERT INTO summaries(scope, scope_key, model, prompt_version, json, markdown, created_at)"
+        " VALUES ('day', ?, 'claude-opus-5', ?, '{}', ?, '2026-09-15T00:00:00Z')",
+        (day, summarize_mod.PROMPT_VERSION, original_markdown),
+    )
+    conn.commit()
+
+    markdown = run_day(conn, cfg, day)
+
+    assert markdown == original_markdown
+    assert fake_calls["map"] == 0
+    assert (mirror / f"{day}.md").read_text(encoding="utf-8") == original_markdown

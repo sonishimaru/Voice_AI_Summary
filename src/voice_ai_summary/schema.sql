@@ -19,7 +19,10 @@ CREATE TABLE IF NOT EXISTS recordings (
     original_name   TEXT NOT NULL DEFAULT '',
     ingested_at     TEXT NOT NULL,
     processed_at    TEXT,
-    error           TEXT
+    error           TEXT,
+    claimed_at      TEXT,                       -- set while a caller owns this row for processing (pipeline.py)
+    processing_ms   INTEGER,                    -- wall time for VAD+ASR in process_recording (pipeline.py)
+    audio_deleted_at TEXT                        -- set when retention removed the audio file; the row and its transcript stay
 );
 CREATE INDEX IF NOT EXISTS idx_recordings_started ON recordings(started_at_utc);
 CREATE INDEX IF NOT EXISTS idx_recordings_unprocessed ON recordings(processed_at) WHERE processed_at IS NULL;

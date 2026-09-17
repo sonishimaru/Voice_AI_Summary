@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import sys
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import Any
 import anthropic
 
 from .config import Config
+from .security import open_private
 
 USAGE_FILENAME = "usage.jsonl"
 
@@ -39,8 +42,99 @@ class BudgetExceeded(RuntimeError):
     """Today's recorded API spend is over `[llm] daily_budget_usd`."""
 
 
+def friendly_api_error(exc: anthropic.APIStatusError, model: str) -> RuntimeError | None:
+    """Turn a setup problem (billing, auth, unknown model) into an actionable message.
+
+    Returns None for anything that is genuinely unexpected, which keeps real bugs loud.
+    """
+    message = str(getattr(exc, "message", "") or exc)
+    if "credit balance" in message.lower():
+        return RuntimeError(
+            "Anthropic API credit balance is empty. Add credits at "
+            "https://platform.claude.com/settings/billing (this is separate from a "
+            "Claude.ai subscription), then run the command again."
+        )
+    if exc.status_code in (401, 403):
+        return RuntimeError(
+            "The Anthropic API rejected the key in VAS_ANTHROPIC_API_KEY "
+            f"(HTTP {exc.status_code}). Check that it is a valid API key."
+        )
+    if exc.status_code == 404:
+        return RuntimeError(f"Unknown model {model!r}. Check the model names in config.toml.")
+    return None
+
+
+API_KEY_FILENAME = "anthropic_api_key"
+
+
+class OutputTruncated(RuntimeError):
+    """A structured-output response carried no complete parsed output."""
+
+
+def parsed_or_raise(response: Any, *, purpose: str) -> Any:
+    """`response.parsed_output`, or a useful error when the model produced none.
+
+    `messages.parse` sets `parsed_output` to None rather than raising when the response
+    carries no complete structured output, so reading it straight through fails later as
+    an `AttributeError` on None, far from the cause. Two things produce it and they need
+    opposite handling: a response cut off at `max_tokens` is retryable with a smaller
+    input, so it raises `OutputTruncated` for the callers' split-and-retry; a refusal is
+    not retryable and surfaces as a message naming the category. `stop_details` is only
+    populated for `stop_reason == "refusal"`, hence the guard rather than a bare read.
+    """
+    if response.stop_reason == "refusal":
+        details = getattr(response, "stop_details", None)
+        category = getattr(details, "category", None) or "unspecified"
+        explanation = (getattr(details, "explanation", None) or "").strip()
+        message = f"The {purpose} model declined this request (category: {category})."
+        raise RuntimeError(f"{message} {explanation}".strip())
+    if response.parsed_output is None:
+        raise OutputTruncated(
+            f"{purpose}: the model returned no parsable structured output "
+            f"(stop_reason={response.stop_reason!r})"
+        )
+    return response.parsed_output
+
+
+def api_key_path() -> Path:
+    """Where a key file may sit: next to config.toml, so it moves with `VAS_CONFIG`."""
+    from .config import DEFAULT_CONFIG_PATH
+
+    config = Path(os.environ.get("VAS_CONFIG", str(DEFAULT_CONFIG_PATH))).expanduser()
+    return config.parent / API_KEY_FILENAME
+
+
 def api_key() -> str | None:
-    return os.environ.get("VAS_ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    """The Anthropic key, from the environment or from a key file.
+
+    Claude Desktop starts an MCP server with a bare environment — no shell profile, so
+    none of the `export`s the README describes are visible. The key file is what makes
+    the server usable there without pasting a secret into Claude's own config file.
+    """
+    env = os.environ.get("VAS_ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if env:
+        return env
+    path = api_key_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = 0
+    if mode & 0o077:
+        try:
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            raise RuntimeError(
+                f"key file {path} is group/world readable and could not be repaired "
+                f"to 0600 ({exc}); fix its permissions yourself (chmod 600 {path})."
+            ) from exc
+        print(f"key file {path} was group/world readable; fixed to 0600", file=sys.stderr)
+
+    return text.strip() or None
 
 
 def make_client(cfg: Config) -> anthropic.Anthropic:
@@ -52,7 +146,8 @@ def make_client(cfg: Config) -> anthropic.Anthropic:
     key = api_key()
     if not key:
         raise RuntimeError(
-            "No API key: set VAS_ANTHROPIC_API_KEY (preferred) or ANTHROPIC_API_KEY."
+            "No API key: set VAS_ANTHROPIC_API_KEY (preferred) or ANTHROPIC_API_KEY, "
+            f"or write the key to {api_key_path()} (chmod 600)."
         )
     return anthropic.Anthropic(api_key=key)
 
@@ -114,7 +209,7 @@ def track_usage(purpose: str, model: str, response: Any) -> None:
         "cache_read": getattr(usage, "cache_read_input_tokens", 0) or 0,
     }
     _usage_path.parent.mkdir(parents=True, exist_ok=True)
-    with _usage_path.open("a", encoding="utf-8") as f:
+    with open_private(_usage_path, "a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 

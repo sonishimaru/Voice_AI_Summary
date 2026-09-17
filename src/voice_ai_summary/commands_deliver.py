@@ -2,11 +2,92 @@
 
 from __future__ import annotations
 
+import sqlite3
+import time
+
 import typer
 
 from .cli import app
-from .config import load_config
+from .config import Config, load_config
 from .db import connect
+
+# How many recordings `_catch_up_pending` asks `pipeline.process_pending` to transcribe
+# per batch. Small so the elapsed-budget check between batches actually bites, instead
+# of one call draining an arbitrarily large backlog before the budget is next checked.
+_CATCHUP_BATCH = 5
+
+
+def _pending_and_errored_counts(
+    conn: sqlite3.Connection, start_utc: str, end_utc: str
+) -> tuple[int, int]:
+    """(pending, errored) recording counts for the local day covering `[start_utc, end_utc)`."""
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM recordings WHERE started_at_utc >= ? AND started_at_utc < ?"
+        " AND processed_at IS NULL AND error IS NULL",
+        (start_utc, end_utc),
+    ).fetchone()[0]
+    errored = conn.execute(
+        "SELECT COUNT(*) FROM recordings WHERE started_at_utc >= ? AND started_at_utc < ?"
+        " AND error IS NOT NULL",
+        (start_utc, end_utc),
+    ).fetchone()[0]
+    return pending, errored
+
+
+def _catch_up_pending(
+    conn: sqlite3.Connection, cfg: Config, budget_s: int, within: tuple[str, str]
+) -> None:
+    """Transcribe the digest day's pending recordings (oldest first within that day) in
+    small batches, stopping once `budget_s` wall-clock seconds have elapsed.
+
+    Delegates the actual transcription to `pipeline.process_pending`, bounded by
+    `within` (the day's `(start_utc, end_utc)`) - this just bounds how much of it a
+    single `vas digest` run is willing to wait for, so a dead worker's backlog cannot
+    turn the nightly digest into an hours-long batch job. Without the bound,
+    `process_pending` picks globally-oldest-first, so the whole budget could go to a
+    days-old backlog while the day actually being summarized stays untranscribed. The
+    elapsed time is re-checked between batches (not just once up front), so the budget
+    is actually respected rather than merely advisory.
+    """
+    from .asr import get_backend
+    from .pipeline import process_pending
+
+    backend = get_backend(cfg)
+    deadline = time.monotonic() + budget_s
+    while time.monotonic() < deadline:
+        if not process_pending(conn, cfg, backend, limit=_CATCHUP_BATCH, within=within):
+            break
+
+
+def _catch_up_and_count_missing(conn: sqlite3.Connection, cfg: Config, day: str) -> int:
+    """Run the catch-up pass (if enabled and there is anything to catch up on), then
+    return how many of `day`'s recordings are still pending or errored."""
+    from .timeutil import local_day_bounds
+
+    start_utc, end_utc = local_day_bounds(day, cfg.summarize.timezone)
+    pending, errored = _pending_and_errored_counts(conn, start_utc, end_utc)
+
+    budget_s = cfg.schedule.digest_catchup_budget_s
+    if pending and budget_s > 0:
+        _catch_up_pending(conn, cfg, budget_s, (start_utc, end_utc))
+        pending, errored = _pending_and_errored_counts(conn, start_utc, end_utc)
+
+    return pending + errored
+
+
+def _insert_incomplete_banner(markdown: str, missing: int) -> str:
+    """Insert the incomplete-day banner right after the digest's top-level heading."""
+    from .deliver.notify import incomplete_banner
+
+    banner = incomplete_banner(missing)
+    lines = markdown.splitlines()
+    if lines and lines[0].startswith("# "):
+        return "\n".join([lines[0], "", banner, *lines[1:]])
+    return banner + "\n\n" + markdown
+
+
+def _incomplete_stdout_note(day: str, missing: int) -> str:
+    return f"警告: {day} は {missing} 件の録音が未処理/エラーのため、記録は不完全です。"
 
 
 @app.command()
@@ -21,19 +102,29 @@ def digest(
     ),
     force: bool = typer.Option(False, "--force", help="Resend even if already delivered"),  # noqa: B008
     channel: list[str] | None = typer.Option(  # noqa: B008
-        None, "--channel", help="Specific channel(s) to deliver to (can repeat)"
+        None,
+        "--channel",
+        help="Specific channel(s) to deliver to: slack, email, repo (can repeat)",
+    ),
+    show: bool = typer.Option(  # noqa: B008
+        False, "--show", help="Print the full digest markdown to stdout"
     ),
 ) -> None:
     """Generate or deliver a daily summary digest.
 
-    By default, generates the digest for today (in the configured timezone) and prints
-    the markdown to stdout. Pass --deliver to send to enabled channels instead.
+    By default, generates the digest for today (in the configured timezone), writes it
+    to `<data_dir>/digests/<day>.md`, and prints just the path and a one-line headline
+    -- not the full markdown, which under launchd would otherwise land verbatim in
+    `com.voiceaisummary.digest.log` every night this runs without `--deliver`. Pass
+    --show to print the full markdown instead, or --deliver to send to enabled channels.
 
     Examples:
         vas digest
+        vas digest --show
         vas digest --deliver
         vas digest --day 2026-09-14
         vas digest --deliver --channel slack --channel email
+        vas digest --deliver --channel repo
     """
     cfg = load_config()
     cfg.ensure_dirs()
@@ -45,23 +136,44 @@ def digest(
 
         day = today_local(cfg.summarize.timezone)
 
+    # Catch up on this day's backlog (if the worker fell behind), under a wall-clock
+    # budget - then find out whether anything is still pending or errored.
+    missing = _catch_up_and_count_missing(conn, cfg, day)
+
     # Generate the digest
     from .summarize import run_day
 
     markdown = run_day(conn, cfg, day, force=force)
 
+    if missing:
+        markdown = _insert_incomplete_banner(markdown, missing)
+        typer.echo(_incomplete_stdout_note(day, missing))
+
     if not deliver:
-        # Just print to stdout
-        typer.echo(markdown)
+        if show:
+            typer.echo(markdown)
+        else:
+            from .deliver.notify import headline
+
+            digest_path = cfg.paths.digests / f"{day}.md"
+            typer.echo(f"wrote {digest_path}")
+            typer.echo(headline(markdown))
     else:
         # Deliver to channels
-        from .deliver import deliver_digest
+        from .deliver import deliver_digest, enabled_channels
 
         if not channel:
-            # No specific channels requested; use enabled ones from config
-            if not cfg.deliver.slack and not cfg.deliver.email:
+            # No specific channels requested; use enabled ones from config. Must check
+            # exactly the set `deliver_digest` itself would use - a hand-maintained
+            # subset here previously omitted `notify` (on by default), so a config with
+            # only `notify` enabled hit this guard and exited before `deliver_digest`
+            # ever ran.
+            if not enabled_channels(cfg):
                 typer.echo("No delivery channels enabled in config.")
-                typer.echo("Set [deliver] slack=true or email=true in config.toml,")
+                typer.echo(
+                    "Set [deliver] slack=true, email=true, notify=true, or repo=true in "
+                    "config.toml,"
+                )
                 typer.echo("and provide secrets: VAS_SLACK_WEBHOOK_URL, VAS_SMTP_PASSWORD")
                 raise typer.Exit(1)
 
@@ -79,6 +191,7 @@ def install_launchd(
 
     On non-macOS, writes plist files and prints the launchctl commands needed.
     """
+    from . import security
     from .launchd import install
 
     cfg = load_config()
@@ -86,6 +199,12 @@ def install_launchd(
     verb = "Would install" if dry_run else "Installed"
     for path in plist_paths:
         typer.echo(f"{verb}: {path}")
+
+    if not dry_run:
+        changes = security.harden(cfg)
+        typer.echo(f"hardened {len(changes)} path(s)")
+        if security.filevault_status() == "off":
+            typer.echo(security.FILEVAULT_WARNING)
 
 
 @app.command()
