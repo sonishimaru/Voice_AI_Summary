@@ -6,6 +6,7 @@ import sqlite3
 
 from ..config import Config
 from ..db import utcnow_iso
+from ..security import redact
 from ..summarize import is_no_data_digest
 from .email import send_email
 from .notify import send_notification
@@ -115,7 +116,11 @@ def deliver_digest(
             )
             results[channel] = "ok"
         except Exception as e:
-            error_msg = str(e)
+            # A raw exception can carry a secret embedded by the failing channel itself
+            # -- notably the repo channel, where a `git push` failure's stderr can
+            # contain a token embedded in an HTTPS remote URL. Redact before it is
+            # stored in `deliveries.detail` or returned in the status string.
+            error_msg = redact(str(e))
             # Record failure
             conn.execute(
                 "INSERT INTO deliveries (scope_key, channel, sent_at, status, detail) "

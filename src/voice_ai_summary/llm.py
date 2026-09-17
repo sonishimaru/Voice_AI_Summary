@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import sys
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -114,9 +116,25 @@ def api_key() -> str | None:
         return env
     path = api_key_path()
     try:
-        return path.read_text(encoding="utf-8").strip() or None
+        text = path.read_text(encoding="utf-8")
     except OSError:
         return None
+
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = 0
+    if mode & 0o077:
+        try:
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            raise RuntimeError(
+                f"key file {path} is group/world readable and could not be repaired "
+                f"to 0600 ({exc}); fix its permissions yourself (chmod 600 {path})."
+            ) from exc
+        print(f"key file {path} was group/world readable; fixed to 0600", file=sys.stderr)
+
+    return text.strip() or None
 
 
 def make_client(cfg: Config) -> anthropic.Anthropic:

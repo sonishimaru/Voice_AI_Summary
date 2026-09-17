@@ -23,6 +23,8 @@ def install_desktop(
     report API usage, all through the MCP server this installs. Quit and reopen Claude
     Desktop afterwards for it to pick up the new server.
     """
+    from . import security
+    from .config import load_config
     from .desktop import default_bin, ensure_api_key_file, install
 
     key_status = ensure_api_key_file()
@@ -32,6 +34,14 @@ def install_desktop(
     verb = "Would write" if dry_run else "Wrote"
     typer.echo(f"{verb} MCP server entry ({bin_path}) to {config_path}")
     typer.echo(key_status)
+
+    if not dry_run:
+        cfg = load_config()
+        changes = security.harden(cfg)
+        typer.echo(f"hardened {len(changes)} path(s)")
+        if security.filevault_status() == "off":
+            typer.echo(security.FILEVAULT_WARNING)
+
     typer.echo("Claude Desktop を一度終了して開き直してください。")
 
 

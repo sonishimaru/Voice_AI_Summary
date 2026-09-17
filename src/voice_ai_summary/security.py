@@ -17,7 +17,9 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -118,6 +120,144 @@ def redact(text: str) -> str:
     for pattern, replacement in _PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+@dataclass
+class HardenChange:
+    """One file or directory whose mode `harden` changed (or would, under dry-run)."""
+
+    path: Path
+    old_mode: int
+    new_mode: int
+
+
+def _harden_one(path: Path, desired_mode: int, *, dry_run: bool) -> HardenChange | None:
+    """Chmod `path` to `desired_mode` if it differs, reporting the change.
+
+    Symlinks are skipped entirely (never followed, never chmod'd). A missing path is
+    silently skipped. A failed chmod is logged to stderr and swallowed -- `harden` must
+    get through the rest of the tree even if one entry (e.g. owned by another user)
+    can't be fixed.
+    """
+    try:
+        if path.is_symlink():
+            return None
+        old_mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return None
+    if old_mode == desired_mode:
+        return None
+    if not dry_run:
+        try:
+            path.chmod(desired_mode)
+        except OSError as exc:
+            print(f"harden: failed to chmod {path}: {exc}", file=sys.stderr)
+            return None
+    return HardenChange(path=path, old_mode=old_mode, new_mode=desired_mode)
+
+
+def _harden_tree(root: Path, *, dry_run: bool) -> list[HardenChange]:
+    """Recursively harden `root`: directories to 0700, files to 0600.
+
+    Symlinked directories are not descended into (`followlinks=False`) and are, like
+    any other symlink, skipped by `_harden_one` rather than chmod'd.
+    """
+    changes: list[HardenChange] = []
+    if (change := _harden_one(root, 0o700, dry_run=dry_run)) is not None:
+        changes.append(change)
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        for name in dirnames:
+            if (change := _harden_one(base / name, 0o700, dry_run=dry_run)) is not None:
+                changes.append(change)
+        for name in filenames:
+            if (change := _harden_one(base / name, 0o600, dry_run=dry_run)) is not None:
+                changes.append(change)
+    return changes
+
+
+def harden(
+    cfg,
+    *,
+    dry_run: bool = False,
+    log_dir: Path | None = None,
+    key_path: Path | None = None,
+) -> list[HardenChange]:
+    """Fix up permissions across everything this tool has ever written to disk.
+
+    Covers `cfg.paths.root` (the whole data tree: db, audio, digests, usage/audit
+    logs -- directories to 0700, files to 0600), the digest mirror directory and its
+    `*.md` files when `cfg.paths.digest_mirror` is set (the mirror's own parents are
+    left alone -- it lives wherever the user pointed it), the Anthropic API key file
+    and its parent directory, and the launchd log directory and the log files in it
+    (both created at the process's default umask before this module existed). Returns
+    only the entries whose mode actually changed (or, under `dry_run`, would have).
+    """
+    changes: list[HardenChange] = []
+
+    root = cfg.paths.root
+    if root.exists():
+        changes.extend(_harden_tree(root, dry_run=dry_run))
+
+    mirror = cfg.paths.digest_mirror
+    if mirror is not None and mirror.exists():
+        if (change := _harden_one(mirror, 0o700, dry_run=dry_run)) is not None:
+            changes.append(change)
+        for md_file in sorted(mirror.glob("*.md")):
+            if (change := _harden_one(md_file, 0o600, dry_run=dry_run)) is not None:
+                changes.append(change)
+
+    if key_path is None:
+        from .llm import api_key_path
+
+        key_path = api_key_path()
+    if key_path.parent.exists():
+        if (change := _harden_one(key_path.parent, 0o700, dry_run=dry_run)) is not None:
+            changes.append(change)
+    if key_path.exists():
+        if (change := _harden_one(key_path, 0o600, dry_run=dry_run)) is not None:
+            changes.append(change)
+
+    if log_dir is None:
+        from .launchd import log_dir as _default_log_dir
+
+        log_dir = _default_log_dir()
+    if log_dir.exists():
+        if (change := _harden_one(log_dir, 0o700, dry_run=dry_run)) is not None:
+            changes.append(change)
+        for entry in sorted(log_dir.iterdir()):
+            if entry.is_symlink() or not entry.is_file():
+                continue
+            if (change := _harden_one(entry, 0o600, dry_run=dry_run)) is not None:
+                changes.append(change)
+
+    return changes
+
+
+FILEVAULT_WARNING = (
+    "FileVault が無効です。音声と文字起こしはファイル権限だけで守られています。"
+    "システム設定 > プライバシーとセキュリティで有効化してください。"
+)
+
+
+def filevault_status() -> str | None:
+    """ "on"/"off" from `fdesetup status` on macOS, else `None` (including any failure).
+
+    Not macOS, `fdesetup` missing, a timeout, or output that doesn't match either
+    expected phrase all fall through to `None` -- this is advisory, never load-bearing.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = subprocess.run(["fdesetup", "status"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    output = (result.stdout or "") + (result.stderr or "")
+    if "FileVault is On" in output:
+        return "on"
+    if "FileVault is Off" in output:
+        return "off"
+    return None
 
 
 def audit(root: Path, tool: str, args: dict, outcome: str) -> None:

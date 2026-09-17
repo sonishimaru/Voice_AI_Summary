@@ -125,10 +125,14 @@ def ensure_api_key_file(*, path: Path | None = None) -> str:
 
     Never returns or logs the key itself, only a status describing what happened.
     """
+    from . import security
     from .llm import api_key_path
 
     key_path = path if path is not None else api_key_path()
     if key_path.exists():
+        repaired = security.ensure_private_file(key_path)
+        if repaired:
+            return f"key file already exists at {key_path} (mode repaired to 600)"
         return f"key file already exists at {key_path}"
 
     env_key = os.environ.get("VAS_ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
@@ -138,7 +142,7 @@ def ensure_api_key_file(*, path: Path | None = None) -> str:
             f"write the key to {key_path} yourself (chmod 600)"
         )
 
-    key_path.parent.mkdir(parents=True, exist_ok=True)
+    security.ensure_private_dir(key_path.parent)
     fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(env_key)

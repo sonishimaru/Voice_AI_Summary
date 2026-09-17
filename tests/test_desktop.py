@@ -165,12 +165,30 @@ class TestEnsureApiKeyFile:
     ) -> None:
         key_path = tmp_path / "anthropic_api_key"
         key_path.write_text("existing-key", encoding="utf-8")
+        key_path.chmod(0o600)
         monkeypatch.setenv("VAS_ANTHROPIC_API_KEY", "sk-new-key")
 
         status = ensure_api_key_file(path=key_path)
 
         assert key_path.read_text(encoding="utf-8") == "existing-key"
         assert "already exists" in status
+        assert "repaired" not in status
+
+    def test_existing_file_with_permissive_mode_is_repaired(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        key_path = tmp_path / "anthropic_api_key"
+        key_path.write_text("existing-key", encoding="utf-8")
+        key_path.chmod(0o644)
+        monkeypatch.setenv("VAS_ANTHROPIC_API_KEY", "sk-new-key")
+
+        status = ensure_api_key_file(path=key_path)
+
+        assert key_path.read_text(encoding="utf-8") == "existing-key"
+        mode = stat.S_IMODE(os.stat(key_path).st_mode)
+        assert mode == 0o600
+        assert "already exists" in status
+        assert "repaired" in status
 
     def test_reports_missing_key_without_writing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

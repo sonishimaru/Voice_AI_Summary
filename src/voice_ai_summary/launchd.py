@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from .config import Config
+from .security import ensure_private_dir, open_private
 
 WORKER_LABEL = "com.voiceaisummary.worker"
 DIGEST_LABEL = "com.voiceaisummary.digest"
@@ -126,7 +127,16 @@ def install(cfg: Config, *, vas_bin: str | None = None, dry_run: bool = False) -
 
     logs_dir = log_dir()
     if not dry_run:
-        logs_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(logs_dir)
+        # launchd opens an existing StandardOutPath/StandardErrorPath with whatever mode
+        # it already has, rather than creating it at 0600 itself -- pre-create the four
+        # log files here (via open_private, which sets 0600 at creation) so a freshly
+        # installed service's logs start private instead of at the process umask.
+        for label in (WORKER_LABEL, DIGEST_LABEL):
+            for suffix in ("log", "err"):
+                path = logs_dir / f"{label}.{suffix}"
+                if not path.exists():
+                    open_private(path, "a").close()
 
     agents_dir = Path.home() / "Library" / "LaunchAgents"
     if not dry_run:

@@ -53,6 +53,37 @@ def status() -> None:
 
 
 @app.command()
+def harden(
+    dry_run: bool = typer.Option(  # noqa: B008
+        False, "--dry-run", help="Report what would change, without changing it."
+    ),
+) -> None:
+    """Fix permissive file/directory permissions across everything vas has written.
+
+    Covers the data directory (db, audio, digests, usage/audit logs), the digest
+    mirror (if configured), the Anthropic API key file, and the launchd log
+    directory -- anything that predates a private-by-default umask, or that launchd
+    created at the process's default umask.
+    """
+    from . import security
+
+    cfg = load_config()
+    changes = security.harden(cfg, dry_run=dry_run)
+    for change in changes:
+        typer.echo(f"{change.old_mode:04o} -> {change.new_mode:04o} {change.path}")
+    verb = "would harden" if dry_run else "hardened"
+    typer.echo(f"{verb} {len(changes)} path(s)")
+
+    status = security.filevault_status()
+    if status == "on":
+        typer.echo("FileVault: on")
+    elif status == "off":
+        typer.echo(security.FILEVAULT_WARNING)
+    else:
+        typer.echo("FileVault: unknown (not macOS)")
+
+
+@app.command()
 def config_path() -> None:
     """Print the config file path that would be loaded."""
     import os

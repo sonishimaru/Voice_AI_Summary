@@ -297,6 +297,32 @@ class TestDeliverDigest:
         assert row["status"] == "error"
         assert "Network error" in row["detail"]
 
+    def test_deliver_digest_redacts_credentials_in_the_error_detail(self, tmp_path: Path) -> None:
+        """A channel's exception can carry a secret embedded by the failing channel
+        itself -- notably the repo channel, where a `git push` failure's stderr can
+        contain a token embedded in an HTTPS remote URL. It must be redacted both in
+        `deliveries.detail` and in the returned status string."""
+        db_path = tmp_path / "test.sqlite3"
+        conn = connect(db_path)
+
+        cfg = Config()
+        cfg.deliver.slack = True
+
+        leaky_error = RuntimeError("fatal: could not push to https://user:ghp_abc@github.com/x")
+        with patch("voice_ai_summary.deliver.send_slack", side_effect=leaky_error):
+            with patch.dict("os.environ", {"VAS_SLACK_WEBHOOK_URL": "https://example.com"}):
+                results = deliver_digest(conn, cfg, "2026-09-15", "# Test", channels=["slack"])
+
+        assert "ghp_abc" not in results["slack"]
+        assert "***:***@" in results["slack"]
+
+        row = conn.execute(
+            "SELECT detail FROM deliveries WHERE scope_key = ? AND channel = ?",
+            ("2026-09-15", "slack"),
+        ).fetchone()
+        assert "ghp_abc" not in row["detail"]
+        assert "***:***@" in row["detail"]
+
     def test_deliver_digest_skips_no_data_digest_on_every_channel(self, tmp_path: Path) -> None:
         """A no-data placeholder digest must not reach any channel - and especially not
         the repo channel, where it would overwrite a real, already-mirrored file."""

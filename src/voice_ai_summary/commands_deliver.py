@@ -106,14 +106,21 @@ def digest(
         "--channel",
         help="Specific channel(s) to deliver to: slack, email, repo (can repeat)",
     ),
+    show: bool = typer.Option(  # noqa: B008
+        False, "--show", help="Print the full digest markdown to stdout"
+    ),
 ) -> None:
     """Generate or deliver a daily summary digest.
 
-    By default, generates the digest for today (in the configured timezone) and prints
-    the markdown to stdout. Pass --deliver to send to enabled channels instead.
+    By default, generates the digest for today (in the configured timezone), writes it
+    to `<data_dir>/digests/<day>.md`, and prints just the path and a one-line headline
+    -- not the full markdown, which under launchd would otherwise land verbatim in
+    `com.voiceaisummary.digest.log` every night this runs without `--deliver`. Pass
+    --show to print the full markdown instead, or --deliver to send to enabled channels.
 
     Examples:
         vas digest
+        vas digest --show
         vas digest --deliver
         vas digest --day 2026-09-14
         vas digest --deliver --channel slack --channel email
@@ -143,8 +150,14 @@ def digest(
         typer.echo(_incomplete_stdout_note(day, missing))
 
     if not deliver:
-        # Just print to stdout
-        typer.echo(markdown)
+        if show:
+            typer.echo(markdown)
+        else:
+            from .deliver.notify import headline
+
+            digest_path = cfg.paths.digests / f"{day}.md"
+            typer.echo(f"wrote {digest_path}")
+            typer.echo(headline(markdown))
     else:
         # Deliver to channels
         from .deliver import deliver_digest, enabled_channels
@@ -178,6 +191,7 @@ def install_launchd(
 
     On non-macOS, writes plist files and prints the launchctl commands needed.
     """
+    from . import security
     from .launchd import install
 
     cfg = load_config()
@@ -185,6 +199,12 @@ def install_launchd(
     verb = "Would install" if dry_run else "Installed"
     for path in plist_paths:
         typer.echo(f"{verb}: {path}")
+
+    if not dry_run:
+        changes = security.harden(cfg)
+        typer.echo(f"hardened {len(changes)} path(s)")
+        if security.filevault_status() == "off":
+            typer.echo(security.FILEVAULT_WARNING)
 
 
 @app.command()

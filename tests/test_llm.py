@@ -56,6 +56,46 @@ def test_api_key_falls_back_to_key_file(monkeypatch, tmp_path) -> None:
     assert llm.api_key() == "env-key"
 
 
+def test_api_key_repairs_a_permissive_key_file(monkeypatch, tmp_path, capsys) -> None:
+    """A key file with any group/world bits set is repaired to 0600, a one-line
+    warning is printed, and the key is still returned -- refusing here would take the
+    MCP server down right after `update_app` created the file at the wrong mode."""
+    monkeypatch.delenv("VAS_ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setenv("VAS_CONFIG", str(config_path))
+
+    key_path = llm.api_key_path()
+    key_path.write_text("sk-test-key", encoding="utf-8")
+    key_path.chmod(0o644)
+
+    result = llm.api_key()
+
+    assert result == "sk-test-key"
+    assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
+    err = capsys.readouterr().err
+    assert "0600" in err
+
+
+def test_api_key_raises_when_the_chmod_repair_fails(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("VAS_ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setenv("VAS_CONFIG", str(config_path))
+
+    key_path = llm.api_key_path()
+    key_path.write_text("sk-test-key", encoding="utf-8")
+    key_path.chmod(0o644)
+
+    def _boom(*args, **kwargs):
+        raise OSError("nope")
+
+    monkeypatch.setattr(os, "chmod", _boom)
+
+    with pytest.raises(RuntimeError, match=str(key_path)):
+        llm.api_key()
+
+
 def test_track_and_summarize_usage(tmp_path) -> None:
     path = tmp_path / "usage.jsonl"
     llm.set_usage_path(path)

@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -180,6 +181,210 @@ class TestAudit:
         not_a_dir = tmp_path / "not-a-dir"
         not_a_dir.write_text("x", encoding="utf-8")
         security.audit(not_a_dir, "tool", {}, "ok")  # must not raise
+
+
+class TestHarden:
+    def test_fixes_permissive_files_and_dirs_under_root(self, tmp_path) -> None:
+        from voice_ai_summary.config import Config
+
+        cfg = Config()
+        cfg.paths.data_dir = tmp_path / "data"
+        root = cfg.paths.root
+        sub = root / "sub"
+        sub.mkdir(parents=True, mode=0o755)
+        root.chmod(0o755)
+        f1 = root / "a.txt"
+        f1.write_text("x", encoding="utf-8")
+        f1.chmod(0o644)
+        f2 = sub / "b.txt"
+        f2.write_text("y", encoding="utf-8")
+        f2.chmod(0o644)
+
+        changes = security.harden(cfg, log_dir=tmp_path / "no-logs", key_path=tmp_path / "no-key")
+
+        assert _mode(root) == 0o700
+        assert _mode(sub) == 0o700
+        assert _mode(f1) == 0o600
+        assert _mode(f2) == 0o600
+        changed_paths = {c.path for c in changes}
+        assert changed_paths == {root, sub, f1, f2}
+        for c in changes:
+            assert c.new_mode in (0o700, 0o600)
+
+    def test_dry_run_reports_without_changing(self, tmp_path) -> None:
+        from voice_ai_summary.config import Config
+
+        cfg = Config()
+        cfg.paths.data_dir = tmp_path / "data"
+        root = cfg.paths.root
+        root.mkdir(parents=True, mode=0o755)
+        f1 = root / "a.txt"
+        f1.write_text("x", encoding="utf-8")
+        f1.chmod(0o644)
+
+        changes = security.harden(
+            cfg, dry_run=True, log_dir=tmp_path / "no-logs", key_path=tmp_path / "no-key"
+        )
+
+        assert _mode(root) == 0o755
+        assert _mode(f1) == 0o644
+        changed_paths = {c.path for c in changes}
+        assert changed_paths == {root, f1}
+
+    def test_already_private_tree_reports_nothing(self, tmp_path) -> None:
+        from voice_ai_summary.config import Config
+
+        cfg = Config()
+        cfg.paths.data_dir = tmp_path / "data"
+        cfg.ensure_dirs()
+
+        changes = security.harden(cfg, log_dir=tmp_path / "no-logs", key_path=tmp_path / "no-key")
+
+        assert changes == []
+
+    def test_skips_symlinks(self, tmp_path) -> None:
+        from voice_ai_summary.config import Config
+
+        cfg = Config()
+        cfg.paths.data_dir = tmp_path / "data"
+        root = cfg.paths.root
+        root.mkdir(parents=True, mode=0o700)
+        target = tmp_path / "outside.txt"
+        target.write_text("z", encoding="utf-8")
+        target.chmod(0o644)
+        link = root / "link.txt"
+        link.symlink_to(target)
+
+        changes = security.harden(cfg, log_dir=tmp_path / "no-logs", key_path=tmp_path / "no-key")
+
+        assert changes == []
+        assert _mode(target) == 0o644  # untouched: the symlink was never followed
+
+    def test_hardens_mirror_dir_and_its_markdown_files_only(self, tmp_path) -> None:
+        from voice_ai_summary.config import Config
+
+        cfg = Config()
+        cfg.paths.data_dir = tmp_path / "data"
+        cfg.paths.digest_mirror_dir = tmp_path / "mirror"
+        mirror = cfg.paths.digest_mirror
+        mirror.mkdir(parents=True, mode=0o755)
+        (tmp_path).chmod(0o755)  # mirror's parent must be left alone
+        md = mirror / "2026-09-17.md"
+        md.write_text("# digest", encoding="utf-8")
+        md.chmod(0o644)
+        other = mirror / "notes.txt"
+        other.write_text("ignored", encoding="utf-8")
+        other.chmod(0o644)
+
+        changes = security.harden(
+            cfg, log_dir=tmp_path / "no-logs", key_path=tmp_path / "no-key-dir" / "no-key"
+        )
+
+        assert _mode(mirror) == 0o700
+        assert _mode(md) == 0o600
+        assert _mode(other) == 0o644  # not a *.md file: left alone
+        assert _mode(tmp_path) == 0o755  # mirror's parent is not touched
+        changed_paths = {c.path for c in changes}
+        assert md in changed_paths
+        assert mirror in changed_paths
+        assert other not in changed_paths
+
+    def test_hardens_key_file_and_its_parent_dir(self, tmp_path) -> None:
+        from voice_ai_summary.config import Config
+
+        cfg = Config()
+        cfg.paths.data_dir = tmp_path / "data"
+        key_dir = tmp_path / "keydir"
+        key_dir.mkdir(mode=0o755)
+        key_path = key_dir / "anthropic_api_key"
+        key_path.write_text("secret", encoding="utf-8")
+        key_path.chmod(0o644)
+
+        changes = security.harden(cfg, log_dir=tmp_path / "no-logs", key_path=key_path)
+
+        assert _mode(key_dir) == 0o700
+        assert _mode(key_path) == 0o600
+        changed_paths = {c.path for c in changes}
+        assert {key_dir, key_path} <= changed_paths
+
+    def test_hardens_log_dir_and_its_files(self, tmp_path) -> None:
+        from voice_ai_summary.config import Config
+
+        cfg = Config()
+        cfg.paths.data_dir = tmp_path / "data"
+        logs = tmp_path / "logs"
+        logs.mkdir(mode=0o755)
+        log_file = logs / "worker.log"
+        log_file.write_text("hi", encoding="utf-8")
+        log_file.chmod(0o644)
+
+        changes = security.harden(cfg, log_dir=logs, key_path=tmp_path / "no-key")
+
+        assert _mode(logs) == 0o700
+        assert _mode(log_file) == 0o600
+        changed_paths = {c.path for c in changes}
+        assert {logs, log_file} <= changed_paths
+
+    def test_never_raises_on_a_failed_chmod(self, tmp_path, monkeypatch) -> None:
+        from voice_ai_summary.config import Config
+
+        cfg = Config()
+        cfg.paths.data_dir = tmp_path / "data"
+        root = cfg.paths.root
+        root.mkdir(parents=True, mode=0o755)
+        f = root / "a.txt"
+        f.write_text("x", encoding="utf-8")
+        f.chmod(0o644)
+
+        def _boom(self, mode):
+            raise OSError("nope")
+
+        monkeypatch.setattr("pathlib.Path.chmod", _boom)
+
+        changes = security.harden(cfg, log_dir=tmp_path / "no-logs", key_path=tmp_path / "no-key")
+        assert changes == []  # every chmod failed, so nothing to report as changed
+
+
+class TestFilevaultStatus:
+    def test_non_darwin_returns_none(self, monkeypatch) -> None:
+        monkeypatch.setattr(security.sys, "platform", "linux")
+        assert security.filevault_status() is None
+
+    def test_on(self, monkeypatch) -> None:
+        monkeypatch.setattr(security.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            security.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(stdout="FileVault is On.\n", stderr=""),
+        )
+        assert security.filevault_status() == "on"
+
+    def test_off(self, monkeypatch) -> None:
+        monkeypatch.setattr(security.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            security.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(stdout="FileVault is Off.\n", stderr=""),
+        )
+        assert security.filevault_status() == "off"
+
+    def test_garbage_output_returns_none(self, monkeypatch) -> None:
+        monkeypatch.setattr(security.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            security.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(stdout="unexpected\n", stderr=""),
+        )
+        assert security.filevault_status() is None
+
+    def test_failure_to_run_returns_none(self, monkeypatch) -> None:
+        monkeypatch.setattr(security.sys, "platform", "darwin")
+
+        def _raise(*a, **k):
+            raise OSError("fdesetup not found")
+
+        monkeypatch.setattr(security.subprocess, "run", _raise)
+        assert security.filevault_status() is None
 
 
 def test_ensure_dirs_creates_private_directories(tmp_path, monkeypatch) -> None:

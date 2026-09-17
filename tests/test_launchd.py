@@ -199,6 +199,26 @@ class TestInstallUninstall:
         digest_plist = agents_dir / f"{DIGEST_LABEL}.plist"
         assert digest_plist.exists()
 
+    def test_install_precreates_log_files_and_dir_private(self, tmp_path: Path) -> None:
+        """launchd opens an existing StandardOutPath/StandardErrorPath with whatever
+        mode it already has, rather than creating it at 0600 itself -- `install` must
+        pre-create the four log files at 0600 (and the log directory at 0700) so a
+        freshly installed service's logs start private."""
+        import stat
+
+        cfg = Config()
+
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            install(cfg, vas_bin="/usr/local/bin/vas", dry_run=False)
+
+        logs_dir = tmp_path / "Library" / "Logs" / "VoiceAISummary"
+        assert stat.S_IMODE(logs_dir.stat().st_mode) == 0o700
+        for label in (WORKER_LABEL, DIGEST_LABEL):
+            for suffix in ("log", "err"):
+                log_path = logs_dir / f"{label}.{suffix}"
+                assert log_path.exists()
+                assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+
     def test_install_returns_plist_paths(self, tmp_path: Path) -> None:
         """Install should return list of created plist paths."""
         cfg = Config()
