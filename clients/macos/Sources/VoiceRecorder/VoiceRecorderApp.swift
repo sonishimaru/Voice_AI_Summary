@@ -135,6 +135,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return item
     }
 
+    /// `@MainActor` because it reads `RecordingController`'s state, and a
+    /// `static` method is not a protocol requirement, so it does not inherit
+    /// `NSApplicationDelegate`'s main-actor isolation the way
+    /// `applicationDockMenu` does. Same for every `@objc` action below.
+    @MainActor
     private static func statusTitle(for controller: RecordingController) -> String {
         switch controller.state {
         case .recording:
@@ -157,33 +162,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Dock menu actions
 
-    @objc private func dockPause(_ sender: NSMenuItem) {
+    @MainActor @objc private func dockPause(_ sender: NSMenuItem) {
         guard let option = PauseOption(rawValue: sender.tag) else { return }
         Self.controllerForLaunch?.pause(until: option.resumeDate())
     }
 
-    @objc private func dockResume(_ sender: NSMenuItem) {
+    @MainActor @objc private func dockResume(_ sender: NSMenuItem) {
         Self.controllerForLaunch?.resume(reason: "user")
     }
 
-    @objc private func dockStart(_ sender: NSMenuItem) {
+    @MainActor @objc private func dockStart(_ sender: NSMenuItem) {
         Self.controllerForLaunch?.start()
     }
 
-    @objc private func dockStop(_ sender: NSMenuItem) {
+    @MainActor @objc private func dockStop(_ sender: NSMenuItem) {
         Self.controllerForLaunch?.stop()
     }
 
-    @objc private func dockDeleteRecent(_ sender: NSMenuItem) {
+    @MainActor @objc private func dockDeleteRecent(_ sender: NSMenuItem) {
         Self.controllerForLaunch?.deleteRecentAudio()
     }
 
-    @objc private func dockOpenInbox(_ sender: NSMenuItem) {
+    @MainActor @objc private func dockOpenInbox(_ sender: NSMenuItem) {
         try? Settings.shared.ensureInboxDirectoryExists()
         NSWorkspace.shared.open(Settings.shared.inboxURL)
     }
 
-    @objc private func dockToggleMenuBarIcon(_ sender: NSMenuItem) {
+    @MainActor @objc private func dockToggleMenuBarIcon(_ sender: NSMenuItem) {
         Settings.shared.showMenuBarIcon.toggle()
     }
 
