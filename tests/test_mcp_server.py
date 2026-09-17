@@ -90,7 +90,7 @@ class TestDailySummary:
         _insert_day_summary(conn, day, f"# {day} の記録\n\nハイライトです。\n")
 
         result = mcp_server.daily_summary(day=day)
-        assert result == f"# {day} の記録\n\nハイライトです。\n"
+        assert result == mcp_server._UNTRUSTED_HEADER + f"# {day} の記録\n\nハイライトです。\n"
 
     def test_no_digest_gives_helpful_message(self, vas: tuple[Config, sqlite3.Connection]) -> None:
         day = "2026-01-01"
@@ -995,3 +995,505 @@ class TestRebuildDayAsync:
         # job_status on that job must not claim it is doing forced work either.
         status = mcp_server.job_status(job_id=jobs[0].id)
         assert "force: False" in status
+
+
+# --- Phase 02 security additions -------------------------------------------------
+
+
+class TestToolAnnotations:
+    def test_every_tool_is_annotated_and_read_only_set_is_exact(self) -> None:
+        import asyncio
+
+        tools = asyncio.run(mcp_server.server.list_tools())
+        by_name = {t.name: t for t in tools}
+
+        expected_read_only = {
+            "daily_summary",
+            "list_days",
+            "search_transcript",
+            "transcript",
+            "recent",
+            "job_status",
+            "status",
+            "api_usage",
+            "throughput",
+            "list_vocabulary",
+            "worker_status",
+            "service_logs",
+            "list_recordings",
+            "find_duplicates",
+            "audit_log",
+        }
+        actual_read_only = {
+            name for name, t in by_name.items() if t.annotations and t.annotations.read_only_hint
+        }
+        assert actual_read_only == expected_read_only
+
+        for name, tool in by_name.items():
+            assert tool.annotations is not None, f"{name} has no annotations"
+
+    def test_update_app_is_destructive_and_open_world(self) -> None:
+        import asyncio
+
+        tools = asyncio.run(mcp_server.server.list_tools())
+        by_name = {t.name: t for t in tools}
+        ann = by_name["update_app"].annotations
+        assert ann.destructive_hint is True
+        assert ann.open_world_hint is True
+
+    def test_delete_range_prune_drop_recording_are_destructive(self) -> None:
+        import asyncio
+
+        tools = asyncio.run(mcp_server.server.list_tools())
+        by_name = {t.name: t for t in tools}
+        for name in ("delete_range", "prune", "drop_recording"):
+            assert by_name[name].annotations.destructive_hint is True
+
+
+class TestValidateDay:
+    def test_rejects_path_traversal_and_bad_dates(self) -> None:
+        for bad in ("../x", "/etc/passwd", "2026-13-01", "2026-9-1", ""):
+            with pytest.raises(RuntimeError):
+                mcp_server._validate_day(bad)
+
+    def test_accepts_well_formed_day(self) -> None:
+        assert mcp_server._validate_day("2026-09-17") == "2026-09-17"
+
+
+class TestDailySummaryPathTraversal:
+    def test_traversal_day_string_is_rejected_before_any_file_access(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        result = mcp_server.daily_summary(day="../../etc/passwd")
+        assert "invalid day" in result
+
+    def test_digest_path_escaping_digests_dir_is_refused(
+        self, vas: tuple[Config, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Even if `cfg.paths.digests / f'{day}.md'` somehow resolved outside the
+        digests directory (e.g. a symlinked digests dir), the resolved-parent check
+        must refuse to read it rather than serving arbitrary file content."""
+        cfg, _conn = vas
+        day = "2026-09-15"
+
+        secret = cfg.paths.root / "secret.md"
+        secret.write_text("TOP SECRET CONTENTS")
+
+        # Point `cfg.paths.digests` (a computed property) at a directory that does not
+        # actually contain the file `daily_summary` will look for, by monkeypatching
+        # the property to a different directory than the one the digest file is
+        # actually written under.
+        other_dir = cfg.paths.root / "not_digests"
+        other_dir.mkdir()
+        (other_dir / f"{day}.md").write_text("should not be served")
+
+        import voice_ai_summary.config as config_mod
+
+        monkeypatch.setattr(
+            config_mod.PathsConfig, "digests", property(lambda self: other_dir / "elsewhere")
+        )
+
+        result = mcp_server.daily_summary(day=day)
+        assert "should not be served" not in result
+        assert "TOP SECRET CONTENTS" not in result
+        assert "No digest found" in result
+
+
+class TestUntrustedHeader:
+    def test_transcript_has_header_when_there_is_content(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        _cfg, conn = vas
+        rec = _insert_recording(
+            conn, source="mac_mic", started_at_utc="2026-09-15T01:00:00Z", sha256="a" * 64
+        )
+        _insert_utterance(conn, recording_id=rec, abs_start_utc="2026-09-15T01:00:00Z")
+
+        result = mcp_server.transcript(day="2026-09-15")
+        assert result.startswith(mcp_server._UNTRUSTED_HEADER)
+
+    def test_recent_has_header_when_there_is_content(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        from datetime import UTC, datetime
+
+        _cfg, conn = vas
+        rec = _insert_recording(
+            conn, source="mac_mic", started_at_utc="2026-09-15T01:00:00Z", sha256="b" * 64
+        )
+        now = datetime.now(UTC)
+        _insert_utterance(conn, recording_id=rec, abs_start_utc=now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+        result = mcp_server.recent(minutes=30)
+        assert result.startswith(mcp_server._UNTRUSTED_HEADER)
+
+    def test_search_transcript_has_header_when_there_is_content(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        _cfg, conn = vas
+        rec = _insert_recording(
+            conn, source="mac_mic", started_at_utc="2026-09-15T01:00:00Z", sha256="c" * 64
+        )
+        _insert_utterance(
+            conn, recording_id=rec, abs_start_utc="2026-09-15T01:00:00Z", text="会議の予定について"
+        )
+
+        result = mcp_server.search_transcript(query="会議の予定")
+        assert result.startswith(mcp_server._UNTRUSTED_HEADER)
+
+    def test_no_content_messages_have_no_header(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        assert not mcp_server.transcript(day="2026-01-01").startswith("[untrusted data]")
+        assert not mcp_server.search_transcript(query="nope").startswith("[untrusted data]")
+
+
+class TestAudited:
+    def test_add_vocabulary_writes_one_audit_line(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        import json
+
+        cfg, _conn = vas
+        mcp_server.add_vocabulary(term="プロジェクトY", note="test")
+
+        audit_path = cfg.paths.root / "audit.jsonl"
+        lines = [ln for ln in audit_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["tool"] == "add_vocabulary"
+        assert record["args"]["term"] == "プロジェクトY"
+        assert "added/updated" in record["outcome"]
+
+    def test_raising_tool_still_writes_error_outcome_and_tool_safe_still_returns_string(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        import json
+
+        cfg, _conn = vas
+
+        @mcp_server._tool_safe
+        @mcp_server._audited
+        def boom(x: int = 1) -> str:
+            raise ValueError("kaboom")
+
+        result = boom()
+        assert result == "ValueError: kaboom"
+
+        audit_path = cfg.paths.root / "audit.jsonl"
+        lines = [ln for ln in audit_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["tool"] == "boom"
+        assert record["outcome"].startswith("error:")
+        assert "kaboom" in record["outcome"]
+
+
+class TestAuditLog:
+    def test_no_audit_file_yet(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        result = mcp_server.audit_log()
+        assert result == "no audit entries yet"
+
+    def test_renders_lines_and_clamps_limit(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        cfg, _conn = vas
+        for i in range(5):
+            mcp_server.add_vocabulary(term=f"term{i}")
+
+        result = mcp_server.audit_log(limit=2)
+        assert result.count("add_vocabulary") == 2
+        assert "term4" in result
+        assert "term3" in result
+        assert "term2" not in result
+
+        # limit is clamped, not passed through raw.
+        clamped = mcp_server.audit_log(limit=100000)
+        assert clamped.count("add_vocabulary") == 5
+
+
+def _insert_processed_recording_with_audio(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    *,
+    sha256: str,
+    processed_at: str,
+) -> tuple[int, Path]:
+    cur = conn.execute(
+        """
+        INSERT INTO recordings(
+            source, device_id, started_at_utc, tz_offset, duration_ms,
+            sha256, storage_path, original_name, ingested_at, processed_at
+        ) VALUES ('mac_mic', 'dev1', ?, '+00:00', 1000, ?, 'store/x.wav', 'x.wav', ?, ?)
+        """,
+        (processed_at, sha256, processed_at, processed_at),
+    )
+    conn.commit()
+    audio_path = cfg.paths.store / "store" / "x.wav"
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_path.write_bytes(b"fake audio bytes")
+    return cur.lastrowid, audio_path
+
+
+class TestDeleteRange:
+    def test_preview_does_not_delete(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        _cfg, conn = vas
+        rec = _insert_recording(
+            conn, source="mac_mic", started_at_utc="2026-09-15T01:00:00Z", sha256="a" * 64
+        )
+        _insert_utterance(conn, recording_id=rec, abs_start_utc="2026-09-15T01:00:00Z")
+
+        result = mcp_server.delete_range(day="2026-09-15", start="10:00", end="10:05")
+        assert "DRY RUN" in result
+        assert "confirm=True" in result
+        assert conn.execute("SELECT COUNT(*) AS n FROM recordings").fetchone()["n"] == 1
+
+    def test_confirm_deletes(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        _cfg, conn = vas
+        rec = _insert_recording(
+            conn, source="mac_mic", started_at_utc="2026-09-15T01:00:00Z", sha256="b" * 64
+        )
+        _insert_utterance(conn, recording_id=rec, abs_start_utc="2026-09-15T01:00:00Z")
+
+        result = mcp_server.delete_range(day="2026-09-15", start="10:00", end="10:05", confirm=True)
+        assert "DRY RUN" not in result
+        assert conn.execute("SELECT COUNT(*) AS n FROM recordings").fetchone()["n"] == 0
+
+    def test_bad_start_time_is_a_clear_error(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        result = mcp_server.delete_range(day="2026-09-15", start="not-a-time", end="10:05")
+        assert "invalid" in result.lower()
+
+    def test_end_not_after_start_is_an_error(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        result = mcp_server.delete_range(day="2026-09-15", start="10:05", end="10:00")
+        assert "after start" in result
+
+
+class TestPrune:
+    def test_preview_leaves_audio_untouched(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        cfg, conn = vas
+        cfg.retention.audio_days = 1
+        _rec_id, audio_path = _insert_processed_recording_with_audio(
+            conn, cfg, sha256="a" * 64, processed_at="2020-01-01T00:00:00Z"
+        )
+
+        result = mcp_server.prune()
+        assert "[dry run]" in result
+        assert "confirm=True" in result
+        assert audio_path.exists()
+
+    def test_confirm_deletes_old_audio(self, vas: tuple[Config, sqlite3.Connection]) -> None:
+        cfg, conn = vas
+        cfg.retention.audio_days = 1
+        _rec_id, audio_path = _insert_processed_recording_with_audio(
+            conn, cfg, sha256="b" * 64, processed_at="2020-01-01T00:00:00Z"
+        )
+
+        result = mcp_server.prune(confirm=True)
+        assert "[dry run]" not in result
+        assert not audio_path.exists()
+
+
+class TestHarden:
+    def test_reports_changes_and_filevault_off(
+        self, vas: tuple[Config, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, _conn = vas
+        cfg.ensure_dirs()
+        loose_file = cfg.paths.root / "loose.txt"
+        loose_file.write_text("x")
+        loose_file.chmod(0o644)
+
+        monkeypatch.setattr("voice_ai_summary.security.filevault_status", lambda: "off")
+
+        result = mcp_server.harden(dry_run=True)
+        assert "loose.txt" in result
+        assert "0o644" in result or "644" in result
+        assert "FileVault" in result
+
+    def test_filevault_on_and_unknown(
+        self, vas: tuple[Config, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("voice_ai_summary.security.filevault_status", lambda: "on")
+        result = mcp_server.harden(dry_run=True)
+        assert "FileVault is on" in result
+
+        monkeypatch.setattr("voice_ai_summary.security.filevault_status", lambda: None)
+        result2 = mcp_server.harden(dry_run=True)
+        assert "could not be determined" in result2
+
+    def test_nothing_to_change_on_a_clean_tree(
+        self, vas: tuple[Config, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("voice_ai_summary.security.filevault_status", lambda: None)
+        # A real pass first (permissions actually fixed), then a dry run against that
+        # already-hardened tree must report nothing left to do.
+        mcp_server.harden(dry_run=False)
+        result = mcp_server.harden(dry_run=True)
+        assert "nothing to change" in result
+
+
+class TestRecentPauseMarkers:
+    def test_pause_transition_shows_header_and_marker(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        import json
+        from datetime import UTC, datetime, timedelta
+
+        cfg, conn = vas
+        now = datetime.now(UTC)
+
+        def iso(dt: datetime) -> str:
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        rec = _insert_recording(
+            conn,
+            source="mac_mic",
+            started_at_utc=iso(now - timedelta(minutes=25)),
+            sha256="a" * 64,
+        )
+        _insert_utterance(
+            conn,
+            recording_id=rec,
+            abs_start_utc=iso(now - timedelta(minutes=25)),
+            text="発話1",
+        )
+        _insert_utterance(
+            conn,
+            recording_id=rec,
+            abs_start_utc=iso(now - timedelta(minutes=5)),
+            text="発話2",
+        )
+
+        events = [
+            {
+                "schema": 1,
+                "state": "paused",
+                "since": iso(now - timedelta(minutes=20)),
+                "resume_at": None,
+                "reason": "user",
+                "pid": None,
+                "app_version": "1",
+                "updated_at": iso(now - timedelta(minutes=20)),
+            },
+            {
+                "schema": 1,
+                "state": "recording",
+                "since": iso(now - timedelta(minutes=10)),
+                "resume_at": None,
+                "reason": "user",
+                "pid": 4242,
+                "app_version": "1",
+                "updated_at": iso(now - timedelta(minutes=10)),
+            },
+        ]
+        with open(cfg.paths.root / "recorder_events.jsonl", "w", encoding="utf-8") as f:
+            for e in events:
+                f.write(json.dumps(e) + "\n")
+        with open(cfg.paths.root / "recorder_state.json", "w", encoding="utf-8") as f:
+            json.dump(events[-1], f)
+
+        result = mcp_server.recent(minutes=30)
+        assert "recorder :" in result
+        assert "recorder paused:" in result
+        assert "--- recorder paused" in result
+        # the marker must sit between the two utterances, chronologically.
+        assert result.index("発話1") < result.index("--- recorder paused")
+        assert result.index("--- recorder paused") < result.index("発話2")
+
+    def test_no_state_file_output_is_unchanged_except_recorder_line(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        _cfg, conn = vas
+        now = datetime.now(UTC)
+
+        def iso(dt: datetime) -> str:
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        rec = _insert_recording(
+            conn,
+            source="mac_mic",
+            started_at_utc=iso(now - timedelta(minutes=5)),
+            sha256="b" * 64,
+        )
+        _insert_utterance(
+            conn, recording_id=rec, abs_start_utc=iso(now - timedelta(minutes=5)), text="発話"
+        )
+
+        result = mcp_server.recent(minutes=30)
+        lines = result.split("\n")
+        recorder_lines = [ln for ln in lines if ln.startswith("recorder :")]
+        assert len(recorder_lines) == 1
+        assert "no recorder state file" in recorder_lines[0]
+        # No pause-related line should appear at all.
+        assert "recorder paused:" not in result
+        assert "--- recorder paused" not in result
+
+
+class TestStatusRecorderAndPruned:
+    def test_reports_recorder_and_audio_pruned_lines(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        cfg, conn = vas
+        conn.execute(
+            """
+            INSERT INTO recordings(
+                source, device_id, started_at_utc, tz_offset, duration_ms,
+                sha256, storage_path, original_name, ingested_at, processed_at,
+                audio_deleted_at
+            ) VALUES ('mac_mic', 'dev1', '2026-09-15T00:00:00Z', '+00:00', 1000,
+                      'c' * 64, 'store/x.wav', 'x.wav', '2026-09-15T00:00:00Z',
+                      '2026-09-15T00:00:00Z', '2026-09-16T00:00:00Z')
+            """
+        )
+        conn.commit()
+
+        result = mcp_server.status()
+        assert "recorder :" in result
+        assert "audio-pruned recordings: 1" in result
+
+
+class TestServiceLogsClampAndRedact:
+    def test_clamps_lines_and_redacts_secret(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from voice_ai_summary import launchd
+
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        directory = launchd.log_dir()
+        directory.mkdir(parents=True)
+        lines = [f"line{i}" for i in range(600)]
+        lines[-1] = "leaked key sk-ant-abcdefgh12345678"
+        (directory / f"{launchd.WORKER_LABEL}.log").write_text("\n".join(lines))
+        (directory / f"{launchd.WORKER_LABEL}.err").write_text("")
+
+        result = mcp_server.service_logs(service="worker", lines=100000)
+        assert "sk-ant-abcdefgh12345678" not in result
+        assert "sk-ant-" in result
+        assert "[redacted]" in result
+        # clamped to 500, so of 600 lines only the last 500 (line100..line599) show.
+        assert "line100" in result
+        assert "line99\n" not in result and "\nline99" not in result
+
+
+class TestDropRecordingDeleteAudio:
+    def test_delete_audio_true_unlinks_the_file(
+        self, vas: tuple[Config, sqlite3.Connection]
+    ) -> None:
+        cfg, conn = vas
+        rec = _insert_recording(
+            conn, source="mac_system", started_at_utc="2026-09-15T01:00:00Z", sha256="d" * 64
+        )
+        _insert_utterance(conn, recording_id=rec, abs_start_utc="2026-09-15T01:00:00Z")
+
+        audio_path = cfg.paths.store / "store" / "x.wav"
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        audio_path.write_bytes(b"fake audio")
+
+        preview = mcp_server.drop_recording(recording_id=rec, delete_audio=True)
+        assert "ALSO be deleted" in preview
+        assert audio_path.exists()
+
+        result = mcp_server.drop_recording(recording_id=rec, confirm=True, delete_audio=True)
+        assert "audio file deleted too" in result
+        assert not audio_path.exists()
+        assert conn.execute("SELECT COUNT(*) AS n FROM recordings").fetchone()["n"] == 0

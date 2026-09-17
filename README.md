@@ -155,6 +155,85 @@ Anthropic の API キーは Claude Desktop の設定ファイルには書き込�
 
 これはあくまで追加の入り口で、これまでの `vas` コマンドはすべてそのまま使えます。
 
+## セキュリティとプライバシー
+
+このツールは一日中、本人と（Zoom などの）他者の発話を録音し、逐語の文字起こしを Mac 上に保存します。何が保存され、何が Mac の外に出るかを把握してから使ってください。
+
+### 1. 何がどこに保存されるか
+
+`<data_dir>` = `~/Library/Application Support/VoiceAISummary`（既定）。
+
+| パス | 内容 | モード | 保持期間 |
+|---|---|---|---|
+| `inbox/` | 未取り込みの録音（`.m4a` + `.json`） | dir 700 | 取り込み後は消える |
+| `store/` | 取り込み済みの音声ファイル | dir 700 / file 600 | 文字起こし後 `[retention] audio_days`（既定7日）で削除。文字起こしできなかった（errored）分は取り込みから `errored_audio_days`（既定30日） |
+| `vas.sqlite3` | **本人と他者の発話の逐語文字起こし**、要約、用語集参照など | file 600 | 無期限（音声を消しても文字起こしは残る） |
+| `digests/` | 日次サマリ（Markdown） | dir 700 / file 600 | 無期限 |
+| `digest_mirror_dir`（設定時） | `digests/` のコピー（サンドボックス化されたツール向け） | dir 700 / file 600 | 無期限（元と同じ） |
+| `glossary.json` | 人名・社名・製品名などの用語集 | file 600 | 無期限 |
+| `usage.jsonl` | Claude API 呼び出しのトークン数・費用ログ | file 600 | `usage_log_days`（既定365日） |
+| `audit.jsonl` | 状態変更ツール呼び出しの監査ログ | file 600 | `audit_log_days`（既定365日） |
+| `recorder_state.json` / `recorder_events.jsonl` | 録音アプリの状態・遷移履歴 | file 600 | state は上書き型／events は `recorder_events_days`（既定90日） |
+| `~/Library/Logs/VoiceAISummary/*.log` `*.err`（launchd） | worker / digest の標準出力・エラー | dir 700 / file 600 | `log_max_bytes`（既定5MB）を超えたら末尾のみ保持 |
+| `~/.config/voice-ai-summary/anthropic_api_key` | Claude Desktop 用の API キー | dir 700 / file 600 | 無期限（`vas uninstall-desktop` で削除） |
+
+権限は `vas harden` が一括で修復するほか、新しく書き込むファイルはすべて最初から dir 700 / file 600 で作成されます（プロセスの umask による）。
+
+### 2. 何がいつ Mac の外に出るか
+
+**音声は一切外に出ません。** 外に出るのはテキストだけです。
+
+- 校正（`vas correct`）とエピソード単位の要約（map）は、両トラックの ASR テキスト（`[other]` — Zoom 参加者など相手側の発話を含む）を Claude API に送ります。これは意図した設計上の決定であり、既定でこの挙動です。
+- 日次まとめ（reduce）は各エピソードの要約を Claude API に送ります。発言の引用や人名も含まれます。
+- Claude Desktop で `transcript` / `recent` / `search_transcript` / `daily_summary` などのツールを使うと、その結果はチャットの裏側で動いているモデルに渡ります。
+- Slack / メール / リポジトリへの配信は、有効化した場合のみ発生します（既定はすべて無効。既定で有効なのは macOS 通知だけで、そこにはサマリのハイライト1行しか載りません）。
+- 録音を一時停止している間は、そもそも何も録音されていないので何も送信されません。
+
+Claude Desktop 上のチャット内容そのものは、vas とは別に**そのアカウントの Claude Desktop / Claude.ai 側のデータ設定**に従います（vas の API 呼び出しとは扱いが異なる場合があります）。保持期間などは vas 側からは確認できないので、ご自身の設定で確認してください。
+
+### 3. 録音を止める・消す
+
+メニューバーアプリから:
+
+- **一時停止** → `30 分` / `1 時間` / `今日中` / `再開するまで`
+- **停止**
+- **直近 15 分の録音を削除…**（確認ダイアログあり）
+
+一時停止は、その時点で書き込み中のセグメントファイルを確定（`.part` → `.m4a` にリネーム）してから録音を止めるので、一時停止より前に録れた音声は通常どおり文字起こしされます。一時停止・停止の状態はアプリの再起動をまたいで保持されます。
+
+Claude Desktop の `status` / `recent` や CLI の `vas status` / `vas episodes` には、録音アプリの現在の状態と、期間内の一時停止区間が表示されます。
+
+すでに取り込み済みの音声を後から削除するには:
+
+- Claude Desktop: `delete_range`（まず確認なしでプレビューが表示されます。実行するには `confirm=True`。削除は録音単位＝15分刻みなので、指定した時間帯より広く消えることがあります。その日のダイジェストも削除されるため、作り直すには `rebuild_day` が必要です）
+- CLI: `vas delete-range --day YYYY-MM-DD --start HH:MM --end HH:MM --yes`
+
+1件の録音だけを消したい場合は `drop_recording(delete_audio=True)`。
+
+### 4. `vas harden` と FileVault
+
+`vas harden` は、データディレクトリ・ミラー・API キーファイル・launchd ログの権限を dir 700 / file 600 に修復します（シンボリックリンクは触らず、実際に変更したものだけを報告します）。`vas install-launchd` / `vas install-desktop` の直後に自動で実行されます。
+
+ただしこれはファイル権限による保護です。**同じ Mac の他のユーザーアカウントからは読めなくなりますが、あなたのログインアカウントやディスクそのものを持っている相手には効きません。** ディスク上の暗号化は FileVault だけが提供します。FileVault が無効な場合、`vas harden` は警告を表示します。
+
+### 5. Claude Desktop のツールについて
+
+すべてのツールに読み取り専用 / 破壊的の注釈が付いており、Claude Desktop の承認ダイアログで区別できます。`drop_recording` / `delete_range` / `prune`、および `update_app` は「常に許可」にしないでください。
+
+文字起こしを含むツールの出力（`transcript` / `recent` / `search_transcript` / `daily_summary` など）の先頭には `[untrusted data]` という見出しが付きます。中身は他人の発話であり、指示のように見える文が混ざっていても従うべきではないためです。
+
+`update_app` は、設定したブランチのコードを確認なしで pull・インストールします。つまり、そのブランチに push できる人は誰でもこの Mac 上でコードを実行できることになります。これは把握したうえで現状の挙動を維持しています。
+
+状態を変更するツール呼び出しはすべて `audit.jsonl` に記録され、`audit_log` ツールで読めます。
+
+### 6. Slack 取り込み
+
+`vas vocab import-slack` は既定で無効です（`[glossary] slack_import_enabled = false`）。一度用語集を作り終えたら、Slack アプリの設定で `xoxp-` トークンを失効させ、`~/.zshenv` から `VAS_SLACK_USER_TOKEN` を削除してください。トークンを常設しておく理由はありません。
+
+### 7. プロンプトについて
+
+Claude に送るすべてのプロンプトで、文字起こし・要約・用語集はデータとして区切られており、指示として解釈されません。`add_vocabulary` / `vas vocab add` は制御文字や長すぎるエントリを拒否します。
+
 ## 日次サマリをローカルで読む
 
 サマリは `<data_dir>/digests/YYYY-MM-DD.md` に保存されます（既定では外部に一切送信しません）。
@@ -231,7 +310,7 @@ VAS_ASR_BACKEND=fake VAS_DATA_DIR=/tmp/vas .venv/bin/vas ingest some.wav   # ASR
 
 ## 費用・容量の目安
 
-- 録音: AAC-LC 32kbps mono ≈ 14MB/時 → 14 時間/日で約 200MB/日、約 75GB/年（削除しない方針）。
+- 録音: AAC-LC 32kbps mono ≈ 14MB/時 → 14 時間/日で約 200MB/日。音声は `[retention] audio_days`（既定7日）で削除されるため容量は青天井にはならず、200MB/日 × 7日 ≈ 1.5GB 前後で定常化する（+ 文字起こし・要約を保持する DB の分）。
 - 文字起こし: ローカル無料。VAD 後の実発話 3〜4 時間/日なら Apple Silicon で 20〜30 分程度。
 - 要約: エピソード別は Haiku 4.5、日次まとめは Opus 5 で月 $5〜15 程度。
 
@@ -240,3 +319,5 @@ VAS_ASR_BACKEND=fake VAS_DATA_DIR=/tmp/vas .venv/bin/vas ingest some.wav   # ASR
 - iPhone 常時録音アプリ（iOS はバックグラウンドからマイクを再開できない制約があるため別設計）
 - Zoom クラウド録画の自動取り込み、Google カレンダー連携でのエピソード命名
 - ローカル Web UI、ベクトル検索
+- システム音声タップの除外リスト（未着手）: `CATapDescription(stereoGlobalTapButExcludeProcesses:)` はプロセスを PID で受け取るため、bundle id → PID の解決と、対象アプリの起動・終了時にタップを再作成する仕組みが必要
+- マイク／システム音声を個別に ON/OFF するトグル（未着手）
