@@ -14,6 +14,11 @@ from voice_ai_summary.config import Config
 
 
 def test_make_client_prefers_dedicated_key(monkeypatch, tmp_path) -> None:
+    # Point VAS_CONFIG into tmp_path so `api_key_path()` resolves to a file that does
+    # not exist. Without this the test reads whatever key file the machine running it
+    # happens to have -- `vas install-desktop` writes one -- and the no-key case then
+    # passes here and fails on a real install.
+    monkeypatch.setenv("VAS_CONFIG", str(tmp_path / "config.toml"))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "shared-key")
     monkeypatch.setenv("VAS_ANTHROPIC_API_KEY", "vas-key")
     cfg = Config()
