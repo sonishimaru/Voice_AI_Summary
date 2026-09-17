@@ -17,7 +17,7 @@ def episodes(
     from .config import load_config
     from .db import connect
     from .episodes import build_episodes
-    from .recorder_state import format_intervals, pause_intervals
+    from .recorder_state import pause_intervals, with_pause_markers
     from .timeutil import fmt_hm, local_time_to_utc, today_local
 
     cfg = load_config()
@@ -34,10 +34,10 @@ def episodes(
 
     if not episode_ids:
         typer.echo(f"{day}: no episodes")
-        for interval_start, interval_end in intervals:
-            typer.echo(
-                f"--- recorder paused {format_intervals([(interval_start, interval_end)], tz)} ---"
-            )
+        for line in with_pause_markers(
+            [], intervals, tz, start_of=lambda row: row["started_at_utc"], render=lambda row: ""
+        ):
+            typer.echo(line)
         return
 
     placeholders = ",".join("?" for _ in episode_ids)
@@ -54,24 +54,19 @@ def episodes(
         episode_ids,
     ).fetchall()
 
-    remaining = list(intervals)
-    for row in rows:
-        while remaining and remaining[0][1] <= row["started_at_utc"]:
-            interval_start, interval_end = remaining.pop(0)
-            typer.echo(
-                f"--- recorder paused {format_intervals([(interval_start, interval_end)], tz)} ---"
-            )
+    def _render(row: object) -> str:
         start = fmt_hm(row["started_at_utc"], tz)
         end = fmt_hm(row["ended_at_utc"], tz)
         title = row["title"] or "(untitled)"
-        typer.echo(
+        return (
             f"#{row['id']} {start}-{end} [{row['kind']}] {title} "
             f"({row['n_utterances']} utterances, {row['source_mix']})"
         )
-    for interval_start, interval_end in remaining:
-        typer.echo(
-            f"--- recorder paused {format_intervals([(interval_start, interval_end)], tz)} ---"
-        )
+
+    for line in with_pause_markers(
+        rows, intervals, tz, start_of=lambda row: row["started_at_utc"], render=_render
+    ):
+        typer.echo(line)
 
 
 @app.command()

@@ -17,17 +17,18 @@ def prune_cmd(
     from .config import load_config
     from .db import connect
     from .launchd import log_dir
-    from .retention import WORKER_LOG_BASENAMES, prune
+    from .retention import prune
 
     cfg = load_config()
     cfg.ensure_dirs()
     conn = connect(cfg.paths.db_path)
+    # No `skip_logs`: this CLI process never has the worker's log file open for
+    # append, so an in-place rewrite here is safe (see `WORKER_LOG_BASENAMES`).
     report = prune(
         conn,
         cfg,
         dry_run=not yes,
         log_dir=log_dir(),
-        skip_logs=WORKER_LOG_BASENAMES,
     )
     typer.echo(report.summary())
     if not yes:

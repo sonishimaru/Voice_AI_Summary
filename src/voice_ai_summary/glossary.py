@@ -169,6 +169,19 @@ def validate_style_note(note: str) -> str:
     return note
 
 
+def sanitize_style_note(note: str) -> str | None:
+    """Lenient counterpart to `validate_style_note`, for model-authored extraction
+    output (`extract_glossary`): flattens whitespace and, unlike `validate_style_note`,
+    never raises - a note that is empty (after flattening) or still over
+    `MAX_STYLE_NOTE_LEN` is dropped (not truncated, so a merely-too-long rule isn't
+    silently cut off mid-sentence) by returning `None`.
+    """
+    note = _flatten(note)
+    if not note or len(note) > MAX_STYLE_NOTE_LEN:
+        return None
+    return note
+
+
 def _sanitize_field(value: str, max_len: int) -> str:
     """Drop control/invisible characters, collapse whitespace, and truncate to
     `max_len`. The lenient counterpart of `validate_term`'s per-field checks."""
@@ -537,7 +550,14 @@ def _extract_chunk(
             for term in extracted.terms
             if (sanitized := sanitize_term(term.term, term.aliases, term.note)) is not None
         ]
-        sanitized = Glossary(terms=sanitized_terms, style_notes=extracted.style_notes)
+        # Same reasoning applies to style_notes: the model's own output, so sanitized
+        # (flattened, dropped if unsalvageable) rather than validated/rejected.
+        sanitized_style_notes = [
+            note
+            for raw_note in extracted.style_notes
+            if (note := sanitize_style_note(raw_note)) is not None
+        ]
+        sanitized = Glossary(terms=sanitized_terms, style_notes=sanitized_style_notes)
         return existing.merge(sanitized)
     except OutputTruncated:
         lines = chunk.split("\n")

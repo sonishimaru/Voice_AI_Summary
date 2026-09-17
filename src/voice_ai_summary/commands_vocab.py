@@ -62,24 +62,29 @@ def vocab_import(
     Every incoming term is validated the same way `vas vocab add` validates its
     argument (`validate_term`); a single invalid entry aborts the whole import with no
     partial write, so a bad file can be fixed and re-run rather than silently truncated.
+    Style notes go through the equivalent `validate_style_note`.
     """
     import json
 
     from .config import load_config
-    from .glossary import Glossary, load_glossary, save_glossary, validate_term
+    from .glossary import Glossary, load_glossary, save_glossary, validate_style_note, validate_term
 
     data = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(data, list):
         data = {"terms": data}
     try:
-        incoming = Glossary(
-            terms=[
-                validate_term(t["term"], t.get("aliases"), t.get("note", ""))
-                for t in data.get("terms", [])
-                if t.get("term")
-            ],
-            style_notes=[str(n) for n in data.get("style_notes", []) if n],
-        )
+        terms = []
+        for t in data.get("terms", []):
+            term = t.get("term")
+            if not term:
+                continue
+            aliases = t.get("aliases") or []
+            if not isinstance(aliases, list):
+                raise ValueError(f"aliases for {term!r} must be a list")
+            note = t.get("note") or ""
+            terms.append(validate_term(term, aliases, note))
+        style_notes = [validate_style_note(str(n)) for n in data.get("style_notes", []) if n]
+        incoming = Glossary(terms=terms, style_notes=style_notes)
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from None

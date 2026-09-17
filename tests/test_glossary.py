@@ -488,6 +488,38 @@ def test_sanitize_term_truncates_rather_than_raising() -> None:
     assert sanitize_term("   ") is None
 
 
+def test_sanitize_style_note_flattens_and_drops_bad_ones() -> None:
+    from voice_ai_summary.glossary import MAX_STYLE_NOTE_LEN, sanitize_style_note
+
+    assert sanitize_style_note("社名は\nカタカナ\tで書く") == "社名は カタカナ で書く"
+    # Empty (even only after flattening) or over the length cap: dropped, not truncated.
+    assert sanitize_style_note("   ") is None
+    assert sanitize_style_note("あ" * (MAX_STYLE_NOTE_LEN + 1)) is None
+
+
+def test_extract_glossary_sanitizes_model_authored_style_notes(monkeypatch) -> None:
+    """Model-authored `style_notes` go through the same lenient sanitizing path as
+    terms - a bad one is dropped, never raised, and never reaches the merged result
+    unsanitized (WI: the model's own output is not the user's direct input)."""
+
+    def fake_call_extract(client, model, text, existing_block, **kwargs) -> Glossary:
+        return Glossary(
+            terms=[],
+            style_notes=[
+                "良いルール",
+                "   ",  # empty after flattening: dropped
+                "あ" * 200,  # far over MAX_STYLE_NOTE_LEN: dropped
+                "改行\nを含むルール",  # flattened, kept
+            ],
+        )
+
+    monkeypatch.setattr(glossary_mod, "_call_extract", fake_call_extract)
+
+    result = extract_glossary(object(), "m", ["msg"], Glossary())
+
+    assert result.style_notes == ["良いルール", "改行 を含むルール"]
+
+
 def test_save_glossary_writes_0600_file(tmp_path) -> None:
     import stat
 
@@ -532,3 +564,65 @@ def test_vocab_import_merges_json_file(vas, tmp_path) -> None:
     assert by_term["安田さん"].note == "取引先" and "安田" in by_term["安田さん"].aliases
     assert g.style_notes == ["社名はカタカナで書く"]
     assert "imported 2 term(s)" in result.output
+
+
+def test_vocab_import_accepts_null_note(vas, tmp_path) -> None:
+    """`note: null` (e.g. a tool that always emits the key, even when empty) must
+    import cleanly rather than raising `AttributeError` from `None.strip()`."""
+    from typer.testing import CliRunner
+
+    from voice_ai_summary.cli import app
+    from voice_ai_summary.glossary import load_glossary
+
+    cfg, _conn = vas
+    src = tmp_path / "glossary.json"
+    src.write_text(
+        json.dumps({"terms": [{"term": "西丸", "aliases": [], "note": None}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["vocab", "import", str(src)])
+
+    assert result.exit_code == 0, result.output
+    g = load_glossary(cfg)
+    assert g.terms[0].term == "西丸"
+    assert g.terms[0].note == ""
+
+
+def test_vocab_import_rejects_string_aliases_with_exit_1(vas, tmp_path) -> None:
+    """A string `aliases` (instead of a list) would otherwise be iterated character by
+    character - this must be rejected with a clear message and exit 1, not silently
+    misinterpreted."""
+    from typer.testing import CliRunner
+
+    from voice_ai_summary.cli import app
+
+    _cfg_obj, _conn = vas
+    src = tmp_path / "glossary.json"
+    src.write_text(
+        json.dumps({"terms": [{"term": "西丸", "aliases": "にしまる"}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["vocab", "import", str(src)])
+
+    assert result.exit_code == 1
+    assert "aliases for '西丸' must be a list" in result.output
+
+
+def test_vocab_import_rejects_overlong_style_note_with_exit_1(vas, tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from voice_ai_summary.cli import app
+
+    _cfg_obj, _conn = vas
+    src = tmp_path / "glossary.json"
+    src.write_text(
+        json.dumps({"terms": [], "style_notes": ["あ" * 200]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["vocab", "import", str(src)])
+
+    assert result.exit_code == 1
+    assert "style note is too long" in result.output

@@ -1290,6 +1290,32 @@ class TestPrune:
         assert "[dry run]" not in result
         assert not audio_path.exists()
 
+    def test_confirm_truncates_worker_log_without_skip_logs(
+        self,
+        vas: tuple[Config, sqlite3.Connection],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """This server runs as its own process, separate from the worker - it must not
+        pass `skip_logs` (that's `worker.run_worker`'s job alone), so it truncates even
+        a log named after the worker's own launchd log."""
+        from voice_ai_summary import launchd
+
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("[retention]\nlog_max_bytes = 50\n", encoding="utf-8")
+        monkeypatch.setenv("VAS_CONFIG", str(config_path))
+
+        log_dir = launchd.log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{launchd.WORKER_LABEL}.log"
+        log_path.write_text("x" * 500, encoding="utf-8")
+
+        result = mcp_server.prune(confirm=True)
+
+        assert log_path.name in result
+        assert log_path.stat().st_size < 500
+
 
 class TestHarden:
     def test_reports_changes_and_filevault_off(

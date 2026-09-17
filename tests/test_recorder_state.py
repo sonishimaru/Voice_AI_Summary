@@ -14,7 +14,8 @@ from voice_ai_summary.recorder_state import (
     format_intervals,
     is_alive,
     pause_intervals,
-    read_events,
+    read_all_events,
+    with_pause_markers,
 )
 
 NOW = datetime(2026, 9, 17, 10, 2, 0, tzinfo=UTC)
@@ -93,6 +94,29 @@ def test_read_state_valid_file_parses(tmp_path: Path) -> None:
     assert state.state == "recording"
     assert state.pid == os.getpid()
     assert state.app_version == "0.2.0"
+
+
+def test_read_state_without_resume_at_key_parses(tmp_path: Path) -> None:
+    """The macOS app's `JSONEncoder` omits a nil Optional entirely rather than writing
+    `"resume_at": null`, so a real state file has no `resume_at` key at all while
+    recording/stopped/indefinitely paused - this must still parse, not be rejected as
+    missing a required key."""
+    from voice_ai_summary.recorder_state import read_state
+
+    data = {
+        "schema": 1,
+        "state": "recording",
+        "since": "2026-09-17T09:12:00Z",
+        "reason": "user",
+        "pid": os.getpid(),
+        "app_version": "0.2.0",
+        "updated_at": "2026-09-17T10:02:00Z",
+    }
+    (tmp_path / STATE_FILENAME).write_text(json.dumps(data), encoding="utf-8")
+
+    state = read_state(tmp_path)
+    assert state is not None
+    assert state.resume_at is None
 
 
 # --- is_alive ------------------------------------------------------------------
@@ -248,10 +272,10 @@ def test_describe_stopped(tmp_path: Path) -> None:
     assert describe(state, "UTC", now=NOW) == "stopped since 18:00"
 
 
-# --- read_events -----------------------------------------------------------------
+# --- read_all_events -------------------------------------------------------------
 
 
-def test_read_events_skips_torn_line_and_delete_recent(tmp_path: Path) -> None:
+def test_read_all_events_skips_torn_line_delete_recent_and_heartbeat(tmp_path: Path) -> None:
     lines = [
         _event_json(state="recording", reason="launch", updated_at="2026-09-17T08:00:00Z"),
         _event_json(state="paused", reason="user", updated_at="2026-09-17T10:00:00Z"),
@@ -262,16 +286,32 @@ def test_read_events_skips_torn_line_and_delete_recent(tmp_path: Path) -> None:
             minutes=10,
             files=2,
         ),
+        _event_json(state="recording", reason="heartbeat", updated_at="2026-09-17T10:10:00Z"),
         _event_json(state="recording", reason="user", updated_at="2026-09-17T10:30:00Z"),
         '{"state": "paused", "reason": "timer", "upda',  # torn last line
     ]
     _write_events(tmp_path, lines)
 
-    events = read_events(tmp_path, "2026-09-17T09:00:00Z", "2026-09-17T11:00:00Z")
+    events = read_all_events(tmp_path)
     assert [(e.state, e.at, e.reason) for e in events] == [
+        ("recording", "2026-09-17T08:00:00Z", "launch"),
         ("paused", "2026-09-17T10:00:00Z", "user"),
         ("recording", "2026-09-17T10:30:00Z", "user"),
     ]
+
+
+def test_heartbeat_event_does_not_affect_pause_intervals(tmp_path: Path) -> None:
+    """A heartbeat line between a pause and its resume must not split, shorten or
+    otherwise change the resulting pause interval - it is not a transition."""
+    lines = [
+        _event_json(state="paused", reason="user", updated_at="2026-09-17T10:00:00Z"),
+        _event_json(state="paused", reason="heartbeat", updated_at="2026-09-17T10:15:00Z"),
+        _event_json(state="recording", reason="user", updated_at="2026-09-17T10:30:00Z"),
+    ]
+    _write_events(tmp_path, lines)
+
+    intervals = pause_intervals(tmp_path, "2026-09-17T09:00:00Z", "2026-09-17T12:00:00Z", now=NOW)
+    assert intervals == [("2026-09-17T10:00:00Z", "2026-09-17T10:30:00Z")]
 
 
 # --- pause_intervals -------------------------------------------------------------
@@ -363,3 +403,49 @@ def test_format_intervals_in_asia_tokyo() -> None:
 
 def test_format_intervals_empty() -> None:
     assert format_intervals([], "UTC") == ""
+
+
+# --- with_pause_markers -------------------------------------------------------------
+
+
+def test_with_pause_markers_places_interval_between_items() -> None:
+    items = [
+        {"start": "2026-09-17T09:00:00Z", "label": "a"},
+        {"start": "2026-09-17T11:00:00Z", "label": "b"},
+    ]
+    intervals = [("2026-09-17T09:30:00Z", "2026-09-17T10:30:00Z")]
+
+    lines = with_pause_markers(
+        items,
+        intervals,
+        "UTC",
+        start_of=lambda item: item["start"],
+        render=lambda item: item["label"],
+    )
+
+    assert lines == ["a", "--- recorder paused 09:30–10:30 ---", "b"]
+
+
+def test_with_pause_markers_trailing_interval_goes_last() -> None:
+    items = [{"start": "2026-09-17T09:00:00Z", "label": "a"}]
+    intervals = [("2026-09-17T10:00:00Z", "2026-09-17T10:30:00Z")]
+
+    lines = with_pause_markers(
+        items,
+        intervals,
+        "UTC",
+        start_of=lambda item: item["start"],
+        render=lambda item: item["label"],
+    )
+
+    assert lines == ["a", "--- recorder paused 10:00–10:30 ---"]
+
+
+def test_with_pause_markers_no_items_still_emits_intervals() -> None:
+    intervals = [("2026-09-17T10:00:00Z", "2026-09-17T10:30:00Z")]
+
+    lines = with_pause_markers(
+        [], intervals, "UTC", start_of=lambda item: item["start"], render=lambda item: item["label"]
+    )
+
+    assert lines == ["--- recorder paused 10:00–10:30 ---"]

@@ -15,6 +15,8 @@ from .config import Config
 from .db import average_processed_duration_ms, recent_realtime_factor, transaction, utcnow_iso
 from .ingest import parse_inbox_name
 from .timeutil import fmt_hm, to_local
+from .timeutil import fmt_utc as _fmt_iso
+from .timeutil import parse_utc as _parse_iso
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +35,6 @@ CLAIM_TIMEOUT_S = 45 * 60
 
 def speaker_for_source(source: str) -> str:
     return _SOURCE_SPEAKERS.get(source, "unknown")
-
-
-def _parse_iso(iso_utc: str) -> datetime:
-    return datetime.strptime(iso_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-
-
-def _fmt_iso(dt: datetime) -> str:
-    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _abs_start_utc(started_at_utc: str, t_start_ms: int) -> str:
@@ -459,9 +453,7 @@ class DeleteRangeReport:
     def summary(self, tz: str) -> str:
         lines = []
         if self.dry_run:
-            lines.append(
-                "DRY RUN - nothing was deleted. Call again with dry_run=False to actually delete."
-            )
+            lines.append("DRY RUN - nothing was deleted.")
         lines.append(
             f"deletion is per RECORDING: the {len(self.recordings)} whole recording(s) "
             f"covering the requested range go, not just the requested minutes within them "

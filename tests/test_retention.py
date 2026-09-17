@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from voice_ai_summary.config import Config
 from voice_ai_summary.db import utcnow_iso
@@ -300,6 +303,45 @@ class TestLaunchdLogTruncation:
 
         assert skipped.name not in report.logs_truncated
         assert skipped.stat().st_size == 500
+
+    def test_bytes_appended_mid_truncation_are_not_lost(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A line appended (by the still-running service, O_APPEND) after this
+        function's own `read()` of the tail but before its `truncate()` must survive -
+        `_truncate_log_tail` re-checks the file's size once and folds any such bytes
+        into the kept tail rather than silently dropping them."""
+        from voice_ai_summary import retention
+
+        cfg, conn = vas
+        cfg.retention.log_max_bytes = 100
+        log_dir = cfg.paths.root / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "com.voiceaisummary.worker.log"
+        lines = [f"line {i:03d} - padding to make this long enough" for i in range(20)]
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        real_fstat = os.fstat
+        appended = False
+
+        def fake_fstat(fd: int) -> os.stat_result:
+            nonlocal appended
+            if not appended:
+                appended = True
+                # Simulate the running service's own O_APPEND fd on this same file
+                # writing a new line while `_truncate_log_tail` is still mid-flight.
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write("line NEW - appended after the tail was read\n")
+            return real_fstat(fd)
+
+        monkeypatch.setattr(retention.os, "fstat", fake_fstat)
+
+        report = prune(conn, cfg, dry_run=False, log_dir=log_dir)
+
+        assert log_path.name in report.logs_truncated
+        remaining = log_path.read_text(encoding="utf-8").splitlines()
+        assert "line NEW - appended after the tail was read" in remaining
+        assert remaining[-1] == "line NEW - appended after the tail was read"
 
 
 class TestEmptyDirRemoval:

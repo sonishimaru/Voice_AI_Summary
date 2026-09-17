@@ -25,13 +25,18 @@ from .db import utcnow_iso
 from .llm import USAGE_FILENAME
 from .recorder_state import EVENTS_FILENAME
 from .security import AUDIT_FILENAME, open_private
+from .timeutil import fmt_utc as _fmt
 
 logger = logging.getLogger(__name__)
 
-# The launchd worker log basenames, for `run_worker` to pass as `skip_logs`: truncating
-# the very file the worker process is itself appending stdout/stderr to is not safe (see
-# `_truncate_log_tail`'s docstring for why an in-place rewrite is used at all, and why
-# even that is skipped for a file this same process still has open for writing).
+# The launchd worker log basenames, for `worker.run_worker` (the *only* caller that
+# should pass this as `skip_logs`) since truncating the very file the worker process
+# is itself appending stdout/stderr to is not safe (see `_truncate_log_tail`'s
+# docstring for why an in-place rewrite is used at all, and why even that is skipped
+# for a file this same process still has open for writing). `commands_security.
+# prune_cmd` and `mcp_server.prune` run as separate, short-lived processes that never
+# hold that fd open, so they must NOT pass this - launchd's own log fd is opened
+# O_APPEND, so an in-place truncate from outside the worker process is safe for it too.
 WORKER_LOG_BASENAMES = frozenset({f"{launchd.WORKER_LABEL}.log", f"{launchd.WORKER_LABEL}.err"})
 
 
@@ -66,10 +71,6 @@ class PruneReport:
             f"{prefix}empty store directories removed: {self.empty_dirs_removed}",
         ]
         return "\n".join(lines)
-
-
-def _fmt(dt: datetime) -> str:
-    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _cutoff(now: datetime, days: int) -> str | None:
@@ -193,6 +194,16 @@ def _truncate_log_tail(path: Path, max_bytes: int) -> None:
     unlinked inode; every subsequent line the service writes would vanish into a file
     nothing reads any more. Rewriting in place (seek, write, truncate on the same open
     fd) keeps the same inode, so launchd's fd - and its append position - stays valid.
+
+    Between the `read()` below and the final `truncate()`, the running service can
+    still append more bytes (its writes are O_APPEND, so they land at the true
+    end-of-file regardless of this fd's own position) - a plain truncate at that point
+    would silently drop them. After reading the tail, this re-checks the file's actual
+    on-disk size once via `os.fstat` and, if it grew, reads the newly appended bytes
+    and folds them into `tail` before rewriting. That one re-check closes the window
+    that matters in practice; a second append landing in the sliver of time between
+    the re-check and the `truncate()` call itself is not handled - a vanishingly small
+    remaining window, accepted rather than chased further.
     """
     with open(path, "r+b") as f:
         f.seek(0, os.SEEK_END)
@@ -205,6 +216,9 @@ def _truncate_log_tail(path: Path, max_bytes: int) -> None:
         newline = tail.find(b"\n")
         if newline != -1:
             tail = tail[newline + 1 :]
+        read_to = f.tell()
+        if os.fstat(f.fileno()).st_size > read_to:
+            tail += f.read()
         f.seek(0)
         f.write(tail)
         f.truncate()

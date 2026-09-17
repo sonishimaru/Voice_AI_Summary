@@ -326,38 +326,6 @@ def _format_utterance_row(row: sqlite3.Row, tz: str) -> str:
     return f"{fmt_hm(row['abs_start_utc'], tz)} [{row['speaker']}] {row['text']}"
 
 
-def _with_pause_markers(
-    rows: list[sqlite3.Row],
-    intervals: list[tuple[str, str]],
-    tz: str,
-    fmt_row: Callable[[sqlite3.Row], str],
-) -> list[str]:
-    """Interleave `--- recorder paused HH:MM–HH:MM ---` marker lines between rendered
-    utterance rows at the chronologically correct spot.
-
-    An interval is emitted right before the first row whose `abs_start_utc` is at or
-    past that interval's end - i.e. it is placed as early as it can be while still
-    coming after every row it overlaps or precedes. Any interval(s) after the last row
-    go at the very end. `rows` must already be sorted oldest-first, same as every
-    caller already returns them.
-    """
-    from .timeutil import fmt_hm
-
-    lines: list[str] = []
-    i = 0
-    for row in rows:
-        while i < len(intervals) and row["abs_start_utc"] >= intervals[i][1]:
-            start, end = intervals[i]
-            lines.append(f"--- recorder paused {fmt_hm(start, tz)}–{fmt_hm(end, tz)} ---")
-            i += 1
-        lines.append(fmt_row(row))
-    while i < len(intervals):
-        start, end = intervals[i]
-        lines.append(f"--- recorder paused {fmt_hm(start, tz)}–{fmt_hm(end, tz)} ---")
-        i += 1
-    return lines
-
-
 def _stored_digest(conn: sqlite3.Connection, day: str) -> str | None:
     """The day digest held in `summaries`, or None when it has not been built."""
     from .summarize import PROMPT_VERSION
@@ -480,7 +448,7 @@ def transcript(day: str = "", limit: int = 800) -> str:
 
     from .config import load_config
     from .db import connect
-    from .recorder_state import pause_intervals
+    from .recorder_state import pause_intervals, with_pause_markers
     from .timeutil import local_day_bounds, today_local
 
     cfg = load_config()
@@ -502,7 +470,13 @@ def transcript(day: str = "", limit: int = 800) -> str:
 
     shown = rows[:limit]
     intervals = pause_intervals(cfg.paths.root, start, end, now=datetime.now(UTC))
-    lines = _with_pause_markers(shown, intervals, tz, lambda row: _format_utterance_row(row, tz))
+    lines = with_pause_markers(
+        shown,
+        intervals,
+        tz,
+        start_of=lambda row: row["abs_start_utc"],
+        render=lambda row: _format_utterance_row(row, tz),
+    )
     if len(rows) > limit:
         lines.append(f"... truncated: showing {limit} of {len(rows)} utterances")
     return _UNTRUSTED_HEADER + "\n".join(lines)
@@ -530,7 +504,13 @@ def recent(minutes: int = 30, limit: int = 200) -> str:
 
     from .config import load_config
     from .db import connect
-    from .recorder_state import describe, format_intervals, pause_intervals, read_state
+    from .recorder_state import (
+        describe,
+        format_intervals,
+        pause_intervals,
+        read_state,
+        with_pause_markers,
+    )
 
     cfg = load_config()
     cfg.ensure_dirs()
@@ -573,7 +553,13 @@ def recent(minutes: int = 30, limit: int = 200) -> str:
     shown = rows[:limit]
     lines = [*header_lines, ""]
     lines.extend(
-        _with_pause_markers(shown, intervals, tz, lambda row: _format_utterance_row(row, tz))
+        with_pause_markers(
+            shown,
+            intervals,
+            tz,
+            start_of=lambda row: row["abs_start_utc"],
+            render=lambda row: _format_utterance_row(row, tz),
+        )
     )
     if len(rows) > limit:
         lines.append(f"... truncated: showing {limit} of {len(rows)} utterances")
@@ -1659,19 +1645,19 @@ def prune(confirm: bool = False) -> str:
     from . import launchd
     from .config import load_config
     from .db import connect
-    from .retention import WORKER_LOG_BASENAMES
     from .retention import prune as run_prune
 
     cfg = load_config()
     cfg.ensure_dirs()
     conn = connect(cfg.paths.db_path)
 
+    # No `skip_logs`: this MCP server process never has the worker's log file open
+    # for append, so an in-place rewrite here is safe (see `WORKER_LOG_BASENAMES`).
     report = run_prune(
         conn,
         cfg,
         dry_run=not confirm,
         log_dir=launchd.log_dir(),
-        skip_logs=WORKER_LOG_BASENAMES,
     )
     summary = report.summary()
     if not confirm:

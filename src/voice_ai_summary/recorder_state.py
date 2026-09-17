@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypeVar
 
 from .timeutil import fmt_hm
 
@@ -79,13 +81,16 @@ def read_state(root: Path) -> RecorderState | None:
         return None
     if not isinstance(data, dict) or data.get("schema") != 1:
         return None
-    required = ("state", "since", "resume_at", "reason", "pid", "app_version", "updated_at")
+    # `resume_at` is deliberately not required: the app now writes `"resume_at": null`
+    # explicitly, but a synthesized Swift encoder omits a nil Optional entirely, and a
+    # file from a build that did that must still parse.
+    required = ("state", "since", "reason", "pid", "app_version", "updated_at")
     if not all(key in data for key in required):
         return None
     return RecorderState(
         state=data["state"],
         since=data["since"],
-        resume_at=data["resume_at"],
+        resume_at=data.get("resume_at"),
         reason=data["reason"],
         pid=data["pid"],
         app_version=data["app_version"],
@@ -139,8 +144,10 @@ def describe(state: RecorderState | None, tz: str, *, now: datetime) -> str:
 def read_all_events(root: Path) -> list[Event]:
     """Parse the entire `recorder_events.jsonl`, tolerating a torn last line.
 
-    `delete_recent` entries (not transitions) are skipped, along with any line that
-    isn't valid JSON, isn't an object, or is missing a required key.
+    `delete_recent` and `heartbeat` entries (not transitions) are skipped, along with
+    any line that isn't valid JSON, isn't an object, or is missing a required key.
+    The app no longer writes heartbeat lines here; skipping them covers files written
+    by an earlier build.
     """
     try:
         text = (root / EVENTS_FILENAME).read_text(encoding="utf-8")
@@ -157,7 +164,7 @@ def read_all_events(root: Path) -> list[Event]:
             continue
         if not isinstance(data, dict):
             continue
-        if data.get("reason") == "delete_recent":
+        if data.get("reason") in ("delete_recent", "heartbeat"):
             continue
         if not all(key in data for key in ("state", "reason", "updated_at")):
             continue
@@ -170,11 +177,6 @@ def read_all_events(root: Path) -> list[Event]:
             )
         )
     return events
-
-
-def read_events(root: Path, start_utc: str, end_utc: str) -> list[Event]:
-    """`read_all_events` filtered to events whose `at` falls in `[start_utc, end_utc)`."""
-    return [event for event in read_all_events(root) if start_utc <= event.at < end_utc]
 
 
 def pause_intervals(
@@ -225,3 +227,38 @@ def pause_intervals(
 def format_intervals(intervals: list[tuple[str, str]], tz: str) -> str:
     """Render `pause_intervals` output as e.g. "10:00–10:30, 14:05–14:20"."""
     return ", ".join(f"{fmt_hm(start, tz)}–{fmt_hm(end, tz)}" for start, end in intervals)
+
+
+_T = TypeVar("_T")
+
+
+def with_pause_markers(
+    items: list[_T],
+    intervals: list[tuple[str, str]],
+    tz: str,
+    *,
+    start_of: Callable[[_T], str],
+    render: Callable[[_T], str],
+) -> list[str]:
+    """Interleave `--- recorder paused HH:MM–HH:MM ---` marker lines between rendered
+    `items` at the chronologically correct spot.
+
+    `start_of(item)` gives the item's UTC ISO start timestamp, used only to decide
+    where each interval falls; `render(item)` gives the line actually emitted for it.
+    An interval is emitted right before the first item whose `start_of` is at or past
+    that interval's end - i.e. it is placed as early as it can be while still coming
+    after every item it overlaps or precedes. Any interval(s) after the last item go
+    at the very end. `items` must already be sorted oldest-first.
+    """
+    lines: list[str] = []
+    i = 0
+    for item in items:
+        item_start = start_of(item)
+        while i < len(intervals) and item_start >= intervals[i][1]:
+            lines.append(f"--- recorder paused {format_intervals([intervals[i]], tz)} ---")
+            i += 1
+        lines.append(render(item))
+    while i < len(intervals):
+        lines.append(f"--- recorder paused {format_intervals([intervals[i]], tz)} ---")
+        i += 1
+    return lines

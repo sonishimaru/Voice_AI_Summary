@@ -11,13 +11,21 @@ from zoneinfo import ZoneInfo
 _HM_RE = re.compile(r"^(?P<h>\d{1,2}):(?P<m>\d{2})$")
 
 
-def _parse_utc(iso_utc: str) -> datetime:
+def parse_utc(iso_utc: str) -> datetime:
     """Parse a `YYYY-MM-DDTHH:MM:SSZ` string into an aware UTC datetime."""
     return datetime.strptime(iso_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
 
 
-def _fmt_utc(dt: datetime) -> str:
+def fmt_utc(dt: datetime) -> str:
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Kept as aliases: other modules in this codebase (and `pipeline`/`retention`, which
+# used to keep their own private copies of these two functions) imported the private
+# names before `parse_utc`/`fmt_utc` were made public - see the code-review note that
+# led to this. New code should use the public names.
+_parse_utc = parse_utc
+_fmt_utc = fmt_utc
 
 
 def local_day_bounds(day: str, tz: str) -> tuple[str, str]:

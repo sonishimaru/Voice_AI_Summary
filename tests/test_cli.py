@@ -279,3 +279,28 @@ def test_episodes_no_episodes_still_shows_paused_marker(env: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "2026-09-15: no episodes" in result.output
     assert "--- recorder paused" in result.output
+
+
+def test_prune_cmd_truncates_worker_log_without_skip_logs(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`vas prune` runs as its own short-lived process, separate from the worker - it
+    must not pass `skip_logs` (that's `worker.run_worker`'s job alone), so it truncates
+    even a log named after the worker's own launchd log."""
+    from voice_ai_summary import launchd
+
+    monkeypatch.setattr(Path, "home", lambda: env)
+    config_path = env / "config.toml"
+    config_path.write_text("[retention]\nlog_max_bytes = 50\n", encoding="utf-8")
+    monkeypatch.setenv("VAS_CONFIG", str(config_path))
+
+    log_dir = launchd.log_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{launchd.WORKER_LABEL}.log"
+    log_path.write_text("x" * 500, encoding="utf-8")
+
+    result = runner.invoke(app, ["prune", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert log_path.name in result.output
+    assert log_path.stat().st_size < 500
