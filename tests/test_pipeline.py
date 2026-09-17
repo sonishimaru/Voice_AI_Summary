@@ -13,7 +13,13 @@ from voice_ai_summary.asr import FakeBackend
 from voice_ai_summary.config import Config
 from voice_ai_summary.db import utcnow_iso
 from voice_ai_summary.ingest import ingest_file
-from voice_ai_summary.pipeline import process_recording, speaker_for_source
+from voice_ai_summary.pipeline import (
+    delete_range,
+    delete_recording,
+    process_recording,
+    recordings_overlapping,
+    speaker_for_source,
+)
 from voice_ai_summary.search import search
 from voice_ai_summary.vad import SpeechRegion
 
@@ -549,3 +555,393 @@ class TestBacklogEta:
         # At 2.0x realtime, 30 min of audio takes ~15 min to decode.
         assert "2.00x" in result
         assert "15.0 min" in result
+
+
+# --- retention guards on the pipeline (process_recording / reset_recordings /
+# retry_failed / delete_recording) ---------------------------------------------------
+
+
+def test_process_recording_on_audio_deleted_row_sets_error_and_raises(
+    vas: tuple[Config, object],
+) -> None:
+    cfg, conn = vas
+    src = cfg.paths.inbox / "mac_mic_dev1_20260915T000000Z.wav"
+    _write_wav(src)
+    rec_id = ingest_file(conn, cfg, src)
+    conn.execute(
+        "UPDATE recordings SET audio_deleted_at = '2026-09-20T00:00:00Z' WHERE id = ?",
+        (rec_id,),
+    )
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="audio was deleted by retention"):
+        process_recording(conn, cfg, rec_id, FakeBackend(["x"]))
+
+    row = conn.execute(
+        "SELECT error, claimed_at FROM recordings WHERE id = ?", (rec_id,)
+    ).fetchone()
+    assert row["error"] is not None
+    assert "2026-09-20T00:00:00Z" in row["error"]
+    assert row["claimed_at"] is None
+
+
+def test_reset_recordings_skips_audio_deleted_rows(vas: tuple[Config, object]) -> None:
+    from voice_ai_summary.pipeline import reset_recordings
+
+    cfg, conn = vas
+    src1 = cfg.paths.inbox / "mac_mic_dev1_20260915T000000Z.wav"
+    src2 = cfg.paths.inbox / "mac_mic_dev1_20260915T010000Z.wav"
+    _write_wav(src1, seconds=2)
+    _write_wav(src2, seconds=3)
+    ok_id = ingest_file(conn, cfg, src1)
+    deleted_id = ingest_file(conn, cfg, src2)
+    conn.execute(
+        "UPDATE recordings SET audio_deleted_at = '2026-09-20T00:00:00Z' WHERE id = ?",
+        (deleted_id,),
+    )
+    conn.commit()
+
+    assert reset_recordings(conn, [ok_id, deleted_id]) == 1
+
+    ok_row = conn.execute(
+        "SELECT processed_at, error FROM recordings WHERE id = ?", (ok_id,)
+    ).fetchone()
+    assert ok_row["processed_at"] is None and ok_row["error"] is None
+
+    deleted_row = conn.execute(
+        "SELECT audio_deleted_at FROM recordings WHERE id = ?", (deleted_id,)
+    ).fetchone()
+    assert deleted_row["audio_deleted_at"] == "2026-09-20T00:00:00Z"  # untouched
+
+
+def test_retry_failed_leaves_audio_deleted_rows_errored(vas: tuple[Config, object]) -> None:
+    from voice_ai_summary.pipeline import retry_failed
+
+    cfg, conn = vas
+    src = cfg.paths.inbox / "mac_mic_dev1_20260915T000000Z.wav"
+    _write_wav(src)
+    rec_id = ingest_file(conn, cfg, src)
+    conn.execute(
+        "UPDATE recordings SET error = 'audio was deleted by retention on X',"
+        " audio_deleted_at = '2026-09-20T00:00:00Z' WHERE id = ?",
+        (rec_id,),
+    )
+    conn.commit()
+
+    assert retry_failed(conn, cfg) == []
+
+    row = conn.execute(
+        "SELECT error, processed_at FROM recordings WHERE id = ?", (rec_id,)
+    ).fetchone()
+    assert row["error"] is not None
+    assert row["processed_at"] is None
+
+
+def test_delete_recording_with_delete_audio_removes_file(vas: tuple[Config, object]) -> None:
+    cfg, conn = vas
+    src = cfg.paths.inbox / "mac_mic_dev1_20260915T000000Z.wav"
+    _write_wav(src)
+    rec_id = ingest_file(conn, cfg, src)
+    storage_path = conn.execute(
+        "SELECT storage_path FROM recordings WHERE id = ?", (rec_id,)
+    ).fetchone()["storage_path"]
+    audio_path = cfg.paths.store / storage_path
+    assert audio_path.exists()
+
+    assert delete_recording(conn, rec_id, cfg=cfg, delete_audio=True) is True
+
+    assert not audio_path.exists()
+    assert conn.execute("SELECT id FROM recordings WHERE id = ?", (rec_id,)).fetchone() is None
+
+
+def test_delete_recording_without_delete_audio_leaves_file(vas: tuple[Config, object]) -> None:
+    """Unchanged default behaviour: existing callers passing only (conn, id) must keep
+    working exactly as before - the audio file is left on disk."""
+    cfg, conn = vas
+    src = cfg.paths.inbox / "mac_mic_dev1_20260915T000000Z.wav"
+    _write_wav(src)
+    rec_id = ingest_file(conn, cfg, src)
+    storage_path = conn.execute(
+        "SELECT storage_path FROM recordings WHERE id = ?", (rec_id,)
+    ).fetchone()["storage_path"]
+    audio_path = cfg.paths.store / storage_path
+
+    assert delete_recording(conn, rec_id) is True
+    assert audio_path.exists()
+
+
+# --- recordings_overlapping / delete_range -------------------------------------------
+
+
+def _insert_overlap_row(conn, *, sha256: str, started_at_utc: str, duration_ms: int | None) -> int:
+    cur = conn.execute(
+        "INSERT INTO recordings(source, started_at_utc, duration_ms, sha256, storage_path,"
+        " ingested_at) VALUES ('mac_mic', ?, ?, ?, 'x.wav', ?)",
+        (started_at_utc, duration_ms, sha256, utcnow_iso()),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+class TestRecordingsOverlapping:
+    def test_recording_straddling_the_start_overlaps(self, vas: tuple[Config, object]) -> None:
+        cfg, conn = vas
+        _insert_overlap_row(
+            conn, sha256="a" * 64, started_at_utc="2026-09-15T00:55:00Z", duration_ms=600_000
+        )
+        rows = recordings_overlapping(
+            conn,
+            "2026-09-15T01:00:00Z",
+            "2026-09-15T01:10:00Z",
+            default_duration_ms=900_000,
+        )
+        assert len(rows) == 1
+
+    def test_recording_ending_exactly_at_start_is_excluded(
+        self, vas: tuple[Config, object]
+    ) -> None:
+        cfg, conn = vas
+        # Ends at exactly 2026-09-15T01:00:00Z (started 00:50 + 600_000ms = 10min).
+        _insert_overlap_row(
+            conn, sha256="b" * 64, started_at_utc="2026-09-15T00:50:00Z", duration_ms=600_000
+        )
+        rows = recordings_overlapping(
+            conn,
+            "2026-09-15T01:00:00Z",
+            "2026-09-15T01:10:00Z",
+            default_duration_ms=900_000,
+        )
+        assert rows == []
+
+    def test_pending_recording_uses_default_duration(self, vas: tuple[Config, object]) -> None:
+        cfg, conn = vas
+        # No duration_ms yet (pending) - only overlaps if the *default* duration reaches
+        # into the requested range.
+        _insert_overlap_row(
+            conn, sha256="c" * 64, started_at_utc="2026-09-15T00:50:00Z", duration_ms=None
+        )
+        # default_duration_ms=600_000 (10min) -> ends at 01:00:00Z, exactly at start: excluded.
+        assert (
+            recordings_overlapping(
+                conn,
+                "2026-09-15T01:00:00Z",
+                "2026-09-15T01:10:00Z",
+                default_duration_ms=600_000,
+            )
+            == []
+        )
+        # default_duration_ms=900_000 (15min) -> ends at 01:05:00Z: overlaps.
+        rows = recordings_overlapping(
+            conn,
+            "2026-09-15T01:00:00Z",
+            "2026-09-15T01:10:00Z",
+            default_duration_ms=900_000,
+        )
+        assert len(rows) == 1
+
+
+def _setup_day_for_delete_range(cfg: Config, conn, monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Build a full day around one recording: ingest + transcribe it, build its episode,
+    stash fake episode/day summaries and digest files (+ mirror), and drop a matching
+    not-yet-ingested inbox file (plus an unrelated one and a `.part`) - everything
+    `delete_range` is expected to touch, or deliberately not touch."""
+    from voice_ai_summary.episodes import build_episodes, episode_transcript
+    from voice_ai_summary.summarize import PROMPT_VERSION, _content_key
+
+    day = "2026-09-15"
+    tz = cfg.summarize.timezone  # Asia/Tokyo by default -> 2026-09-15T01:00:00Z == 10:00 JST
+    started_at_utc = "2026-09-15T01:00:00Z"
+
+    src = cfg.paths.inbox / "mac_mic_dev1_20260915T010000Z.wav"
+    _write_wav(src, seconds=4)
+    rec_id = ingest_file(conn, cfg, src)
+
+    fixed_regions = [SpeechRegion(0, 1000, 0.9)]
+    monkeypatch.setattr(vad_module, "detect_speech", lambda samples, cfg: fixed_regions)
+    process_recording(conn, cfg, rec_id, FakeBackend(["削除される発言です"]))
+
+    episode_ids = build_episodes(conn, cfg, day)
+    assert len(episode_ids) == 1
+    episode_id = episode_ids[0]
+    transcript = episode_transcript(conn, episode_id, tz)
+    episode_key = _content_key(transcript)
+
+    now = utcnow_iso()
+    conn.execute(
+        "INSERT INTO summaries(scope, scope_key, model, prompt_version, json, markdown,"
+        " created_at) VALUES ('episode', ?, 'test', ?, '{}', NULL, ?)",
+        (episode_key, PROMPT_VERSION, now),
+    )
+    conn.execute(
+        "INSERT INTO summaries(scope, scope_key, model, prompt_version, json, markdown,"
+        " created_at) VALUES ('day', ?, 'test', ?, '{}', ?, ?)",
+        (day, PROMPT_VERSION, "# digest\n", now),
+    )
+    conn.commit()
+
+    cfg.paths.digests.mkdir(parents=True, exist_ok=True)
+    (cfg.paths.digests / f"{day}.md").write_text("# digest\n", encoding="utf-8")
+    mirror = cfg.paths.digest_mirror
+    if mirror is not None:
+        mirror.mkdir(parents=True, exist_ok=True)
+        (mirror / f"{day}.md").write_text("# digest\n", encoding="utf-8")
+
+    # A not-yet-ingested inbox file whose assumed (rotation-interval) window overlaps
+    # the delete range used by the tests below.
+    matching = cfg.paths.inbox / "mac_mic_dev1_20260915T010030Z.wav"
+    _write_wav(matching, seconds=1)
+    (matching.with_suffix(".json")).write_text('{"source": "mac_mic"}', encoding="utf-8")
+
+    # An unrelated inbox file, far outside the range - must survive.
+    unrelated = cfg.paths.inbox / "mac_mic_dev1_20260916T010000Z.wav"
+    _write_wav(unrelated, seconds=1)
+
+    # A `.part` file (recorder still writing), timestamped inside the same window -
+    # never touched, regardless of the timestamp in its name.
+    part = cfg.paths.inbox / "mac_mic_dev1_20260915T010045Z.wav.part"
+    _write_wav(part, seconds=1)
+
+    return {
+        "day": day,
+        "rec_id": rec_id,
+        "episode_id": episode_id,
+        "episode_key": episode_key,
+        "started_at_utc": started_at_utc,
+        "matching_name": matching.name,
+        "unrelated_name": unrelated.name,
+        "part_name": part.name,
+    }
+
+
+class TestDeleteRange:
+    def test_dry_run_touches_nothing(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        cfg, conn = vas
+        cfg.paths.digest_mirror_dir = tmp_path / "mirror"
+        cfg.ensure_dirs()
+        info = _setup_day_for_delete_range(cfg, conn, monkeypatch)
+
+        start_utc = "2026-09-15T01:00:00Z"
+        end_utc = "2026-09-15T01:01:00Z"
+        report = delete_range(conn, cfg, start_utc, end_utc, dry_run=True)
+
+        assert report.dry_run is True
+        assert len(report.recordings) == 1
+        assert report.recordings[0]["id"] == info["rec_id"]
+
+        # Nothing on disk or in the DB actually changed.
+        assert (
+            conn.execute("SELECT id FROM recordings WHERE id = ?", (info["rec_id"],)).fetchone()
+            is not None
+        )
+        assert conn.execute("SELECT COUNT(*) AS n FROM summaries").fetchone()["n"] == 2
+        assert (cfg.paths.digests / f"{info['day']}.md").is_file()
+        assert (cfg.paths.inbox / info["matching_name"]).exists()
+        assert search(conn, "削除される発言です") != []
+
+    def test_real_run_removes_everything_it_should_and_nothing_else(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        cfg, conn = vas
+        cfg.paths.digest_mirror_dir = tmp_path / "mirror"
+        cfg.ensure_dirs()
+        info = _setup_day_for_delete_range(cfg, conn, monkeypatch)
+
+        audio_path = (
+            cfg.paths.store
+            / conn.execute(
+                "SELECT storage_path FROM recordings WHERE id = ?", (info["rec_id"],)
+            ).fetchone()["storage_path"]
+        )
+        assert audio_path.exists()
+
+        start_utc = "2026-09-15T01:00:00Z"
+        end_utc = "2026-09-15T01:01:00Z"
+        report = delete_range(conn, cfg, start_utc, end_utc, dry_run=False)
+
+        assert report.dry_run is False
+        assert info["day"] in report.days
+
+        # Recording row + audio gone.
+        assert (
+            conn.execute("SELECT id FROM recordings WHERE id = ?", (info["rec_id"],)).fetchone()
+            is None
+        )
+        assert not audio_path.exists()
+
+        # FTS stays consistent: the deleted utterance is not findable any more.
+        assert search(conn, "削除される発言です") == []
+
+        # Episode + day summaries gone.
+        assert (
+            conn.execute(
+                "SELECT 1 FROM summaries WHERE scope='episode' AND scope_key=?",
+                (info["episode_key"],),
+            ).fetchone()
+            is None
+        )
+        assert (
+            conn.execute(
+                "SELECT 1 FROM summaries WHERE scope='day' AND scope_key=?", (info["day"],)
+            ).fetchone()
+            is None
+        )
+
+        # Episodes rebuilt for the day: the old episode_id no longer exists (no
+        # utterances left to build it from).
+        assert (
+            conn.execute("SELECT 1 FROM episodes WHERE id = ?", (info["episode_id"],)).fetchone()
+            is None
+        )
+
+        # Digest file + mirror gone.
+        assert not (cfg.paths.digests / f"{info['day']}.md").exists()
+        assert not (cfg.paths.digest_mirror / f"{info['day']}.md").exists()
+
+        # The matching inbox file + its sidecar are gone.
+        assert not (cfg.paths.inbox / info["matching_name"]).exists()
+        assert not (cfg.paths.inbox / info["matching_name"]).with_suffix(".json").exists()
+
+        # The unrelated file and the `.part` file must survive untouched.
+        assert (cfg.paths.inbox / info["unrelated_name"]).exists()
+        assert (cfg.paths.inbox / info["part_name"]).exists()
+
+
+# --- timeutil.local_time_to_utc --------------------------------------------------
+# (no dedicated tests/test_timeutil.py exists yet, so these live alongside delete_range,
+# the feature that needed the function.)
+
+
+class TestLocalTimeToUtc:
+    def test_midnight(self) -> None:
+        from voice_ai_summary.timeutil import local_time_to_utc
+
+        assert local_time_to_utc("2026-09-15", "00:00", "Asia/Tokyo") == "2026-09-14T15:00:00Z"
+
+    def test_24_00_means_the_start_of_the_next_local_day(self) -> None:
+        from voice_ai_summary.timeutil import local_time_to_utc
+
+        assert local_time_to_utc("2026-09-15", "24:00", "Asia/Tokyo") == "2026-09-15T15:00:00Z"
+        # Same instant as 00:00 the next day.
+        assert local_time_to_utc("2026-09-15", "24:00", "Asia/Tokyo") == local_time_to_utc(
+            "2026-09-16", "00:00", "Asia/Tokyo"
+        )
+
+    def test_asia_tokyo_has_no_dst_so_the_offset_is_always_plus_9(self) -> None:
+        from voice_ai_summary.timeutil import local_time_to_utc
+
+        assert local_time_to_utc("2026-01-15", "10:30", "Asia/Tokyo") == "2026-01-15T01:30:00Z"
+        assert local_time_to_utc("2026-07-15", "10:30", "Asia/Tokyo") == "2026-07-15T01:30:00Z"
+
+    def test_bad_input_raises(self) -> None:
+        from voice_ai_summary.timeutil import local_time_to_utc
+
+        with pytest.raises(ValueError):
+            local_time_to_utc("2026-09-15", "25:00", "Asia/Tokyo")
+        with pytest.raises(ValueError):
+            local_time_to_utc("2026-09-15", "10:60", "Asia/Tokyo")
+        with pytest.raises(ValueError):
+            local_time_to_utc("2026-09-15", "not-a-time", "Asia/Tokyo")
+        with pytest.raises(ValueError):
+            local_time_to_utc("not-a-date", "10:00", "Asia/Tokyo")

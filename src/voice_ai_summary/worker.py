@@ -9,14 +9,21 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from . import retention
 from .asr import get_backend
 from .config import Config
 from .db import connect
 from .deliver.notify import send_desktop_notification
 from .ingest import ingest_inbox
+from .launchd import log_dir as launchd_log_dir
 from .pipeline import process_pending
 
 logger = logging.getLogger(__name__)
+
+# How often `run_worker` calls `retention.prune` - once an hour is plenty for something
+# that only deletes audio once it is already `audio_days`/`errored_audio_days` old and
+# rewrites append-only logs; there's no benefit to running it on every poll.
+PRUNE_INTERVAL_S = 60 * 60
 
 
 class _Stop(BaseException):
@@ -96,18 +103,31 @@ def run_worker(
     once: bool = False,
     clock: Callable[[], float] | None = None,
 ) -> None:
-    """Ingest + process in a loop until interrupted (or once, if `once` is set)."""
+    """Ingest + process in a loop until interrupted (or once, if `once` is set).
+
+    Does not set the process umask itself - `cli.main()` (the `vas worker` entry point)
+    already does that before dispatching here, so the worker just inherits it. Setting
+    it again from inside `run_worker` would also mean a test calling it directly (there
+    is no other entry point that reaches this function without going through
+    `cli.main()`) changes this whole test process's umask as a side effect, which
+    outlives the test.
+    """
     cfg.ensure_dirs()
     conn = connect(cfg.paths.db_path)
     backend = get_backend(cfg)
     interval = poll_seconds if poll_seconds is not None else cfg.schedule.worker_poll_seconds
+    clock_fn = clock if clock is not None else time.monotonic
 
     backlog_watch = _BacklogWatch(
         count_threshold=cfg.schedule.backlog_alert_count,
         grace_s=cfg.schedule.backlog_alert_minutes * 60,
-        clock=clock if clock is not None else time.monotonic,
+        clock=clock_fn,
         notify=_notify_backlog,
     )
+
+    # `None` means "never pruned yet this run" - the first poll always prunes, then no
+    # more often than once per `PRUNE_INTERVAL_S` after that.
+    last_prune: float | None = None
 
     def _handle_signal(signum: int, _frame: Any) -> None:
         raise _Stop
@@ -125,6 +145,21 @@ def run_worker(
             if processed:
                 logger.info("processed %d recording(s)", processed)
             backlog_watch.observe(_pending_count(conn))
+
+            now = clock_fn()
+            if last_prune is None or now - last_prune >= PRUNE_INTERVAL_S:
+                last_prune = now
+                try:
+                    retention.prune(
+                        conn,
+                        cfg,
+                        dry_run=False,
+                        log_dir=launchd_log_dir(),
+                        skip_logs=retention.WORKER_LOG_BASENAMES,
+                    )
+                except Exception:
+                    logger.exception("retention prune failed")
+
             if once:
                 return
             time.sleep(interval)

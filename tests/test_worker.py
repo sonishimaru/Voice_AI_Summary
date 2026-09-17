@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from voice_ai_summary import retention, worker
 from voice_ai_summary import vad as vad_module
-from voice_ai_summary import worker
 from voice_ai_summary.config import Config
 from voice_ai_summary.db import utcnow_iso
 from voice_ai_summary.ingest import ingest_file
@@ -169,8 +169,86 @@ def test_worker_survives_notification_failure(
 
     monkeypatch.setattr(worker, "ingest_inbox", bounded_ingest)
 
-    clock_values = iter([0.0, 100.0, 200.0])
+    # An unbounded incrementing fake clock: `run_worker` now also reads the clock to
+    # schedule `retention.prune` (see TestRetentionSchedule below), so the loop consumes
+    # more ticks per iteration than just `_BacklogWatch.observe`'s one - a fixed-length
+    # `iter([...])` would run out and raise `StopIteration` instead of exercising the
+    # shutdown path this test is actually about.
+    clock_state = {"t": 0.0}
+
+    def _clock() -> float:
+        clock_state["t"] += 50.0
+        return clock_state["t"]
 
     # Must return normally (the _Stop is caught inside run_worker) despite the
     # notification raising on the second poll.
-    worker.run_worker(cfg, clock=lambda: next(clock_values))
+    worker.run_worker(cfg, clock=_clock)
+
+
+class TestRetentionSchedule:
+    """`run_worker` also runs `retention.prune` on its own schedule - once an hour,
+    driven by the same injectable `clock` as `_BacklogWatch`, not on every poll."""
+
+    def test_prune_runs_once_an_hour_not_every_poll(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, _conn = vas
+        # Keep `_BacklogWatch.observe` from consuming clock ticks of its own: it only
+        # calls the clock once `pending >= count_threshold`, and there's nothing
+        # pending here (a fresh `vas` fixture, threshold defaults to 10).
+        monkeypatch.setattr(worker.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(worker, "process_pending", lambda conn, cfg, backend: 0)
+
+        calls = {"n": 0}
+
+        def bounded_ingest(conn: object, cfg: object) -> list:
+            calls["n"] += 1
+            if calls["n"] > 3:
+                raise worker._Stop
+            return []
+
+        monkeypatch.setattr(worker, "ingest_inbox", bounded_ingest)
+
+        prune_calls: list[tuple] = []
+
+        def fake_prune(conn: object, cfg: object, *, dry_run: bool, log_dir, skip_logs) -> None:
+            prune_calls.append((dry_run, skip_logs))
+
+        monkeypatch.setattr(retention, "prune", fake_prune)
+
+        # 3 successful polls: t=0 (first ever poll -> prunes), t=10 (10s later, well
+        # under an hour -> skipped), t=4000 (past the hour mark from t=0 -> prunes again).
+        clock_values = iter([0.0, 10.0, 4000.0])
+        worker.run_worker(cfg, clock=lambda: next(clock_values))
+
+        assert len(prune_calls) == 2
+        assert all(dry_run is False for dry_run, _ in prune_calls)
+        assert all(skip_logs == retention.WORKER_LOG_BASENAMES for _, skip_logs in prune_calls)
+
+    def test_a_raising_prune_does_not_stop_the_worker_loop(
+        self, vas: tuple[Config, object], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, _conn = vas
+        monkeypatch.setattr(worker.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(worker, "process_pending", lambda conn, cfg, backend: 0)
+
+        calls = {"n": 0}
+
+        def bounded_ingest(conn: object, cfg: object) -> list:
+            calls["n"] += 1
+            if calls["n"] > 2:
+                raise worker._Stop
+            return []
+
+        monkeypatch.setattr(worker, "ingest_inbox", bounded_ingest)
+
+        def raising_prune(conn: object, cfg: object, **kwargs: object) -> None:
+            raise RuntimeError("prune boom")
+
+        monkeypatch.setattr(retention, "prune", raising_prune)
+
+        clock_values = iter([0.0, 10.0])
+        # Must return normally: run_worker logs the exception and keeps polling instead
+        # of letting a retention bug take down the whole worker.
+        worker.run_worker(cfg, clock=lambda: next(clock_values))
+        assert calls["n"] == 3

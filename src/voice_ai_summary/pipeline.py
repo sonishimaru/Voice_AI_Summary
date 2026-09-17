@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from . import vad as vad_module
@@ -12,6 +13,8 @@ from .asr import ASRBackend
 from .audio import SAMPLE_RATE, duration_ms, load_audio_16k
 from .config import Config
 from .db import average_processed_duration_ms, recent_realtime_factor, transaction, utcnow_iso
+from .ingest import parse_inbox_name
+from .timeutil import fmt_hm, to_local
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,14 @@ CLAIM_TIMEOUT_S = 45 * 60
 
 def speaker_for_source(source: str) -> str:
     return _SOURCE_SPEAKERS.get(source, "unknown")
+
+
+def _parse_iso(iso_utc: str) -> datetime:
+    return datetime.strptime(iso_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
+def _fmt_iso(dt: datetime) -> str:
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _abs_start_utc(started_at_utc: str, t_start_ms: int) -> str:
@@ -66,6 +77,20 @@ def process_recording(
     row = conn.execute("SELECT * FROM recordings WHERE id = ?", (recording_id,)).fetchone()
     if row is None:
         raise ValueError(f"no such recording: {recording_id}")
+
+    if row["audio_deleted_at"] is not None:
+        # Terminal state: retention already removed this recording's audio file, so
+        # there is nothing left to decode. Recorded the same way an ordinary decode
+        # failure is (error set, claim cleared) so callers see one consistent shape.
+        message = (
+            f"audio was deleted by retention on {row['audio_deleted_at']}; cannot re-transcribe"
+        )
+        with transaction(conn):
+            conn.execute(
+                "UPDATE recordings SET error = ?, claimed_at = NULL WHERE id = ?",
+                (message, recording_id),
+            )
+        raise RuntimeError(message)
 
     try:
         audio_path = cfg.paths.store / row["storage_path"]
@@ -278,12 +303,18 @@ def retry_failed(conn: sqlite3.Connection, cfg: Config) -> list[int]:
 
     A recording ingested while the recorder still had it open lands in the store under its
     `.part` name; once the recorder has closed it the file is valid, so it is renamed here.
+
+    Skips (and leaves errored) any recording whose audio retention already deleted -
+    `process_recording` would just set the same "audio was deleted" error right back,
+    so clearing it here would only make the row flicker pending before failing again.
     """
     rows = conn.execute(
-        "SELECT id, storage_path FROM recordings WHERE error IS NOT NULL"
+        "SELECT id, storage_path, audio_deleted_at FROM recordings WHERE error IS NOT NULL"
     ).fetchall()
     ids: list[int] = []
     for row in rows:
+        if row["audio_deleted_at"] is not None:
+            continue
         storage_path = row["storage_path"]
         if storage_path.endswith(".part"):
             src = cfg.paths.store / storage_path
@@ -309,35 +340,321 @@ def reset_recordings(conn: sqlite3.Connection, recording_ids: list[int]) -> int:
 
     Used to re-transcribe after changing the ASR model, vocabulary or VAD chunking.
     Summaries are keyed by transcript content, so they recompute on the next digest.
+
+    Skips any recording whose audio retention already deleted - there is nothing left
+    to re-transcribe it from - and logs which ids were skipped. Returns the count
+    actually reset, which can be smaller than `len(recording_ids)`.
     """
     if not recording_ids:
         return 0
     placeholders = ",".join("?" for _ in recording_ids)
+    rows = conn.execute(
+        f"SELECT id, audio_deleted_at FROM recordings WHERE id IN ({placeholders})",
+        recording_ids,
+    ).fetchall()
+    resettable_ids = [r["id"] for r in rows if r["audio_deleted_at"] is None]
+    for r in rows:
+        if r["audio_deleted_at"] is not None:
+            logger.warning(
+                "skipping reset of recording %s: audio was deleted by retention on %s",
+                r["id"],
+                r["audio_deleted_at"],
+            )
+    if not resettable_ids:
+        return 0
+    reset_placeholders = ",".join("?" for _ in resettable_ids)
     with transaction(conn):
-        _clear_transcript(conn, recording_ids)
+        _clear_transcript(conn, resettable_ids)
         conn.execute(
             # claimed_at = NULL for the same reason as in retry_failed: a re-queued
             # recording must be visible to process_pending immediately, not after the
             # stale-claim timeout.
             f"UPDATE recordings SET processed_at = NULL, error = NULL, claimed_at = NULL"
-            f" WHERE id IN ({placeholders})",
-            recording_ids,
+            f" WHERE id IN ({reset_placeholders})",
+            resettable_ids,
         )
-    return len(recording_ids)
+    return len(resettable_ids)
 
 
-def delete_recording(conn: sqlite3.Connection, recording_id: int) -> bool:
+def delete_recording(
+    conn: sqlite3.Connection,
+    recording_id: int,
+    *,
+    cfg: Config | None = None,
+    delete_audio: bool = False,
+) -> bool:
     """Permanently delete one recording's row along with its segments/utterances.
 
-    Does NOT touch the audio file on disk - callers that want that removed too must do
-    it themselves. Returns False (no-op) if the recording does not exist. Uses
-    `_clear_transcript` so `utterances_fts` stays consistent, same as `reset_recordings`
-    and `process_recording`.
+    By default does NOT touch the audio file on disk - callers that want that removed
+    too must either pass `cfg` and `delete_audio=True`, or do it themselves. When both
+    are given, the audio file is unlinked (a missing file is fine) before the row is
+    deleted, so a crash between the two leaves an orphaned file rather than a row
+    pointing at nothing.
+
+    Returns False (no-op) if the recording does not exist. Uses `_clear_transcript` so
+    `utterances_fts` stays consistent, same as `reset_recordings` and `process_recording`.
     """
+    row = conn.execute(
+        "SELECT storage_path FROM recordings WHERE id = ?", (recording_id,)
+    ).fetchone()
+    if row is None:
+        return False
+
+    if delete_audio and cfg is not None and row["storage_path"]:
+        try:
+            (cfg.paths.store / row["storage_path"]).unlink()
+        except FileNotFoundError:
+            pass
+
     with transaction(conn):
-        row = conn.execute("SELECT id FROM recordings WHERE id = ?", (recording_id,)).fetchone()
-        if row is None:
-            return False
         _clear_transcript(conn, [recording_id])
         conn.execute("DELETE FROM recordings WHERE id = ?", (recording_id,))
     return True
+
+
+def recordings_overlapping(
+    conn: sqlite3.Connection,
+    start_utc: str,
+    end_utc: str,
+    *,
+    default_duration_ms: int,
+) -> list[sqlite3.Row]:
+    """Recordings whose `[started_at_utc, started_at_utc + duration)` window overlaps
+    the half-open `[start_utc, end_utc)` range - a recording ending exactly at
+    `start_utc` does NOT overlap.
+
+    A recording with no `duration_ms` yet (still pending, or errored before it could be
+    measured) is assumed to last `default_duration_ms` - typically the recorder's
+    rotation interval (`cfg.recorder.rotation_minutes`), the same assumption
+    `delete_range` uses for the recordings it finds this way.
+
+    The SQL below is a wide net over candidates (no recording is expected to run
+    anywhere near a full day), not the exact overlap test - that needs each row's actual
+    duration, and is applied in Python over the candidate set.
+    """
+    window_start = _fmt_iso(_parse_iso(start_utc) - timedelta(hours=24))
+    candidates = conn.execute(
+        "SELECT * FROM recordings WHERE started_at_utc < ? AND started_at_utc >= ?"
+        " ORDER BY started_at_utc",
+        (end_utc, window_start),
+    ).fetchall()
+    out = []
+    for row in candidates:
+        dur = row["duration_ms"] if row["duration_ms"] is not None else default_duration_ms
+        row_end = _fmt_iso(_parse_iso(row["started_at_utc"]) + timedelta(milliseconds=dur))
+        if row["started_at_utc"] < end_utc and row_end > start_utc:
+            out.append(row)
+    return out
+
+
+@dataclass
+class DeleteRangeReport:
+    recordings: list[dict] = field(default_factory=list)
+    inbox_files: list[str] = field(default_factory=list)
+    days: list[str] = field(default_factory=list)
+    episode_summaries_removed: int = 0
+    day_digests_removed: list[str] = field(default_factory=list)
+    dry_run: bool = True
+
+    def summary(self, tz: str) -> str:
+        lines = []
+        if self.dry_run:
+            lines.append(
+                "DRY RUN - nothing was deleted. Call again with dry_run=False to actually delete."
+            )
+        lines.append(
+            f"deletion is per RECORDING: the {len(self.recordings)} whole recording(s) "
+            f"covering the requested range go, not just the requested minutes within them "
+            f"(local time, {tz}):"
+        )
+        for r in self.recordings:
+            audio_state = "audio present" if r["audio_present"] else "audio already gone"
+            lines.append(
+                f"  recording {r['id']} ({r['source']}) local start {r['local_start']}"
+                f" duration~{r['duration_min']:.1f}min utterances={r['utterances']}"
+                f" ({audio_state})"
+            )
+        if self.inbox_files:
+            lines.append(f"{len(self.inbox_files)} not-yet-ingested inbox file(s) also covered:")
+            for name in self.inbox_files:
+                lines.append(f"  {name}")
+        lines.append(f"affected local day(s): {', '.join(self.days) if self.days else '(none)'}")
+        removed_digests = (
+            ", ".join(self.day_digests_removed) if self.day_digests_removed else "(none)"
+        )
+        lines.append(
+            f"episode summaries removed: {self.episode_summaries_removed}; "
+            f"day digest(s) removed: {removed_digests} "
+            "- these day(s) need `rebuild_day` (or `vas digest`) run again to get a digest back."
+        )
+        return "\n".join(lines)
+
+
+def delete_range(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    start_utc: str,
+    end_utc: str,
+    *,
+    dry_run: bool = True,
+) -> DeleteRangeReport:
+    """Permanently delete every recording overlapping `[start_utc, end_utc)`, along with
+    their audio, the not-yet-ingested inbox files covering the same window, the episode/
+    day summaries that depended on them, and the affected days' digest files - then
+    rebuild those days' episodes so nothing points at deleted utterances.
+
+    Deletion is per-recording: a recording is atomic here (it came from one continuous
+    audio file), so asking to delete a five-minute slice removes the *whole* recording(s)
+    that slice falls in, per `recordings_overlapping`'s overlap rule.
+
+    `dry_run=True` (the default) only reads - the returned report is an accurate preview
+    and nothing on disk or in the database changes. `dry_run=False` performs the
+    deletion: DB writes (summaries, then recordings - audio + row, via `delete_recording`,
+    so `_clear_transcript` keeps `utterances_fts` consistent) happen first; only after
+    that do the pure filesystem steps happen (inbox files/sidecars, rebuilding episodes,
+    the digest files). That order means a worker mid-decode of a recording just deleted
+    fails on file-not-found (its audio, or its row) and its final `UPDATE ... WHERE id=?`
+    then simply matches no row - not a crash, just a no-op. `.part` files (the recorder's
+    still-open marker) are never touched.
+    """
+    tz = cfg.summarize.timezone
+    default_duration_ms = cfg.recorder.rotation_minutes * 60_000
+
+    overlapping = recordings_overlapping(
+        conn, start_utc, end_utc, default_duration_ms=default_duration_ms
+    )
+
+    rec_infos: list[dict] = []
+    days_set: set[str] = set()
+    for row in overlapping:
+        dur = row["duration_ms"] if row["duration_ms"] is not None else default_duration_ms
+        utt_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM utterances WHERE recording_id = ?", (row["id"],)
+        ).fetchone()["n"]
+        rec_infos.append(
+            {
+                "id": row["id"],
+                "source": row["source"],
+                "local_start": fmt_hm(row["started_at_utc"], tz),
+                "duration_min": dur / 60_000,
+                "utterances": utt_count,
+                "audio_present": row["audio_deleted_at"] is None,
+            }
+        )
+        end_dt = _parse_iso(row["started_at_utc"]) + timedelta(milliseconds=dur)
+        days_set.add(to_local(row["started_at_utc"], tz).strftime("%Y-%m-%d"))
+        days_set.add(to_local(_fmt_iso(end_dt), tz).strftime("%Y-%m-%d"))
+    days = sorted(days_set)
+
+    inbox_files: list[str] = []
+    if cfg.paths.inbox.is_dir():
+        for path in sorted(cfg.paths.inbox.iterdir()):
+            if not path.is_file() or path.suffix in (".json", ".part") or path.name.startswith("."):
+                continue
+            parsed = parse_inbox_name(path)
+            if parsed is None:
+                continue
+            row_start = parsed["started_at_utc"]
+            row_end = _fmt_iso(_parse_iso(row_start) + timedelta(milliseconds=default_duration_ms))
+            if row_start < end_utc and row_end > start_utc:
+                inbox_files.append(path.name)
+
+    # What this would drop from `summaries` - computed whether or not this is a dry run
+    # (read-only), so the preview matches what a real run would remove.
+    from .episodes import build_episodes, episode_transcript
+    from .summarize import _content_key
+
+    episode_ids = [
+        r["id"]
+        for r in conn.execute(
+            "SELECT id FROM episodes WHERE started_at_utc < ? AND ended_at_utc > ?",
+            (end_utc, start_utc),
+        ).fetchall()
+    ]
+    episode_keys = sorted({_content_key(episode_transcript(conn, eid, tz)) for eid in episode_ids})
+
+    episode_summaries_removed = 0
+    if episode_keys:
+        placeholders = ",".join("?" for _ in episode_keys)
+        episode_summaries_removed = conn.execute(
+            f"SELECT COUNT(*) AS n FROM summaries"
+            f" WHERE scope='episode' AND scope_key IN ({placeholders})",
+            episode_keys,
+        ).fetchone()["n"]
+
+    day_digests_removed: list[str] = []
+    if days:
+        placeholders = ",".join("?" for _ in days)
+        day_digests_removed = sorted(
+            r["scope_key"]
+            for r in conn.execute(
+                f"SELECT scope_key FROM summaries"
+                f" WHERE scope='day' AND scope_key IN ({placeholders})",
+                days,
+            ).fetchall()
+        )
+
+    report = DeleteRangeReport(
+        recordings=rec_infos,
+        inbox_files=inbox_files,
+        days=days,
+        episode_summaries_removed=episode_summaries_removed,
+        day_digests_removed=day_digests_removed,
+        dry_run=dry_run,
+    )
+
+    if dry_run:
+        return report
+
+    with transaction(conn):
+        if episode_keys:
+            placeholders = ",".join("?" for _ in episode_keys)
+            conn.execute(
+                f"DELETE FROM summaries WHERE scope='episode' AND scope_key IN ({placeholders})",
+                episode_keys,
+            )
+        if days:
+            placeholders = ",".join("?" for _ in days)
+            conn.execute(
+                f"DELETE FROM summaries WHERE scope='day' AND scope_key IN ({placeholders})",
+                days,
+            )
+        for info in rec_infos:
+            delete_recording(conn, info["id"], cfg=cfg, delete_audio=True)
+        if episode_ids:
+            # `delete_recording` above (via `_clear_transcript`) already removed every
+            # utterance these episodes had - clean up the now-empty episode rows too, or
+            # they'd linger forever with nothing pointing at them. Safe even for an
+            # episode that also had utterances outside the deleted recordings: those
+            # utterances' `episode_id` just goes to NULL (`ON DELETE SET NULL`), and
+            # `build_episodes` below regenerates the day's episodes from scratch anyway.
+            placeholders = ",".join("?" for _ in episode_ids)
+            conn.execute(f"DELETE FROM episodes WHERE id IN ({placeholders})", episode_ids)
+
+    # Filesystem cleanup, deliberately after the DB transaction above has committed.
+    for name in inbox_files:
+        path = cfg.paths.inbox / name
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        sidecar = path.with_suffix(".json")
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+
+    for day in days:
+        build_episodes(conn, cfg, day)
+        try:
+            (cfg.paths.digests / f"{day}.md").unlink()
+        except FileNotFoundError:
+            pass
+        mirror = cfg.paths.digest_mirror
+        if mirror is not None:
+            try:
+                (mirror / f"{day}.md").unlink()
+            except FileNotFoundError:
+                pass
+
+    return report
