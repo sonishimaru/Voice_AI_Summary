@@ -20,7 +20,13 @@ from .config import Config
 from .db import utcnow_iso
 from .episodes import build_episodes, episode_transcript
 from .glossary import load_glossary
-from .llm import check_budget, friendly_api_error, make_client, track_usage
+from .llm import (
+    check_budget,
+    friendly_api_error,
+    make_client,
+    parsed_or_raise,
+    track_usage,
+)
 from .timeutil import fmt_hm, local_day_bounds
 
 log = logging.getLogger(__name__)
@@ -178,7 +184,7 @@ def _call_map(
             raise friendly from None
         raise
     track_usage("map", model, response)
-    return response.parsed_output
+    return parsed_or_raise(response, purpose="episode summary")
 
 
 def _merge_str_lists(lists: list[list[str]]) -> list[str]:

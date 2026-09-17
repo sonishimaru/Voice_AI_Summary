@@ -24,7 +24,13 @@ import pydantic
 from pydantic import BaseModel, Field
 
 from .config import Config
-from .llm import check_budget, friendly_api_error, track_usage
+from .llm import (
+    OutputTruncated,
+    check_budget,
+    friendly_api_error,
+    parsed_or_raise,
+    track_usage,
+)
 
 log = logging.getLogger(__name__)
 
@@ -40,10 +46,6 @@ MAX_EXTRACT_CHARS = 20_000
 STYLE_NOTE_SIMILARITY = 0.6
 
 _PUNCT = re.compile(r"[\s!-/:-@\[-`{-~\u3000-\u303f]")
-
-
-class OutputTruncated(RuntimeError):
-    """A structured-output response hit `max_tokens` and could not be parsed."""
 
 
 class Term(BaseModel):
@@ -290,7 +292,7 @@ def _call_extract(
             raise friendly from None
         raise
     track_usage("glossary", model, response)
-    return response.parsed_output
+    return parsed_or_raise(response, purpose="glossary extraction")
 
 
 def _chunk_messages(messages: list[str], max_chars: int) -> list[str]:

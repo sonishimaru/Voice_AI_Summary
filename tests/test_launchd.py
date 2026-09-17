@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from voice_ai_summary import launchd
 from voice_ai_summary.config import Config
 from voice_ai_summary.launchd import (
     DIGEST_LABEL,
@@ -265,33 +266,87 @@ class TestInstallUninstall:
 
 
 class TestInstallDefaults:
-    """Test install command defaults."""
+    """Which executable `install` writes into the plists when not told one."""
 
-    def test_install_default_vas_bin_from_which(self, tmp_path: Path) -> None:
-        """Install should use `which vas` as default."""
+    def test_install_prefers_the_venv_script_over_path(self, tmp_path: Path) -> None:
+        """The venv's `vas` wins over whatever PATH happens to hold.
+
+        `install_services` runs inside the MCP server, whose PATH need not contain the
+        venv at all -- and whose argv[0] is `vas-mcp`. The script sitting next to the
+        running interpreter is the one that matches this checkout.
+        """
         cfg = Config()
+        bin_dir = tmp_path / "venv" / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "vas").write_text("#!/bin/sh\n")
 
-        with patch("shutil.which", return_value="/usr/local/bin/vas"):
-            with patch("pathlib.Path.home", return_value=tmp_path):
-                install(cfg, dry_run=False)
-
-        agents_dir = tmp_path / "Library" / "LaunchAgents"
-        worker_plist = agents_dir / f"{WORKER_LABEL}.plist"
-        plist_text = worker_plist.read_text()
-
-        assert "/usr/local/bin/vas" in plist_text
-
-    def test_install_uses_sys_argv0_fallback(self, tmp_path: Path) -> None:
-        """Install should fall back to sys.argv[0] if which fails."""
-        cfg = Config()
-
-        with patch("shutil.which", return_value=None):
-            with patch("sys.argv", ["/home/user/.venv/bin/vas"]):
+        with patch.object(launchd.sys, "executable", str(bin_dir / "python")):
+            with patch("shutil.which", return_value="/usr/local/bin/vas"):
                 with patch("pathlib.Path.home", return_value=tmp_path):
                     install(cfg, dry_run=False)
 
-        agents_dir = tmp_path / "Library" / "LaunchAgents"
-        worker_plist = agents_dir / f"{WORKER_LABEL}.plist"
-        plist_text = worker_plist.read_text()
+        plist_text = (tmp_path / "Library" / "LaunchAgents" / f"{WORKER_LABEL}.plist").read_text()
+        assert str(bin_dir / "vas") in plist_text
+        assert "/usr/local/bin/vas" not in plist_text
 
-        assert "vas" in plist_text
+    def test_install_uses_path_when_there_is_no_venv_script(self, tmp_path: Path) -> None:
+        cfg = Config()
+
+        with patch.object(launchd.sys, "executable", str(tmp_path / "nowhere" / "python")):
+            with patch("shutil.which", return_value="/usr/local/bin/vas"):
+                with patch("pathlib.Path.home", return_value=tmp_path):
+                    install(cfg, dry_run=False)
+
+        plist_text = (tmp_path / "Library" / "LaunchAgents" / f"{WORKER_LABEL}.plist").read_text()
+        assert "/usr/local/bin/vas" in plist_text
+
+    def test_install_never_writes_argv0_into_the_plist(self, tmp_path: Path) -> None:
+        """argv[0] is `vas-mcp` under the MCP server; that plist ran the wrong program."""
+        cfg = Config()
+
+        with patch.object(launchd.sys, "executable", str(tmp_path / "nowhere" / "python")):
+            with patch("shutil.which", return_value=None):
+                with patch.object(launchd.sys, "argv", ["/home/user/.venv/bin/vas-mcp"]):
+                    with patch("pathlib.Path.home", return_value=tmp_path):
+                        install(cfg, dry_run=False)
+
+        plist_text = (tmp_path / "Library" / "LaunchAgents" / f"{WORKER_LABEL}.plist").read_text()
+        assert "vas-mcp" not in plist_text
+
+
+class TestResolveVasBin:
+    """The plist must run `vas`, whichever console script installed it."""
+
+    def test_prefers_the_script_next_to_the_running_interpreter(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "vas").write_text("#!/bin/sh\n")
+        monkeypatch.setattr(launchd.sys, "executable", str(bin_dir / "python"))
+
+        assert launchd.resolve_vas_bin() == str(bin_dir / "vas")
+
+    def test_never_falls_back_to_argv0(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`install_services` runs inside the MCP server, where argv[0] is `vas-mcp`.
+
+        Writing that into the plist produced a LaunchAgent running `vas-mcp worker`,
+        and the worker silently never started.
+        """
+        monkeypatch.setattr(launchd.sys, "executable", str(tmp_path / "nowhere" / "python"))
+        monkeypatch.setattr(launchd.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(launchd.sys, "argv", ["/somewhere/.venv/bin/vas-mcp", "install"])
+
+        assert "vas-mcp" not in launchd.resolve_vas_bin()
+
+    def test_falls_back_to_path_then_to_the_bare_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(launchd.sys, "executable", str(tmp_path / "nowhere" / "python"))
+        monkeypatch.setattr(launchd.shutil, "which", lambda _name: "/usr/local/bin/vas")
+        assert launchd.resolve_vas_bin() == "/usr/local/bin/vas"
+
+        monkeypatch.setattr(launchd.shutil, "which", lambda _name: None)
+        assert launchd.resolve_vas_bin() == "vas"

@@ -16,6 +16,23 @@ WORKER_LABEL = "com.voiceaisummary.worker"
 DIGEST_LABEL = "com.voiceaisummary.digest"
 
 
+def resolve_vas_bin() -> str:
+    """Find the `vas` console script to write into the LaunchAgents.
+
+    Deliberately never falls back to `sys.argv[0]`. `install_services` exposes this
+    through the MCP server, where argv[0] is `vas-mcp` -- so that fallback wrote a plist
+    running `vas-mcp worker`, and the worker silently never started. The venv's script
+    directory is the reliable answer: it is where `vas` was installed alongside the
+    interpreter now running, whichever console script was invoked. PATH is only a
+    second guess, since a launchd- or Claude-Desktop-spawned process need not have the
+    venv on it at all.
+    """
+    candidate = Path(sys.executable).parent / "vas"
+    if candidate.exists():
+        return str(candidate)
+    return shutil.which("vas") or "vas"
+
+
 def _program_args(vas_bin: str, *args: str) -> list[str]:
     """Run `vas` through a zsh login shell.
 
@@ -98,14 +115,14 @@ def install(cfg: Config, *, vas_bin: str | None = None, dry_run: bool = False) -
 
     Args:
         cfg: Configuration with schedule settings.
-        vas_bin: Path to vas executable (defaults to `which vas` or sys.argv[0]).
+        vas_bin: Path to the `vas` executable (defaults to `resolve_vas_bin()`).
         dry_run: If True, only write files and print commands (don't run launchctl).
 
     Returns:
         List of plist file paths written.
     """
     if vas_bin is None:
-        vas_bin = shutil.which("vas") or sys.argv[0]
+        vas_bin = resolve_vas_bin()
 
     logs_dir = log_dir()
     if not dry_run:

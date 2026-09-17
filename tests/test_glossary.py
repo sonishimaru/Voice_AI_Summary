@@ -374,6 +374,7 @@ def test_extract_glossary_uses_channel_prompt_for_other_authors(monkeypatch) -> 
     class _Parsed:
         parsed_output = Glossary(terms=[Term(term="ドット歯磨き")])
         usage = None
+        stop_reason = "end_turn"
 
     class _Messages:
         def parse(self, **kwargs):

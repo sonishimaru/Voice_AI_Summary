@@ -154,3 +154,50 @@ def test_friendly_api_error_maps_setup_problems() -> None:
     assert "config.toml" in str(llm.friendly_api_error(err(404, "no model"), "claude-x"))
     # A genuine server fault stays an exception the caller must deal with.
     assert llm.friendly_api_error(err(500, "overloaded"), "m") is None
+
+
+class _Response:
+    """The shape `messages.parse` returns, as far as `parsed_or_raise` reads it."""
+
+    def __init__(self, *, stop_reason: str, parsed_output=None, stop_details=None) -> None:
+        self.stop_reason = stop_reason
+        self.parsed_output = parsed_output
+        self.stop_details = stop_details
+
+
+class _StopDetails:
+    def __init__(self, category: str, explanation: str = "") -> None:
+        self.category = category
+        self.explanation = explanation
+
+
+def test_parsed_or_raise_returns_the_parsed_output() -> None:
+    response = _Response(stop_reason="end_turn", parsed_output={"fixes": []})
+    assert llm.parsed_or_raise(response, purpose="correction") == {"fixes": []}
+
+
+def test_a_refusal_names_the_category_and_is_not_retryable() -> None:
+    """A refusal must not look like truncation: retrying a smaller input cannot help."""
+    response = _Response(
+        stop_reason="refusal",
+        stop_details=_StopDetails("cyber", "This request was declined."),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        llm.parsed_or_raise(response, purpose="correction")
+    assert not isinstance(excinfo.value, llm.OutputTruncated)
+    assert "cyber" in str(excinfo.value)
+    assert "declined" in str(excinfo.value)
+
+
+def test_a_refusal_without_details_still_reports_something_useful() -> None:
+    """`stop_details` is only populated for refusals, and even then may be sparse."""
+    response = _Response(stop_reason="refusal")
+    with pytest.raises(RuntimeError, match="unspecified"):
+        llm.parsed_or_raise(response, purpose="correction")
+
+
+def test_no_parsed_output_is_reported_as_truncation() -> None:
+    """`messages.parse` returns None rather than raising; callers split and retry."""
+    response = _Response(stop_reason="max_tokens", parsed_output=None)
+    with pytest.raises(llm.OutputTruncated, match="max_tokens"):
+        llm.parsed_or_raise(response, purpose="glossary extraction")
