@@ -439,6 +439,75 @@ def test_run_day_includes_glossary_block_in_map_and_reduce(vas, monkeypatch) -> 
     assert "西丸" in captured["reduce"]
 
 
+def test_map_user_content_wraps_transcript_and_glossary() -> None:
+    from voice_ai_summary.summarize import _map_user_content
+
+    meta = {"start": "10:00", "end": "10:30", "kind": "call", "source_mix": "mic"}
+    content = _map_user_content("トランスクリプト本文", meta, "## 用語集\n- 西丸")
+
+    assert "<transcript>\nトランスクリプト本文\n</transcript>" in content
+    assert "<glossary>\n## 用語集\n- 西丸\n</glossary>" in content
+
+
+def test_map_user_content_omits_glossary_tag_when_empty() -> None:
+    from voice_ai_summary.summarize import _map_user_content
+
+    meta = {"start": "a", "end": "b", "kind": "c", "source_mix": "d"}
+    content = _map_user_content("t", meta, "")
+
+    assert "<glossary>" not in content
+
+
+def test_reduce_user_content_wraps_episodes_and_glossary() -> None:
+    from voice_ai_summary.summarize import _reduce_user_content
+
+    content = _reduce_user_content("2026-09-15", "[]", "## 表記ルール\n- foo")
+
+    assert "<episode_summaries>\n[]\n</episode_summaries>" in content
+    assert "<glossary>\n## 表記ルール\n- foo\n</glossary>" in content
+
+
+def test_reduce_user_content_omits_glossary_tag_when_empty() -> None:
+    from voice_ai_summary.summarize import _reduce_user_content
+
+    content = _reduce_user_content("2026-09-15", "[]", "")
+
+    assert "<glossary>" not in content
+
+
+def test_map_and_reduce_system_prompts_carry_data_framing_sentence() -> None:
+    from voice_ai_summary.summarize import _MAP_SYSTEM, _REDUCE_SYSTEM
+
+    assert "<transcript>" in _MAP_SYSTEM
+    assert "<glossary>" in _MAP_SYSTEM
+    assert "<episode_summaries>" in _REDUCE_SYSTEM
+    assert "<glossary>" in _REDUCE_SYSTEM
+
+
+def test_prompt_version_unchanged() -> None:
+    """`PROMPT_VERSION` must stay exactly as it was: bumping it would invalidate every
+    cached summary and make `_stored_digest` lookups miss existing digests."""
+    assert PROMPT_VERSION == "v1"
+
+
+def test_write_digest_creates_0600_files(vas, tmp_path) -> None:
+    import stat
+
+    from voice_ai_summary.summarize import _write_digest
+
+    cfg, _conn = vas
+    cfg.paths.digest_mirror_dir = tmp_path / "mirror"
+
+    _write_digest(cfg, "2026-09-15", "# hello\n")
+
+    digest_path = cfg.paths.digests / "2026-09-15.md"
+    mirror_path = cfg.paths.digest_mirror_dir / "2026-09-15.md"
+    assert digest_path.read_text(encoding="utf-8") == "# hello\n"
+    assert mirror_path.read_text(encoding="utf-8") == "# hello\n"
+    assert stat.S_IMODE(digest_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(mirror_path.stat().st_mode) == 0o600
+
+
 def test_digest_path_prints_the_local_file(vas) -> None:
     from typer.testing import CliRunner
 

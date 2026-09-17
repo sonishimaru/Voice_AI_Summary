@@ -35,13 +35,19 @@ def vocab_add(
 ) -> None:
     """Add a term to the glossary, or merge into it if the term already exists."""
     from .config import load_config
-    from .glossary import Glossary, Term, load_glossary, save_glossary
+    from .glossary import Glossary, load_glossary, save_glossary, validate_term
+
+    try:
+        validated = validate_term(term, list(alias), note)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from None
 
     cfg = load_config()
     glossary = load_glossary(cfg)
-    updated = glossary.merge(Glossary(terms=[Term(term=term, aliases=list(alias), note=note)]))
+    updated = glossary.merge(Glossary(terms=[validated]))
     save_glossary(cfg, updated)
-    typer.echo(f"added/updated: {term}")
+    typer.echo(f"added/updated: {validated.term}")
 
 
 @vocab_app.command("import")
@@ -52,19 +58,31 @@ def vocab_import(
 
     Accepts `{"terms": [{"term", "aliases", "note"}], "style_notes": [...]}` or a bare list
     of term objects. Existing entries are kept; aliases and notes are merged.
+
+    Every incoming term is validated the same way `vas vocab add` validates its
+    argument (`validate_term`); a single invalid entry aborts the whole import with no
+    partial write, so a bad file can be fixed and re-run rather than silently truncated.
     """
     import json
 
     from .config import load_config
-    from .glossary import Glossary, Term, load_glossary, save_glossary
+    from .glossary import Glossary, load_glossary, save_glossary, validate_term
 
     data = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(data, list):
         data = {"terms": data}
-    incoming = Glossary(
-        terms=[Term.model_validate(t) for t in data.get("terms", []) if t.get("term")],
-        style_notes=[str(n) for n in data.get("style_notes", []) if n],
-    )
+    try:
+        incoming = Glossary(
+            terms=[
+                validate_term(t["term"], t.get("aliases"), t.get("note", ""))
+                for t in data.get("terms", [])
+                if t.get("term")
+            ],
+            style_notes=[str(n) for n in data.get("style_notes", []) if n],
+        )
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from None
     cfg = load_config()
     before = load_glossary(cfg)
     updated = before.merge(incoming)
@@ -116,6 +134,13 @@ def vocab_import_slack(
     if scope not in ("mine", "channels", "all"):
         raise typer.BadParameter("--scope must be mine, channels or all")
     cfg = load_config()
+    if not cfg.glossary.slack_import_enabled:
+        typer.echo(
+            "Slack からの取り込みは無効です。再取り込みが必要なら config.toml の "
+            "[glossary] slack_import_enabled = true を設定してください"
+            "（参加チャンネル全部のメッセージが Claude API に送られます）。"
+        )
+        raise typer.Exit(code=1)
     token = cfg.slack_user_token
     if not token:
         typer.echo("VAS_SLACK_USER_TOKEN is not set (needs a Slack user token).")
