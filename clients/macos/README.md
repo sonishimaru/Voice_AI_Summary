@@ -30,6 +30,10 @@ Xcodeが開いたら:
 
 初回起動時、メニューバーに波形アイコンが表示されます（Dockアイコンは出ません＝`LSUIElement`）。
 
+コードを更新（`git pull`）したあとは、**Xcodeを終了してから** `xcodegen generate` をやり直してください。追加されたソースファイルや `Info.plist` のキーは、プロジェクトを再生成しないと反映されません。Xcodeでプロジェクトを開いたまま再生成すると、ビルド中にファイルが書き換わったと判断されてエラーになることがあります。
+
+> `Entitlements file "VoiceRecorder.entitlements" was modified during the build` と出たとき: ビルドの最中に誰か（Xcode自身の「Signing & Capabilities」タブ、`xcodegen generate`、`git pull`、同期フォルダなど）がこのファイルに触っています。Xcodeを終了 → `xcodegen generate` → Xcodeを開く → Product > Clean Build Folder（`⇧⌘K`）→ もう一度ビルド、で解消します。再発する場合は `git status` を見てください。`VoiceRecorder.entitlements` が変更扱いになっていれば、Xcodeが書き換えた内容がわかります。
+
 ## 求められる権限
 
 起動直後、実際に録音を開始しようとしたタイミングで、macOSが以下の2つの許可を求めてきます:
