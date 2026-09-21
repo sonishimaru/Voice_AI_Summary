@@ -4,6 +4,13 @@
 [paths]
 # Root data directory. The macOS recorder writes into <data_dir>/inbox/.
 data_dir = "~/Library/Application Support/VoiceAISummary"
+# Optional second copy of each daily digest. ~/Library/Application Support is off limits
+# to sandboxed readers (Cowork's device tools, other agents), so point this at an ordinary
+# folder to let them read the day's digest without moving the audio and database there.
+# Spotlight はここに置いた Markdown の本文まで索引します（他人の発話が無関係な
+# 検索に出ます）。フォルダ名を `.noindex` で終わらせるか、システム設定 >
+# Spotlight > プライバシー に追加してください。`vas harden` が索引状況を報告します。
+# digest_mirror_dir = "~/voice-digests"
 
 [asr]
 # backend = "faster-whisper" runs on CPU (CTranslate2). On Apple Silicon, "mlx" runs on the
@@ -14,12 +21,40 @@ backend = "faster-whisper"
 # mlx:            "mlx-community/whisper-large-v3-turbo" (default when backend = "mlx").
 model = "kotoba-tech/kotoba-whisper-v2.0-faster"
 device = "auto"          # auto | cpu | cuda  (faster-whisper only)
-compute_type = "default" # default | int8 | float16  (faster-whisper only; int8 is ~2x faster on CPU)
+compute_type = "auto"    # auto | default | int8 | float16  (faster-whisper のみ。auto はデバイスが速く回せる精度を選ぶ)
 language = "ja"
 beam_size = 5
 # Names, products and jargon that ASR keeps misspelling. Biases decoding toward these.
 hotwords = []            # e.g. ["西丸", "安田さん", "チョコレート株式会社"]
 initial_prompt = ""      # optional free-text context, e.g. "社内の打ち合わせの録音です。"
+normalize = "none"       # none | peak | rms (レベルを揃えてから文字起こしする)
+# mac_mic (自分の声) は mac_system (Zoomなど相手の声) より録音レベルが低く、Whisperは
+# 小さい声を聞き取りにくい。normalize を全体で "rms" にすると相手側も余計に持ち上げてしまうので、
+# mac_mic だけ個別に上書きする。以下はコメントアウトの例(既定は空 = 上書きなし、動作は変わらない):
+# [asr.normalize_by_source]
+# mac_mic = "rms"
+# 文字起こしの繰り返しループ(同じ短い文が連続して出力される)を検知して間引く。デコーダの
+# バグに対する対策なので既定で有効。実際の発言を消してしまう場合はここで無効化する。
+drop_repeated_utterances = true
+# 上記の間引きが「直前と同じ文」を繰り返しループと見なす際の、直前発話の終わりからの時間差
+# (ms)の上限。vad.pack_regions が別々のVAD区間をまとめて1回のデコード呼び出しにするため、
+# 本当に別々に話された同じ短い発言(例: 数秒おきの「はい」)が1回の呼び出しの中で隣り合って
+# 出力されることがある。デコーダの繰り返しループはほぼ間隔なしで同じ行を出力するのに対し、
+# 元々別々のVAD区間だった発話は vad.merge_gap_ms 以上の無音を挟んでいたはず(そうでなければ
+# 統合されて1つの区間になっている)なので、その半分程度に設定して両者を区別する。
+repeat_gap_max_ms = 1000
+# Whisperのデコード失敗しきい値。既定値はfaster-whisper/mlx-whisperそれぞれの既定値と同じ
+# (ライブラリのシグネチャを確認して転記。実測ではない)なので、変更しない限り動作は変わらない。
+# no_speech_threshold: 無音確率がこの値を超え、かつ log_prob_threshold 未満のときに「無音」と
+#   判定してテキストを捨てる。無音・雑音区間の幻覚(ありもしないテキスト)を抑えたいときは
+#   下げる(判定されやすくなる)。
+no_speech_threshold = 0.6
+# log_prob_threshold: 出力トークンの平均対数確率がこの値未満だと「失敗」扱いにする。
+#   自信のない出力を幻覚として弾きたいときは上げる(0に近づける = より厳しくなる)。
+log_prob_threshold = -1.0
+# compression_ratio_threshold: 出力テキストのgzip圧縮率がこの値を超えると「失敗」扱いにする
+#   (繰り返しの多いテキストほど圧縮率が高くなる)。繰り返しループを抑えたいときは下げる。
+compression_ratio_threshold = 2.4
 
 [vad]
 threshold = 0.5           # Silero speech probability threshold (lower = more recall)
@@ -28,6 +63,10 @@ min_silence_ms = 500      # gap that closes a speech region
 merge_gap_ms = 2000       # regions closer than this are transcribed together (context!)
 max_speech_s = 30         # split long chunks for the ASR window
 pad_ms = 200              # padding added around each region
+# Whisperは音声区間の長さに関わらず固定長(30秒)の窓にパディングして処理するため、短い区間を
+# 個別に文字起こしするとパディング分の計算が無駄になる。merge_gap_ms で作られた区間どうしを、
+# 間の無音がこの値以下ならさらに詰めて1つの区間にまとめ、max_speech_s まで詰め込む。0で無効化。
+pack_max_gap_ms = 5000
 
 [episodes]
 gap_minutes = 5           # silence longer than this starts a new episode
@@ -67,8 +106,53 @@ email_to = ""
 smtp_host = "smtp.gmail.com"
 smtp_port = 587
 smtp_user = ""
+# Commits the daily digest to a local git checkout and pushes, so a Claude session
+# (which can read GitHub repos but not this Mac) can read it. No secret needed beyond
+# whatever git already uses to push (SSH key / credential helper) from repo_path.
+# The target repo MUST be private: the digest contains other people's speech and
+# client names, not just your own.
+# Local-only: post a macOS notification when the digest is ready. The digest itself stays
+# in <data_dir>/digests/; only a one-line headline reaches the notification centre.
+notify = true
+repo = false
+repo_path = ""          # e.g. "~/voice-digests", a local clone of a private repo
+repo_subdir = "digests" # written as <repo_path>/<repo_subdir>/<day>.md
+repo_branch = ""        # empty: use whatever branch is currently checked out
+repo_remote = "origin"
 
 [schedule]
 digest_hour = 22          # local time for the daily digest (launchd)
 digest_minute = 0
 worker_poll_seconds = 30
+# worker が止まっていた等でその日の録音が未処理のまま残っている場合、digest はまず
+# この秒数だけ文字起こしの追いつき処理を行う(0 で無効)。深夜バッチが延々と回り続け
+# ないよう、上限に達したらその時点で要約に進み、未処理/エラーが残っていればその旨を
+# 記録・通知する。
+digest_catchup_budget_s = 900
+# worker のバックログ通知: 未処理の録音数が backlog_alert_count 件以上のまま
+# backlog_alert_minutes 分以上減らなかったら、macOS 通知を1回だけ送る(いずれかを
+# 0 にすると無効)。バックログが backlog_alert_count 未満に戻ると再度アームされる。
+backlog_alert_count = 10
+backlog_alert_minutes = 30
+
+[retention]
+# 文字起こしが終わった録音の音声ファイルを、この日数後に削除する。DB の行と文字起こしは残る
+# （後からモデルを変えて文字起こしし直すことだけができなくなる）。0 で無効。
+audio_days = 7
+# 文字起こしできなかった（errored）録音の音声は、取り込みからこの日数で削除。
+errored_audio_days = 30
+usage_log_days = 365
+recorder_events_days = 90
+audit_log_days = 365
+# launchd のログ（.log / .err）がこのバイト数を超えたら末尾だけ残す。
+log_max_bytes = 5000000
+
+[recorder]
+# 録音アプリ側のローテーション間隔（分）と一致させる。未処理の録音の長さの見積もりと、
+# 「録音中のはずなのにファイルが届かない」監視の待ち時間に使う。
+rotation_minutes = 15
+
+[glossary]
+# Slack からの用語集取り込み。一度取り終えたら false のままにしておく（再取り込みは
+# 参加チャンネル全部のメッセージを Claude API に送る）。
+slack_import_enabled = false

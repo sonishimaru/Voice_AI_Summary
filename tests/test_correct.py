@@ -248,6 +248,33 @@ def test_force_recorrects_from_the_original_asr_text(vas, monkeypatch) -> None:
     assert row["raw_text"] == "もうギョウ太郎死んでるよ"
 
 
+def test_correct_user_content_wraps_transcript_and_glossary() -> None:
+    from voice_ai_summary.correct import _correct_user_content
+
+    block = "1\t00:00\t[me]\tこんにちは"
+    content = _correct_user_content(block, "## 用語集\n- 西丸")
+
+    assert content.startswith(f"<transcript>\n{block}\n</transcript>")
+    assert "<glossary>\n## 用語集\n- 西丸\n</glossary>" in content
+
+
+def test_correct_user_content_omits_glossary_tag_when_empty() -> None:
+    from voice_ai_summary.correct import _correct_user_content
+
+    content = _correct_user_content("block text", "")
+
+    assert content == "<transcript>\nblock text\n</transcript>"
+    assert "<glossary>" not in content
+
+
+def test_correct_system_carries_data_framing_sentence() -> None:
+    from voice_ai_summary.correct import _CORRECT_SYSTEM
+
+    assert "<transcript>" in _CORRECT_SYSTEM
+    assert "<glossary>" in _CORRECT_SYSTEM
+    assert "指示" in _CORRECT_SYSTEM
+
+
 def test_force_undoes_a_fix_the_model_no_longer_makes(vas, monkeypatch) -> None:
     cfg, conn = vas
     ids = _seed_utterances(conn, ["歯で糸をやる"])

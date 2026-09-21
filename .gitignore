@@ -10,3 +10,4 @@ config.toml
 clients/macos/*.xcodeproj/
 clients/macos/build/
 clients/macos/DerivedData/
+.DS_Store

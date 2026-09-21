@@ -11,9 +11,27 @@ import sys
 from pathlib import Path
 
 from .config import Config
+from .security import ensure_private_dir, open_private
 
 WORKER_LABEL = "com.voiceaisummary.worker"
 DIGEST_LABEL = "com.voiceaisummary.digest"
+
+
+def resolve_vas_bin() -> str:
+    """Find the `vas` console script to write into the LaunchAgents.
+
+    Deliberately never falls back to `sys.argv[0]`. `install_services` exposes this
+    through the MCP server, where argv[0] is `vas-mcp` -- so that fallback wrote a plist
+    running `vas-mcp worker`, and the worker silently never started. The venv's script
+    directory is the reliable answer: it is where `vas` was installed alongside the
+    interpreter now running, whichever console script was invoked. PATH is only a
+    second guess, since a launchd- or Claude-Desktop-spawned process need not have the
+    venv on it at all.
+    """
+    candidate = Path(sys.executable).parent / "vas"
+    if candidate.exists():
+        return str(candidate)
+    return shutil.which("vas") or "vas"
 
 
 def _program_args(vas_bin: str, *args: str) -> list[str]:
@@ -81,6 +99,15 @@ def render_digest_plist(
     return plistlib.dumps(plist_dict).decode("utf-8")
 
 
+def log_dir() -> Path:
+    """Directory `install` writes worker/digest stdout+stderr logs into.
+
+    Factored out so other code (e.g. the MCP server's `service_logs` tool) reads logs
+    from the exact same place `install` writes them, instead of repeating the path.
+    """
+    return Path.home() / "Library" / "Logs" / "VoiceAISummary"
+
+
 def install(cfg: Config, *, vas_bin: str | None = None, dry_run: bool = False) -> list[Path]:
     """Install or update launchd services.
 
@@ -89,18 +116,27 @@ def install(cfg: Config, *, vas_bin: str | None = None, dry_run: bool = False) -
 
     Args:
         cfg: Configuration with schedule settings.
-        vas_bin: Path to vas executable (defaults to `which vas` or sys.argv[0]).
+        vas_bin: Path to the `vas` executable (defaults to `resolve_vas_bin()`).
         dry_run: If True, only write files and print commands (don't run launchctl).
 
     Returns:
         List of plist file paths written.
     """
     if vas_bin is None:
-        vas_bin = shutil.which("vas") or sys.argv[0]
+        vas_bin = resolve_vas_bin()
 
-    log_dir = Path.home() / "Library" / "Logs" / "VoiceAISummary"
+    logs_dir = log_dir()
     if not dry_run:
-        log_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(logs_dir)
+        # launchd opens an existing StandardOutPath/StandardErrorPath with whatever mode
+        # it already has, rather than creating it at 0600 itself -- pre-create the four
+        # log files here (via open_private, which sets 0600 at creation) so a freshly
+        # installed service's logs start private instead of at the process umask.
+        for label in (WORKER_LABEL, DIGEST_LABEL):
+            for suffix in ("log", "err"):
+                path = logs_dir / f"{label}.{suffix}"
+                if not path.exists():
+                    open_private(path, "a").close()
 
     agents_dir = Path.home() / "Library" / "LaunchAgents"
     if not dry_run:
@@ -110,19 +146,22 @@ def install(cfg: Config, *, vas_bin: str | None = None, dry_run: bool = False) -
 
     # Write and load worker service
     worker_path = agents_dir / f"{WORKER_LABEL}.plist"
-    worker_plist = render_worker_plist(vas_bin, log_dir)
+    worker_plist = render_worker_plist(vas_bin, logs_dir)
     if not dry_run:
         worker_path.write_text(worker_plist, encoding="utf-8")
     plist_paths.append(worker_path)
 
-    # Write and load digest service
+    # Write and load digest service. Any enabled delivery channel (Slack, email, the
+    # notify-repo git push, or the local macOS notification) needs `--deliver` passed to
+    # the nightly `vas digest` invocation, or that channel never fires - mirrors the
+    # channel list `deliver.deliver_digest` enables by default.
     digest_path = agents_dir / f"{DIGEST_LABEL}.plist"
     digest_plist = render_digest_plist(
         vas_bin,
-        log_dir,
+        logs_dir,
         cfg.schedule.digest_hour,
         cfg.schedule.digest_minute,
-        deliver=cfg.deliver.slack or cfg.deliver.email,
+        deliver=any([cfg.deliver.slack, cfg.deliver.email, cfg.deliver.repo, cfg.deliver.notify]),
     )
     if not dry_run:
         digest_path.write_text(digest_plist, encoding="utf-8")
@@ -176,7 +215,9 @@ def _launchctl_bootout(uid: int, plist_path: str, *, dry_run: bool = False) -> N
     if dry_run:
         print(" ".join(cmd))
     else:
-        subprocess.run(cmd, capture_output=True)  # Ignore errors
+        # capture_output+text so nothing launchctl prints reaches this process's own
+        # stdout/stderr; a caller like the MCP server's stdio transport depends on that.
+        subprocess.run(cmd, capture_output=True, text=True, timeout=15)  # Ignore errors
 
 
 def _launchctl_bootstrap(uid: int, plist_path: str, *, dry_run: bool = False) -> None:
@@ -185,7 +226,20 @@ def _launchctl_bootstrap(uid: int, plist_path: str, *, dry_run: bool = False) ->
     if dry_run:
         print(" ".join(cmd))
     else:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=15)
+
+
+def launchctl_bootout(uid: int, plist_path: str, *, dry_run: bool = False) -> None:
+    """Public wrapper around `_launchctl_bootout`, for callers outside this module (the
+    MCP server's `restart_worker` tool) that need to stop a service without reaching
+    into a private name. Ignores failures, same as the private function it wraps."""
+    _launchctl_bootout(uid, plist_path, dry_run=dry_run)
+
+
+def launchctl_bootstrap(uid: int, plist_path: str, *, dry_run: bool = False) -> None:
+    """Public wrapper around `_launchctl_bootstrap`. Raises `subprocess.CalledProcessError`
+    on failure, same as the private function it wraps."""
+    _launchctl_bootstrap(uid, plist_path, dry_run=dry_run)
 
 
 def _get_env_overrides() -> dict[str, str]:
