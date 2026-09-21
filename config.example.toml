@@ -7,6 +7,9 @@ data_dir = "~/Library/Application Support/VoiceAISummary"
 # Optional second copy of each daily digest. ~/Library/Application Support is off limits
 # to sandboxed readers (Cowork's device tools, other agents), so point this at an ordinary
 # folder to let them read the day's digest without moving the audio and database there.
+# Spotlight はここに置いた Markdown の本文まで索引します（他人の発話が無関係な
+# 検索に出ます）。フォルダ名を `.noindex` で終わらせるか、システム設定 >
+# Spotlight > プライバシー に追加してください。`vas harden` が索引状況を報告します。
 # digest_mirror_dir = "~/voice-digests"
 
 [asr]

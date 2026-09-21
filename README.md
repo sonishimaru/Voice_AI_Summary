@@ -216,7 +216,21 @@ Claude Desktop の `status` / `recent` や CLI の `vas status` / `vas episodes`
 
 ただしこれはファイル権限による保護です。**同じ Mac の他のユーザーアカウントからは読めなくなりますが、あなたのログインアカウントやディスクそのものを持っている相手には効きません。** ディスク上の暗号化は FileVault だけが提供します。FileVault が無効な場合、`vas harden` は警告を表示します。
 
-### 5. Claude Desktop のツールについて
+### 5. Spotlight に索引されること
+
+ファイル権限は「同じ Mac の他のアカウント」に対する防御ですが、**Spotlight には効きません。** Spotlight はあなた自身の権限でファイルを読み、その**本文をシステムのインデックス（`/.Spotlight-V100`）に複製**します。
+
+- `digests/*.md` とミラーは平文の Markdown なので、**本文まで索引されます**。他人の発言や取引先名が、まったく別のものを Spotlight で検索したときに出てきます
+- `vas.sqlite3` はバイナリなので本文は索引されません（ファイル名などのメタデータのみ）
+- 音声ファイルもメタデータのみです
+
+除外するには、システム設定 > Spotlight > プライバシー（お使いの macOS では「Siri と Spotlight」の中の場合もあります）に `~/Library/Application Support/VoiceAISummary` と、設定していれば `digest_mirror_dir` を追加してください。ミラーを新しく作るなら、フォルダ名を `.noindex` で終わらせる方法もあります。かつて使われた `.metadata_never_index` は最近の macOS では効きません。
+
+`vas harden` と Claude Desktop の `harden` は、索引されている件数を検出して警告します。
+
+インデックスが肥大している場合（`/.Spotlight-V100` が数十GB など）、`sudo mdutil -E /` で作り直せます。なお Xcode の `DerivedData` も索引対象で、ビルドを繰り返す環境ではこちらのほうが大きくなりがちです。
+
+### 6. Claude Desktop のツールについて
 
 すべてのツールに読み取り専用 / 破壊的の注釈が付いており、Claude Desktop の承認ダイアログで区別できます。`drop_recording` / `delete_range` / `prune`、および `update_app` は「常に許可」にしないでください。
 
@@ -226,11 +240,11 @@ Claude Desktop の `status` / `recent` や CLI の `vas status` / `vas episodes`
 
 状態を変更するツール呼び出しはすべて `audit.jsonl` に記録され、`audit_log` ツールで読めます。
 
-### 6. Slack 取り込み
+### 7. Slack 取り込み
 
 `vas vocab import-slack` は既定で無効です（`[glossary] slack_import_enabled = false`）。一度用語集を作り終えたら、Slack アプリの設定で `xoxp-` トークンを失効させ、`~/.zshenv` から `VAS_SLACK_USER_TOKEN` を削除してください。トークンを常設しておく理由はありません。
 
-### 7. プロンプトについて
+### 8. プロンプトについて
 
 Claude に送るすべてのプロンプトで、文字起こし・要約・用語集はデータとして区切られており、指示として解釈されません。`add_vocabulary` / `vas vocab add` は制御文字や長すぎるエントリを拒否します。
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -408,3 +410,70 @@ def test_ensure_dirs_creates_private_directories(tmp_path, monkeypatch) -> None:
         tmp_path / "mirror",
     ):
         assert stat.S_IMODE(d.stat().st_mode) == 0o700, d
+
+
+class TestSpotlight:
+    """File permissions keep the data from other accounts; Spotlight copies the
+    digests' *text* into the system index, where it turns up in searches for
+    something else entirely. Different exposure, so it gets its own report."""
+
+    def _fake_mdfind(self, monkeypatch, *, stdout: str, expect_paths: list | None = None):
+        seen: list[str] = []
+
+        def _run(cmd, capture_output=False, text=False, timeout=None):
+            seen.append(cmd[2])
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(security.subprocess, "run", _run)
+        monkeypatch.setattr(security.sys, "platform", "darwin")
+        return seen
+
+    def test_returns_the_count(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._fake_mdfind(monkeypatch, stdout="42\n")
+        assert security.spotlight_indexed(tmp_path) == 42
+
+    def test_is_none_off_darwin(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(security.sys, "platform", "linux")
+
+        def _fail(*args: object, **kwargs: object) -> None:
+            raise AssertionError("mdfind must not run off macOS")
+
+        monkeypatch.setattr(security.subprocess, "run", _fail)
+        assert security.spotlight_indexed(tmp_path) is None
+
+    def test_is_none_when_mdfind_is_unusable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._fake_mdfind(monkeypatch, stdout="no matches, whatever that means")
+        assert security.spotlight_indexed(tmp_path) is None
+
+    def test_report_names_every_indexed_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from voice_ai_summary.config import Config
+
+        cfg = Config()
+        cfg.paths.data_dir = tmp_path / "data"
+        cfg.paths.root.mkdir(parents=True)
+        cfg.paths.digest_mirror_dir = tmp_path / "mirror"
+        cfg.paths.digest_mirror_dir.mkdir()
+        seen = self._fake_mdfind(monkeypatch, stdout="7\n")
+
+        report = security.spotlight_report(cfg)
+
+        assert report is not None
+        assert "14" in report  # 7 for the data dir + 7 for the mirror
+        assert str(cfg.paths.root) in report
+        assert str(cfg.paths.digest_mirror) in report
+        assert seen == [str(cfg.paths.root), str(cfg.paths.digest_mirror)]
+
+    def test_report_is_silent_when_nothing_is_indexed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from voice_ai_summary.config import Config
+
+        cfg = Config()
+        cfg.paths.data_dir = tmp_path / "data"
+        cfg.paths.root.mkdir(parents=True)
+        self._fake_mdfind(monkeypatch, stdout="0\n")
+        assert security.spotlight_report(cfg) is None

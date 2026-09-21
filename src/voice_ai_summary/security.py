@@ -260,6 +260,60 @@ def filevault_status() -> str | None:
     return None
 
 
+SPOTLIGHT_WARNING = (
+    "Spotlight がこのデータを索引しています（{count} 件）。ダイジェストは平文なので"
+    "本文まで索引され、他人の発話や取引先名が無関係な検索の結果に出ます。"
+    "システム設定 > Spotlight > プライバシー に次を追加してください: {paths}"
+)
+
+
+def spotlight_indexed(path: Path) -> int | None:
+    """How many files under `path` Spotlight has indexed, or `None` if unknown.
+
+    File permissions keep this data from other accounts, but they do nothing about
+    Spotlight: it reads the digests as the owner and copies their *text* into the
+    system index, where it surfaces in results for unrelated searches. That is a
+    different exposure from the one `harden` addresses, so it is worth reporting
+    even though nothing here can fix it -- excluding a folder needs the Spotlight
+    Privacy list (`.metadata_never_index` stopped working in recent macOS).
+
+    Not macOS, no `mdfind`, a timeout, or unparsable output all give `None`; this is
+    advisory, never load-bearing.
+    """
+    if sys.platform != "darwin" or not path.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["mdfind", "-onlyin", str(path), "-count", "kMDItemFSName == '*'"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        return int((result.stdout or "").strip())
+    except ValueError:
+        return None
+
+
+def spotlight_report(cfg) -> str | None:
+    """One line about Spotlight indexing of the data directory and digest mirror,
+    or `None` when nothing is indexed (or the answer cannot be determined)."""
+    indexed: list[Path] = []
+    total = 0
+    for path in (cfg.paths.root, cfg.paths.digest_mirror):
+        if path is None:
+            continue
+        count = spotlight_indexed(path)
+        if count:
+            indexed.append(path)
+            total += count
+    if not indexed:
+        return None
+    return SPOTLIGHT_WARNING.format(count=total, paths=", ".join(str(p) for p in indexed))
+
+
 def audit(root: Path, tool: str, args: dict, outcome: str) -> None:
     """Append one redacted JSON audit line to `root / AUDIT_FILENAME`.
 

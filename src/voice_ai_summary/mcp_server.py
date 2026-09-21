@@ -1682,8 +1682,9 @@ def harden(dry_run: bool = False) -> str:
     `dry_run=True` reports what WOULD change without touching anything; the default
     `dry_run=False` actually chmods. Idempotent - safe to run repeatedly, a clean tree
     reports "nothing to change". Also reports FileVault's on/off status (macOS only)
-    since full-disk encryption is this data's other line of defense. Local-only and
-    free.
+    since full-disk encryption is this data's other line of defense, and whether
+    Spotlight has indexed the digests, whose text it copies into the system index
+    where permissions no longer hide it from ordinary searches. Local-only and free.
     """
     from . import security
     from .config import load_config
@@ -1709,6 +1710,11 @@ def harden(dry_run: bool = False) -> str:
     else:
         lines.append("")
         lines.append("FileVault status could not be determined (not macOS, or fdesetup failed).")
+
+    spotlight = security.spotlight_report(cfg)
+    if spotlight:
+        lines.append("")
+        lines.append(spotlight)
     return "\n".join(lines)
 
 

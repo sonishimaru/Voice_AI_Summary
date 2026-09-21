@@ -92,6 +92,10 @@ def harden(
     else:
         typer.echo("FileVault: unknown (not macOS)")
 
+    spotlight = security.spotlight_report(cfg)
+    if spotlight:
+        typer.echo(spotlight)
+
 
 @app.command()
 def config_path() -> None:
